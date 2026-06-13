@@ -101,7 +101,7 @@ pub async fn run(socket: WebSocket, codec: Box<dyn Codec>, params: ConnectionPar
                         break;
                     }
                     None if now.duration_since(last_activity) >= activity => {
-                        let ping = serde_json::json!({ "event": "pusher:ping", "data": {} }).to_string();
+                        let ping = codec.encode(&ServerEvent::Ping);
                         if sink.send(Message::Text(ping.into())).await.is_err() {
                             break;
                         }

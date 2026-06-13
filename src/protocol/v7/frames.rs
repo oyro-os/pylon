@@ -16,6 +16,7 @@ pub fn encode(event: &ServerEvent) -> String {
                     .to_string();
             json!({ "event": "pusher:connection_established", "data": data }).to_string()
         }
+        ServerEvent::Ping => json!({ "event": "pusher:ping", "data": {} }).to_string(),
         ServerEvent::Pong => json!({ "event": "pusher:pong", "data": {} }).to_string(),
         ServerEvent::SubscriptionSucceeded { channel, presence } => {
             let data = match presence {
@@ -120,6 +121,13 @@ mod tests {
         let data = parse(out["data"].as_str().expect("data is a stringified JSON"));
         assert_eq!(data["socket_id"], id.as_str());
         assert_eq!(data["activity_timeout"], 120);
+    }
+
+    #[test]
+    fn ping_frame() {
+        let out = parse(&encode(&ServerEvent::Ping));
+        assert_eq!(out["event"], "pusher:ping");
+        assert!(out["data"].is_object());
     }
 
     #[test]

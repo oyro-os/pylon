@@ -18,6 +18,7 @@ pub enum ServerEvent {
         socket_id: SocketId,
         activity_timeout: u32,
     },
+    Ping,
     Pong,
     SubscriptionSucceeded {
         channel: String,
