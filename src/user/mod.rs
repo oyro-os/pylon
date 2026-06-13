@@ -3,7 +3,7 @@
 
 use serde_json::Value;
 
-// pub mod registry; // re-enabled in Task A5
+pub mod registry;
 
 /// A connection's authenticated user, parsed from `user_data`. `user_info` is
 /// intentionally not split out (unused in SP4) — it stays inside `user_data_raw`.

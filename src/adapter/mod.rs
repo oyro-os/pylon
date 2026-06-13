@@ -9,6 +9,7 @@ use crate::connection::handle::ConnectionHandle;
 use crate::presence::member::PresenceMember;
 use crate::protocol::event::ServerEvent;
 use crate::protocol::socket_id::SocketId;
+use crate::user::{UserJoinOutcome, UserLeaveOutcome};
 use async_trait::async_trait;
 use std::time::Duration;
 
@@ -50,4 +51,22 @@ pub trait Adapter: Send + Sync {
     /// Fetch the last cached event for a cache channel, or `None` if there is
     /// none or it has expired.
     async fn cache_get(&self, app: &str, channel: &str) -> Option<CachedEvent>;
+
+    /// Bind a connection to a user. `first_for_user` is true when this is the
+    /// user's first live connection (offline -> online transition).
+    async fn signin_user(
+        &self,
+        app: &str,
+        user_id: &str,
+        handle: ConnectionHandle,
+    ) -> UserJoinOutcome;
+
+    /// Unbind a connection from a user. `last_for_user` is true when the user
+    /// has no remaining connections (online -> offline transition).
+    async fn signout_user(
+        &self,
+        app: &str,
+        user_id: &str,
+        socket_id: &SocketId,
+    ) -> UserLeaveOutcome;
 }

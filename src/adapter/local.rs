@@ -6,6 +6,8 @@ use crate::connection::handle::ConnectionHandle;
 use crate::presence::member::PresenceMember;
 use crate::protocol::event::ServerEvent;
 use crate::protocol::socket_id::SocketId;
+use crate::user::registry::UserRegistry;
+use crate::user::{UserJoinOutcome, UserLeaveOutcome};
 use async_trait::async_trait;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -13,6 +15,7 @@ use std::time::{Duration, Instant};
 pub struct LocalAdapter {
     registry: Arc<Registry>,
     cache: CacheStore,
+    users: UserRegistry,
 }
 
 impl LocalAdapter {
@@ -20,6 +23,7 @@ impl LocalAdapter {
         Self {
             registry,
             cache: CacheStore::new(),
+            users: UserRegistry::new(),
         }
     }
 }
@@ -90,6 +94,24 @@ impl Adapter for LocalAdapter {
         }
         self.cache.remove(&key);
         None
+    }
+
+    async fn signin_user(
+        &self,
+        app: &str,
+        user_id: &str,
+        handle: ConnectionHandle,
+    ) -> UserJoinOutcome {
+        self.users.signin(app, user_id, handle)
+    }
+
+    async fn signout_user(
+        &self,
+        app: &str,
+        user_id: &str,
+        socket_id: &SocketId,
+    ) -> UserLeaveOutcome {
+        self.users.signout(app, user_id, socket_id)
     }
 }
 
