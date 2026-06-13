@@ -1,1 +1,60 @@
+//! Pusher connection error / close codes (see protocol spec §error codes).
 
+/// A `pusher:error` payload. Note: unlike most frames, its `data` is encoded as
+/// a plain JSON object, not a double-encoded string (handled by the v7 codec).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PusherError {
+    pub code: u16,
+    pub message: String,
+}
+
+impl PusherError {
+    pub fn new(code: u16, message: impl Into<String>) -> Self {
+        Self {
+            code,
+            message: message.into(),
+        }
+    }
+    pub fn app_not_found() -> Self {
+        Self::new(4001, "Could not find app by key")
+    }
+    pub fn over_capacity() -> Self {
+        Self::new(4004, "App connection limit reached")
+    }
+    pub fn invalid_version() -> Self {
+        Self::new(4006, "Invalid protocol version")
+    }
+    pub fn unsupported_protocol() -> Self {
+        Self::new(4007, "Unsupported protocol version")
+    }
+    pub fn no_protocol() -> Self {
+        Self::new(4008, "No protocol version supplied")
+    }
+    pub fn unauthorized() -> Self {
+        Self::new(4009, "Connection is unauthorized")
+    }
+    pub fn pong_not_received() -> Self {
+        Self::new(4201, "Pong reply not received")
+    }
+    pub fn inactive() -> Self {
+        Self::new(4202, "Closed due to inactivity")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn constructors_carry_spec_codes() {
+        assert_eq!(PusherError::app_not_found().code, 4001);
+        assert_eq!(PusherError::over_capacity().code, 4004);
+        assert_eq!(PusherError::invalid_version().code, 4006);
+        assert_eq!(PusherError::unsupported_protocol().code, 4007);
+        assert_eq!(PusherError::no_protocol().code, 4008);
+        assert_eq!(PusherError::unauthorized().code, 4009);
+        assert_eq!(PusherError::pong_not_received().code, 4201);
+        assert_eq!(PusherError::inactive().code, 4202);
+        assert!(!PusherError::app_not_found().message.is_empty());
+    }
+}
