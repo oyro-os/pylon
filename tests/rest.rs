@@ -5,7 +5,7 @@ use pylon::adapter::local::LocalAdapter;
 use pylon::adapter::Adapter;
 use pylon::app::static_file::StaticFileAppManager;
 use pylon::app::AppManager;
-use pylon::auth::signature::{hmac_sha256_hex, md5_hex};
+use pylon::auth::signature::{channel_signature, hmac_sha256_hex, md5_hex};
 use pylon::channel::registry::Registry;
 use pylon::server::config::ServerConfig;
 use pylon::server::router::{build_router, AppState};
@@ -62,7 +62,7 @@ fn signed_query(method: &str, path: &str, body: &[u8], extra: &[(&str, &str)]) -
         .map(|(k, v)| format!("{k}={v}"))
         .collect::<Vec<_>>()
         .join("&");
-    let signed = format!("{}\n{}\n{}", method, path, canon);
+    let signed = format!("{}\n{}\n{}", method.to_uppercase(), path, canon);
     let sig = hmac_sha256_hex(SECRET, &signed);
     format!("{canon}&auth_signature={sig}")
 }
@@ -80,6 +80,23 @@ async fn next_json(ws: &mut Ws) -> Value {
             return serde_json::from_str(&t).unwrap();
         }
     }
+}
+
+/// Read the `connection_established` frame and return the assigned socket_id.
+async fn established_socket_id(ws: &mut Ws) -> String {
+    let frame = next_json(ws).await;
+    let data: Value = serde_json::from_str(frame["data"].as_str().unwrap()).unwrap();
+    data["socket_id"].as_str().unwrap().to_string()
+}
+
+/// Subscribe `ws` to a public channel and consume the success frame.
+async fn subscribe_public(ws: &mut Ws, channel: &str) {
+    ws.send(Message::Text(
+        json!({"event":"pusher:subscribe","data":{"channel":channel}}).to_string(),
+    ))
+    .await
+    .unwrap();
+    let _ = next_json(ws).await; // subscription_succeeded
 }
 
 #[tokio::test]
@@ -156,4 +173,109 @@ async fn rest_get_channel_reports_occupancy() {
     let v: Value = resp.json().await.unwrap();
     assert_eq!(v["occupied"], true);
     assert_eq!(v["subscription_count"], 1);
+}
+
+#[tokio::test]
+async fn rest_batch_events_delivers_to_two_channels() {
+    let addr = spawn().await;
+    let mut ws = connect_ws(addr).await;
+    let _ = next_json(&mut ws).await; // established
+    subscribe_public(&mut ws, "room-a").await;
+    subscribe_public(&mut ws, "room-b").await;
+
+    let body = json!({"batch":[
+        {"name":"ev-a","data":"1","channel":"room-a"},
+        {"name":"ev-b","data":"2","channel":"room-b"}
+    ]})
+    .to_string();
+    let q = signed_query("POST", "/apps/app1/batch_events", body.as_bytes(), &[]);
+    let resp = reqwest::Client::new()
+        .post(format!("http://{addr}/apps/app1/batch_events?{q}"))
+        .body(body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    // Both events are fanned out; collect by channel to be order-independent.
+    let mut got = std::collections::HashMap::new();
+    for _ in 0..2 {
+        let f = next_json(&mut ws).await;
+        got.insert(
+            f["channel"].as_str().unwrap().to_string(),
+            f["event"].as_str().unwrap().to_string(),
+        );
+    }
+    assert_eq!(got.get("room-a").map(String::as_str), Some("ev-a"));
+    assert_eq!(got.get("room-b").map(String::as_str), Some("ev-b"));
+}
+
+#[tokio::test]
+async fn rest_get_channels_lists_occupied_channel() {
+    let addr = spawn().await;
+    let mut ws = connect_ws(addr).await;
+    let _ = next_json(&mut ws).await;
+    subscribe_public(&mut ws, "public-room").await;
+
+    let q = signed_query("GET", "/apps/app1/channels", b"", &[]);
+    let resp = reqwest::Client::new()
+        .get(format!("http://{addr}/apps/app1/channels?{q}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let v: Value = resp.json().await.unwrap();
+    assert!(v["channels"]["public-room"].is_object());
+}
+
+#[tokio::test]
+async fn rest_get_users_lists_presence_members() {
+    let addr = spawn().await;
+    let mut ws = connect_ws(addr).await;
+    let socket_id = established_socket_id(&mut ws).await;
+
+    let channel = "presence-room";
+    let channel_data = json!({"user_id":"u1","user_info":{"name":"U"}}).to_string();
+    let token = format!(
+        "app-key:{}",
+        channel_signature(SECRET, &socket_id, channel, Some(&channel_data))
+    );
+    ws.send(Message::Text(
+        json!({"event":"pusher:subscribe","data":{
+            "channel": channel, "auth": token, "channel_data": channel_data
+        }})
+        .to_string(),
+    ))
+    .await
+    .unwrap();
+    let _ = next_json(&mut ws).await; // subscription_succeeded (presence roster)
+
+    let q = signed_query("GET", "/apps/app1/channels/presence-room/users", b"", &[]);
+    let resp = reqwest::Client::new()
+        .get(format!(
+            "http://{addr}/apps/app1/channels/presence-room/users?{q}"
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let v: Value = resp.json().await.unwrap();
+    assert_eq!(v["users"], json!([{"id": "u1"}]));
+}
+
+#[tokio::test]
+async fn rest_body_too_large_is_413() {
+    let addr = spawn().await;
+    // Default limits → body cap = 10*10240 + 64KiB ≈ 164KiB; exceed it. The
+    // limit fires at body extraction, before the signature check runs.
+    let big = "x".repeat(200 * 1024);
+    let body = json!({"name": "e", "data": big, "channels": ["c"]}).to_string();
+    let q = signed_query("POST", "/apps/app1/events", body.as_bytes(), &[]);
+    let resp = reqwest::Client::new()
+        .post(format!("http://{addr}/apps/app1/events?{q}"))
+        .body(body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 413);
 }
