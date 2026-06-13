@@ -87,8 +87,19 @@ pub async fn run(socket: WebSocket, codec: Box<dyn Codec>, params: ConnectionPar
                 }
             }
             Some(ev) = rx.recv() => {
-                if sink.send(Message::Text(codec.encode(&ev).into())).await.is_err() {
-                    break;
+                match ev {
+                    ServerEvent::Close { code, reason } => {
+                        use axum::extract::ws::CloseFrame;
+                        let _ = sink
+                            .send(Message::Close(Some(CloseFrame { code, reason: reason.into() })))
+                            .await;
+                        break;
+                    }
+                    other => {
+                        if sink.send(Message::Text(codec.encode(&other).into())).await.is_err() {
+                            break;
+                        }
+                    }
                 }
             }
             _ = ticker.tick() => {

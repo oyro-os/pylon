@@ -66,6 +66,13 @@ pub enum ServerEvent {
     SigninSuccess {
         user_data: String,
     },
+    /// A control directive: write a WebSocket Close frame with this code/reason
+    /// and end the connection. Intercepted by the connection task — never encoded
+    /// to text. Used for fatal `4009` paths (bad signin, terminate).
+    Close {
+        code: u16,
+        reason: String,
+    },
 }
 
 #[cfg(test)]

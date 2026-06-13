@@ -75,6 +75,9 @@ pub fn encode(event: &ServerEvent) -> String {
             json!({ "event": "pusher:signin_success", "data": { "user_data": user_data } })
                 .to_string()
         }
+        // Control frame — the connection task intercepts `Close` before encoding,
+        // so this arm is unreachable in practice; present only for exhaustiveness.
+        ServerEvent::Close { .. } => String::new(),
     }
 }
 
@@ -354,6 +357,18 @@ mod tests {
             "signin_success data is a plain object"
         );
         assert_eq!(out["data"]["user_data"], r#"{"id":"7"}"#);
+    }
+
+    #[test]
+    fn close_encodes_to_empty_text() {
+        // Close is intercepted by the connection task; encode is a no-op safety net.
+        assert_eq!(
+            encode(&ServerEvent::Close {
+                code: 4009,
+                reason: "x".into()
+            }),
+            ""
+        );
     }
 
     #[test]
