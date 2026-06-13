@@ -36,7 +36,11 @@ impl ConnectionContext {
     pub async fn dispatch(&mut self, cmd: ClientCommand) {
         match cmd {
             ClientCommand::Ping => self.send_self(ServerEvent::Pong),
-            ClientCommand::Subscribe { channel, .. } => self.subscribe(channel).await,
+            ClientCommand::Subscribe {
+                channel,
+                auth,
+                channel_data,
+            } => self.subscribe(channel, auth, channel_data).await,
             ClientCommand::Unsubscribe { channel } => self.unsubscribe(channel).await,
             ClientCommand::ClientEvent { .. } => {
                 // Client events are valid only on private/presence channels (SP2).
@@ -49,7 +53,12 @@ impl ConnectionContext {
         }
     }
 
-    async fn subscribe(&mut self, channel: String) {
+    async fn subscribe(
+        &mut self,
+        channel: String,
+        auth: Option<String>,
+        _channel_data: Option<String>,
+    ) {
         match ChannelKind::of(&channel) {
             ChannelKind::Public => {
                 let out = self
@@ -64,9 +73,52 @@ impl ConnectionContext {
                 self.maybe_emit_count(&channel, out.subscription_count)
                     .await;
             }
-            // private / presence / encrypted / cache require auth — SP2/SP3.
+            ChannelKind::Private => {
+                let token = match auth.as_deref() {
+                    Some(t) => t,
+                    None => {
+                        return self.send_subscription_error(
+                            &channel,
+                            "AuthError",
+                            "Auth signature required",
+                            401,
+                        )
+                    }
+                };
+                if let Err(e) = crate::auth::channel::verify(
+                    &self.app.key,
+                    &self.app.secret,
+                    self.socket_id.as_str(),
+                    &channel,
+                    None,
+                    token,
+                ) {
+                    return self.send_subscription_error(&channel, "AuthError", e.message(), 401);
+                }
+                let out = self
+                    .adapter
+                    .subscribe(&self.app.id, &channel, self.handle(), None)
+                    .await;
+                self.subscribed.insert(channel.clone());
+                self.send_self(ServerEvent::SubscriptionSucceeded {
+                    channel: channel.clone(),
+                    presence: None,
+                });
+                self.maybe_emit_count(&channel, out.subscription_count)
+                    .await;
+            }
+            // presence / encrypted / cache require auth — SP2/SP3.
             _ => self.send_self(ServerEvent::Error(PusherError::unauthorized())),
         }
+    }
+
+    fn send_subscription_error(&self, channel: &str, error_type: &str, error: &str, status: u16) {
+        self.send_self(ServerEvent::SubscriptionError {
+            channel: channel.to_string(),
+            error_type: error_type.to_string(),
+            error: error.to_string(),
+            status,
+        });
     }
 
     async fn unsubscribe(&mut self, channel: String) {
@@ -180,7 +232,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn private_subscribe_unauthorized_in_sp1() {
+    async fn private_subscribe_without_auth_errors_non_fatally() {
         let (mut c, mut rx) = ctx(app(false));
         c.dispatch(ClientCommand::Subscribe {
             channel: "private-x".into(),
@@ -189,9 +241,32 @@ mod tests {
         })
         .await;
         match rx.try_recv() {
-            Ok(ServerEvent::Error(e)) => assert_eq!(e.code, 4009),
-            other => panic!("expected Error 4009, got {other:?}"),
+            Ok(ServerEvent::SubscriptionError {
+                channel, status, ..
+            }) => {
+                assert_eq!(channel, "private-x");
+                assert_eq!(status, 401);
+            }
+            other => panic!("expected SubscriptionError, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn private_subscribe_with_valid_auth_succeeds() {
+        let (mut c, mut rx) = ctx(app(false));
+        let sid = c.socket_id.as_str().to_string();
+        let sig = crate::auth::signature::channel_signature("s", &sid, "private-x", None);
+        let token = format!("k:{sig}"); // app key "k", secret "s" from the `app()` helper
+        c.dispatch(ClientCommand::Subscribe {
+            channel: "private-x".into(),
+            auth: Some(token),
+            channel_data: None,
+        })
+        .await;
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(ServerEvent::SubscriptionSucceeded { .. })
+        ));
     }
 
     #[tokio::test]
