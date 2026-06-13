@@ -1,0 +1,13 @@
+[
+  {
+    "name": "Example App",
+    "id": "<your-app-id>",
+    "key": "<your-app-key>",
+    "secret": "<your-app-secret>",
+    "host": "",
+    "path": "",
+    "client_messages_enabled": true,
+    "capacity": 10000,
+    "statistics_enabled": false
+  }
+]

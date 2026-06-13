@@ -1,0 +1,31 @@
+[package]
+name = "pylon"
+version = "0.1.0"
+edition = "2021"
+description = "A Pusher-compatible real-time WebSocket server"
+repository = "https://github.com/oyro-os/pylon"
+
+[dependencies]
+# Async runtime
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "signal", "time"] }
+# HTTP + WebSocket (axum's ws extractor rides on tokio-tungstenite).
+# Swap to fastwebsockets + hyper later if raw throughput becomes the priority.
+axum = { version = "0.8", features = ["ws"] }
+# JSON
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# Pusher signature primitives
+hmac = "0.12"
+sha2 = "0.10"
+md-5 = "0.10"
+hex = "0.4"
+subtle = "2.6"          # constant-time comparison
+# Misc
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+dashmap = "6"           # sharded concurrent map for the channel registry
+
+[profile.release]
+lto = true
+codegen-units = 1

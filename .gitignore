@@ -1,0 +1,5 @@
+/target
+
+# Local app config holds real credentials — never commit it.
+# Copy apps.example.json to apps.json and fill in your values.
+/apps.json
