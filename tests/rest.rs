@@ -264,6 +264,45 @@ async fn rest_get_users_lists_presence_members() {
 }
 
 #[tokio::test]
+async fn rest_trigger_relays_to_encrypted_subscriber() {
+    let addr = spawn().await;
+    let mut ws = connect_ws(addr).await;
+    let socket_id = established_socket_id(&mut ws).await;
+
+    // Subscribe to an encrypted channel (private-style token, no channel_data).
+    let channel = "private-encrypted-room";
+    let token = format!(
+        "app-key:{}",
+        channel_signature(SECRET, &socket_id, channel, None)
+    );
+    ws.send(Message::Text(
+        json!({"event":"pusher:subscribe","data":{"channel":channel,"auth":token}}).to_string(),
+    ))
+    .await
+    .unwrap();
+    let succ = next_json(&mut ws).await;
+    assert_eq!(succ["event"], "pusher_internal:subscription_succeeded");
+
+    // REST-trigger an opaque ciphertext payload; pylon must relay it verbatim.
+    // `data` is a string on the wire (what Pusher server SDKs send for encrypted).
+    let cipher = "{\"nonce\":\"abc\",\"ciphertext\":\"xyz\"}";
+    let body = json!({"name":"secret","data":cipher,"channels":[channel]}).to_string();
+    let q = signed_query("POST", "/apps/app1/events", body.as_bytes(), &[]);
+    let resp = reqwest::Client::new()
+        .post(format!("http://{addr}/apps/app1/events?{q}"))
+        .body(body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let frame = next_json(&mut ws).await;
+    assert_eq!(frame["event"], "secret");
+    assert_eq!(frame["channel"], channel);
+    assert_eq!(frame["data"], cipher); // verbatim, untouched
+}
+
+#[tokio::test]
 async fn rest_body_too_large_is_413() {
     let addr = spawn().await;
     // Default limits → body cap = 10*10240 + 64KiB ≈ 164KiB; exceed it. The

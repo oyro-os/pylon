@@ -236,6 +236,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn encrypted_subscribe_with_valid_auth_succeeds() {
+        let (mut c, mut rx) = ctx(app(false));
+        let sid = c.socket_id.as_str().to_string();
+        // Encrypted subscribe is signed exactly like a private channel (no channel_data).
+        let sig = crate::auth::signature::channel_signature("s", &sid, "private-encrypted-x", None);
+        c.dispatch(ClientCommand::Subscribe {
+            channel: "private-encrypted-x".into(),
+            auth: Some(format!("k:{sig}")),
+            channel_data: None,
+        })
+        .await;
+        match rx.try_recv() {
+            Ok(ServerEvent::SubscriptionSucceeded { channel, presence }) => {
+                assert_eq!(channel, "private-encrypted-x");
+                assert!(presence.is_none(), "encrypted channels carry no roster");
+            }
+            other => panic!("expected SubscriptionSucceeded, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn encrypted_subscribe_without_auth_errors_non_fatally() {
+        let (mut c, mut rx) = ctx(app(false));
+        c.dispatch(ClientCommand::Subscribe {
+            channel: "private-encrypted-x".into(),
+            auth: None,
+            channel_data: None,
+        })
+        .await;
+        match rx.try_recv() {
+            Ok(ServerEvent::SubscriptionError {
+                channel, status, ..
+            }) => {
+                assert_eq!(channel, "private-encrypted-x");
+                assert_eq!(status, 401);
+            }
+            other => panic!("expected SubscriptionError, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
     async fn presence_subscribe_returns_roster_and_broadcasts_member_added() {
         let (mut c, mut rx) = ctx(app(false));
         let sid = c.socket_id.as_str().to_string();

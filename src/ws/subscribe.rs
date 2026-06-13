@@ -33,7 +33,9 @@ impl ConnectionContext {
                 self.maybe_emit_count(&channel, out.subscription_count)
                     .await;
             }
-            AuthKind::Private => {
+            // Encrypted channels authenticate exactly like private channels
+            // (HMAC over `socket_id:channel`, no channel_data) — pure relay.
+            AuthKind::Private | AuthKind::PrivateEncrypted => {
                 let token = match auth.as_deref() {
                     Some(t) => t,
                     None => {
@@ -159,10 +161,6 @@ impl ConnectionContext {
                 }
                 self.maybe_emit_count(&channel, out.subscription_count)
                     .await;
-            }
-            // Encrypted subscribe is added in Phase B; placeholder for now.
-            AuthKind::PrivateEncrypted => {
-                self.send_self(ServerEvent::Error(PusherError::unauthorized()))
             }
         }
     }
