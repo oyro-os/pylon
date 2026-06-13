@@ -219,3 +219,62 @@ async fn server_to_user_trigger_reaches_signed_in_connection() {
     assert_eq!(frame["channel"], "#server-to-user-u1");
     assert_eq!(frame["data"], "{\"msg\":\"hi\"}");
 }
+
+/// POST /apps/{app_id}/users/{user_id}/terminate_connections sends pusher:error
+/// 4009 to the target user's connections and then closes the socket.
+#[tokio::test]
+async fn terminate_user_connections_sends_error_and_closes() {
+    const USER_DATA: &str = r#"{"id":"u1"}"#;
+
+    let addr = spawn(ServerConfig::default()).await;
+    let mut ws = connect(addr, "?protocol=7").await;
+    let socket_id = established_socket_id(&mut ws).await;
+
+    // Sign in as user u1.
+    let auth = format!("{KEY}:{}", user_signature(SECRET, &socket_id, USER_DATA));
+    send_json(
+        &mut ws,
+        json!({
+            "event": "pusher:signin",
+            "data": { "auth": auth, "user_data": USER_DATA }
+        }),
+    )
+    .await;
+    let ack = next_json(&mut ws).await;
+    assert_eq!(ack["event"], "pusher:signin_success");
+
+    // REST: POST /apps/app/users/u1/terminate_connections with body `{}` — exactly
+    // what the Pusher SDK sends (terminateUserConnections does `post({ body: {} })`).
+    let path = "/apps/app/users/u1/terminate_connections";
+    let body = b"{}";
+    let q = signed_query("POST", path, body);
+    let resp = reqwest::Client::new()
+        .post(format!("http://{addr}{path}?{q}"))
+        .body(body.as_slice())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    // The signed-in connection must receive pusher:error with code 4009 …
+    match tokio::time::timeout(Duration::from_secs(5), ws.next()).await {
+        Ok(Some(Ok(Message::Text(t)))) => {
+            let v: Value = serde_json::from_str(&t).unwrap();
+            assert_eq!(v["event"], "pusher:error");
+            assert_eq!(v["data"]["code"], 4009);
+        }
+        other => panic!("expected pusher:error 4009, got {other:?}"),
+    }
+
+    // … and then the server closes the socket.
+    match tokio::time::timeout(Duration::from_secs(5), ws.next()).await {
+        Ok(Some(Ok(Message::Close(frame)))) => {
+            if let Some(cf) = frame {
+                assert_eq!(u16::from(cf.code), 4009, "close frame should carry 4009");
+            }
+        }
+        Ok(None) | Ok(Some(Err(_))) => { /* stream ended / errored: also acceptable */ }
+        Ok(Some(Ok(other))) => panic!("expected close after 4009 error, got {other:?}"),
+        Err(_) => panic!("timed out waiting for close after terminate"),
+    }
+}

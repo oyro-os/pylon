@@ -28,6 +28,10 @@ pub fn merge(router: Router<AppState>, body_limit: usize) -> Router<AppState> {
             "/apps/{app_id}/channels/{channel_name}/users",
             get(users::get_users),
         )
+        .route(
+            "/apps/{app_id}/users/{user_id}/terminate_connections",
+            post(users::terminate_user_connections),
+        )
         .layer(DefaultBodyLimit::max(body_limit));
     router.merge(rest)
 }
