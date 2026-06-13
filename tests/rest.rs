@@ -341,6 +341,37 @@ async fn rest_trigger_mixed_one_encrypted_one_public_is_200() {
 }
 
 #[tokio::test]
+async fn rest_trigger_caches_event_for_later_subscriber() {
+    let addr = spawn().await;
+
+    // Trigger to a cache channel BEFORE anyone subscribes — only the cache write matters.
+    let body = json!({"name":"my-event","data":"{\"hi\":1}","channels":["cache-feed"]}).to_string();
+    let q = signed_query("POST", "/apps/app1/events", body.as_bytes(), &[]);
+    let resp = reqwest::Client::new()
+        .post(format!("http://{addr}/apps/app1/events?{q}"))
+        .body(body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    // A new subscriber gets subscription_succeeded, then the replayed cached event.
+    let mut ws = connect_ws(addr).await;
+    let _ = next_json(&mut ws).await; // established
+    ws.send(Message::Text(
+        json!({"event":"pusher:subscribe","data":{"channel":"cache-feed"}}).to_string(),
+    ))
+    .await
+    .unwrap();
+    let succ = next_json(&mut ws).await;
+    assert_eq!(succ["event"], "pusher_internal:subscription_succeeded");
+    let replay = next_json(&mut ws).await;
+    assert_eq!(replay["event"], "my-event");
+    assert_eq!(replay["channel"], "cache-feed");
+    assert_eq!(replay["data"], "{\"hi\":1}"); // verbatim
+}
+
+#[tokio::test]
 async fn rest_body_too_large_is_413() {
     let addr = spawn().await;
     // Default limits → body cap = 10*10240 + 64KiB ≈ 164KiB; exceed it. The

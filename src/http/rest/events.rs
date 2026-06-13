@@ -1,5 +1,6 @@
 //! POST /apps/{app_id}/events and /batch_events.
 
+use crate::channel::cache::CachedEvent;
 use crate::channel::kind::{AuthKind, ChannelInfo};
 use crate::http::error::RestError;
 use crate::http::rest::auth::authenticate;
@@ -12,6 +13,7 @@ use axum::Json;
 use serde::Deserialize;
 use serde_json::{Map, Value};
 use std::collections::HashMap;
+use std::time::Duration;
 
 #[derive(Deserialize)]
 struct TriggerBody {
@@ -70,6 +72,21 @@ async fn deliver(
             except,
         )
         .await;
+    // Cache channels retain their last event for replay to new subscribers.
+    if ChannelInfo::of(channel).cache {
+        state
+            .adapter
+            .cache_set(
+                app_id,
+                channel,
+                CachedEvent {
+                    event: name.to_string(),
+                    data: data.to_string(),
+                },
+                Duration::from_secs(state.config.cache_ttl_secs),
+            )
+            .await;
+    }
 }
 
 /// Build the per-channel `info` attributes object (empty if nothing requested).
