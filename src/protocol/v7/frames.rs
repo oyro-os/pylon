@@ -43,6 +43,31 @@ pub fn encode(event: &ServerEvent) -> String {
             event,
             data,
         } => json!({ "event": event, "channel": channel, "data": data }).to_string(),
+        ServerEvent::SubscriptionError {
+            channel,
+            error_type,
+            error,
+            status,
+        } => json!({
+            "event": "pusher:subscription_error",
+            "channel": channel,
+            "data": { "type": error_type, "error": error, "status": status }
+        })
+        .to_string(),
+        ServerEvent::MemberAdded {
+            channel,
+            user_id,
+            user_info,
+        } => {
+            let data = json!({ "user_id": user_id, "user_info": user_info }).to_string();
+            json!({ "event": "pusher_internal:member_added", "channel": channel, "data": data })
+                .to_string()
+        }
+        ServerEvent::MemberRemoved { channel, user_id } => {
+            let data = json!({ "user_id": user_id }).to_string();
+            json!({ "event": "pusher_internal:member_removed", "channel": channel, "data": data })
+                .to_string()
+        }
     }
 }
 
@@ -223,5 +248,68 @@ mod tests {
             decode(r#"{"event":"pusher:pong"}"#).unwrap(),
             ClientCommand::Unknown("pusher:pong".into())
         );
+    }
+
+    #[test]
+    fn subscription_error_data_is_object() {
+        let out = parse(&encode(&ServerEvent::SubscriptionError {
+            channel: "private-x".into(),
+            error_type: "AuthError".into(),
+            error: "Invalid signature".into(),
+            status: 401,
+        }));
+        assert_eq!(out["event"], "pusher:subscription_error");
+        assert_eq!(out["channel"], "private-x");
+        assert!(
+            out["data"].is_object(),
+            "subscription_error data must be an object"
+        );
+        assert_eq!(out["data"]["type"], "AuthError");
+        assert_eq!(out["data"]["status"], 401);
+    }
+
+    #[test]
+    fn member_added_double_encodes() {
+        let out = parse(&encode(&ServerEvent::MemberAdded {
+            channel: "presence-x".into(),
+            user_id: "u1".into(),
+            user_info: serde_json::json!({"name":"Ann"}),
+        }));
+        assert_eq!(out["event"], "pusher_internal:member_added");
+        assert_eq!(out["channel"], "presence-x");
+        let data = parse(out["data"].as_str().expect("data is stringified JSON"));
+        assert_eq!(data["user_id"], "u1");
+        assert_eq!(data["user_info"]["name"], "Ann");
+    }
+
+    #[test]
+    fn member_removed_double_encodes_user_id_only() {
+        let out = parse(&encode(&ServerEvent::MemberRemoved {
+            channel: "presence-x".into(),
+            user_id: "u1".into(),
+        }));
+        assert_eq!(out["event"], "pusher_internal:member_removed");
+        let data = parse(out["data"].as_str().unwrap());
+        assert_eq!(data["user_id"], "u1");
+        assert!(data.get("user_info").is_none());
+    }
+
+    #[test]
+    fn presence_subscription_succeeded_double_encodes_roster() {
+        use crate::protocol::event::PresencePayload;
+        let mut hash = serde_json::Map::new();
+        hash.insert("u1".into(), serde_json::json!({"name":"Ann"}));
+        let out = parse(&encode(&ServerEvent::SubscriptionSucceeded {
+            channel: "presence-x".into(),
+            presence: Some(PresencePayload {
+                ids: vec!["u1".into()],
+                hash,
+                count: 1,
+            }),
+        }));
+        let data = parse(out["data"].as_str().unwrap());
+        assert_eq!(data["presence"]["count"], 1);
+        assert_eq!(data["presence"]["ids"][0], "u1");
+        assert_eq!(data["presence"]["hash"]["u1"]["name"], "Ann");
     }
 }

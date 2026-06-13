@@ -35,6 +35,24 @@ pub enum ServerEvent {
         event: String,
         data: Value,
     },
+    /// `pusher:subscription_error` — non-fatal, channel-scoped. Data is an OBJECT.
+    SubscriptionError {
+        channel: String,
+        error_type: String,
+        error: String,
+        status: u16,
+    },
+    /// `pusher_internal:member_added` (presence). Data double-encoded.
+    MemberAdded {
+        channel: String,
+        user_id: String,
+        user_info: Value,
+    },
+    /// `pusher_internal:member_removed` (presence). Data double-encoded.
+    MemberRemoved {
+        channel: String,
+        user_id: String,
+    },
 }
 
 #[cfg(test)]
