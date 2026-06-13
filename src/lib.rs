@@ -6,6 +6,7 @@ pub mod app;
 pub mod channel;
 pub mod connection;
 pub mod http;
+pub mod presence;
 pub mod protocol;
 pub mod server;
 pub mod ws;
