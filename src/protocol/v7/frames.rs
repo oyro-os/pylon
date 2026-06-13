@@ -1,7 +1,9 @@
 //! v7 wire (de)serialization. Every `data` is double-encoded EXCEPT pusher:error.
 
+use crate::protocol::codec::DecodeError;
+use crate::protocol::command::ClientCommand;
 use crate::protocol::event::ServerEvent;
-use serde_json::json;
+use serde_json::{json, Value};
 
 pub fn encode(event: &ServerEvent) -> String {
     match event {
@@ -40,6 +42,58 @@ pub fn encode(event: &ServerEvent) -> String {
             event,
             data,
         } => json!({ "event": event, "channel": channel, "data": data }).to_string(),
+    }
+}
+
+pub fn decode(text: &str) -> Result<ClientCommand, DecodeError> {
+    let v: Value = serde_json::from_str(text)?;
+    let event = v
+        .get("event")
+        .and_then(Value::as_str)
+        .ok_or(DecodeError::MissingField("event"))?;
+    match event {
+        "pusher:ping" => Ok(ClientCommand::Ping),
+        "pusher:subscribe" => {
+            let data = v.get("data").ok_or(DecodeError::MissingField("data"))?;
+            let channel = data
+                .get("channel")
+                .and_then(Value::as_str)
+                .ok_or(DecodeError::MissingField("channel"))?
+                .to_string();
+            let auth = data.get("auth").and_then(Value::as_str).map(String::from);
+            let channel_data = data
+                .get("channel_data")
+                .and_then(Value::as_str)
+                .map(String::from);
+            Ok(ClientCommand::Subscribe {
+                channel,
+                auth,
+                channel_data,
+            })
+        }
+        "pusher:unsubscribe" => {
+            let data = v.get("data").ok_or(DecodeError::MissingField("data"))?;
+            let channel = data
+                .get("channel")
+                .and_then(Value::as_str)
+                .ok_or(DecodeError::MissingField("channel"))?
+                .to_string();
+            Ok(ClientCommand::Unsubscribe { channel })
+        }
+        name if name.starts_with("client-") => {
+            let channel = v
+                .get("channel")
+                .and_then(Value::as_str)
+                .ok_or(DecodeError::MissingField("channel"))?
+                .to_string();
+            let data = v.get("data").cloned().unwrap_or(Value::Null);
+            Ok(ClientCommand::ClientEvent {
+                event: name.to_string(),
+                channel,
+                data,
+            })
+        }
+        other => Ok(ClientCommand::Unknown(other.to_string())),
     }
 }
 
@@ -106,5 +160,60 @@ mod tests {
             "error data must be an object, not stringified"
         );
         assert_eq!(out["data"]["code"], 4001);
+    }
+
+    use crate::protocol::command::ClientCommand;
+
+    #[test]
+    fn decodes_ping() {
+        assert_eq!(
+            decode(r#"{"event":"pusher:ping","data":{}}"#).unwrap(),
+            ClientCommand::Ping
+        );
+    }
+
+    #[test]
+    fn decodes_public_subscribe() {
+        let cmd =
+            decode(r#"{"event":"pusher:subscribe","data":{"channel":"my-channel"}}"#).unwrap();
+        assert_eq!(
+            cmd,
+            ClientCommand::Subscribe {
+                channel: "my-channel".into(),
+                auth: None,
+                channel_data: None
+            }
+        );
+    }
+
+    #[test]
+    fn decodes_unsubscribe() {
+        let cmd = decode(r#"{"event":"pusher:unsubscribe","data":{"channel":"c"}}"#).unwrap();
+        assert_eq!(
+            cmd,
+            ClientCommand::Unsubscribe {
+                channel: "c".into()
+            }
+        );
+    }
+
+    #[test]
+    fn decodes_client_event() {
+        let cmd = decode(r#"{"event":"client-foo","channel":"private-x","data":{"a":1}}"#).unwrap();
+        match cmd {
+            ClientCommand::ClientEvent { event, channel, .. } => {
+                assert_eq!(event, "client-foo");
+                assert_eq!(channel, "private-x");
+            }
+            other => panic!("expected ClientEvent, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unknown_event_is_unknown() {
+        assert_eq!(
+            decode(r#"{"event":"pusher:pong"}"#).unwrap(),
+            ClientCommand::Unknown("pusher:pong".into())
+        );
     }
 }
