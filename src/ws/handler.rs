@@ -334,4 +334,70 @@ mod tests {
             "unsubscribed client event is silently dropped"
         );
     }
+
+    #[tokio::test]
+    async fn duplicate_presence_subscribe_is_idempotent() {
+        let (mut c, _rx) = ctx(app(false));
+        let sid = c.socket_id.as_str().to_string();
+        let cd = r#"{"user_id":"u1"}"#;
+        let sig = crate::auth::signature::channel_signature("s", &sid, "presence-x", Some(cd));
+        let make = || ClientCommand::Subscribe {
+            channel: "presence-x".into(),
+            auth: Some(format!("k:{sig}")),
+            channel_data: Some(cd.into()),
+        };
+        c.dispatch(make()).await;
+        c.dispatch(make()).await; // duplicate must be ignored, not double-counted
+        c.unsubscribe("presence-x".into()).await;
+        // If the duplicate had inflated conn_count, the user would still be present.
+        assert_eq!(
+            c.adapter.channel("app", "presence-x").await.user_count,
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn presence_over_member_cap_errors() {
+        let registry = Arc::new(Registry::new());
+        let adapter: Arc<dyn Adapter> = Arc::new(LocalAdapter::new(registry));
+        let mk = || {
+            let (tx, rx) = mpsc::unbounded_channel();
+            let mut limits = crate::server::config::ServerConfig::default().limits();
+            limits.max_presence_members = 1;
+            let c = ConnectionContext {
+                app: app(false),
+                socket_id: SocketId::generate(),
+                self_tx: tx,
+                adapter: adapter.clone(),
+                limits,
+                subscribed: HashSet::new(),
+            };
+            (c, rx)
+        };
+        let sub = |c: &ConnectionContext, user: &str| {
+            let sid = c.socket_id.as_str().to_string();
+            let cd = format!(r#"{{"user_id":"{user}"}}"#);
+            let sig = crate::auth::signature::channel_signature("s", &sid, "presence-x", Some(&cd));
+            ClientCommand::Subscribe {
+                channel: "presence-x".into(),
+                auth: Some(format!("k:{sig}")),
+                channel_data: Some(cd),
+            }
+        };
+        let (mut a, _rxa) = mk();
+        let cmd_a = sub(&a, "ua");
+        a.dispatch(cmd_a).await; // fills the cap (max=1)
+        let (mut b, mut rxb) = mk();
+        let cmd_b = sub(&b, "ub");
+        b.dispatch(cmd_b).await; // second distinct user exceeds the cap
+        match rxb.try_recv() {
+            Ok(ServerEvent::SubscriptionError {
+                error_type, status, ..
+            }) => {
+                assert_eq!(error_type, "LimitReached");
+                assert_eq!(status, 4004);
+            }
+            other => panic!("expected LimitReached SubscriptionError, got {other:?}"),
+        }
+    }
 }

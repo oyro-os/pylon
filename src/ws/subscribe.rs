@@ -13,6 +13,11 @@ impl ConnectionContext {
         auth: Option<String>,
         channel_data: Option<String>,
     ) {
+        // Idempotent per spec §5.1: ignore a duplicate subscribe to an already-joined
+        // channel (prevents presence conn_count corruption / ghost members).
+        if self.subscribed.contains(&channel) {
+            return;
+        }
         match ChannelKind::of(&channel) {
             ChannelKind::Public => {
                 let out = self
