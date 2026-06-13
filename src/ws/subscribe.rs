@@ -1,7 +1,7 @@
 //! Subscribe/unsubscribe and client-event handling, split from `ws::handler`.
 
 use super::handler::ConnectionContext;
-use crate::channel::kind::{AuthKind, ChannelInfo};
+use crate::channel::kind::{AuthKind, ChannelInfo, SERVER_TO_USER_PREFIX};
 use crate::protocol::error::PusherError;
 use crate::protocol::event::ServerEvent;
 use serde_json::Value;
@@ -20,7 +20,7 @@ impl ConnectionContext {
         }
 
         // Reserved `#` channels are server-managed, never normal subscriptions.
-        if let Some(uid) = channel.strip_prefix("#server-to-user-") {
+        if let Some(uid) = channel.strip_prefix(SERVER_TO_USER_PREFIX) {
             let ok = self.user.as_ref().is_some_and(|u| u.id == uid);
             if ok {
                 // Delivery is via the user registry (set up at signin), NOT the

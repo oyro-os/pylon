@@ -63,7 +63,15 @@ async fn deliver(
     // via the user registry instead of broadcasting (and never cache it). The
     // delivered frame is byte-identical to a normal channel event so pusher-js's
     // `#server-to-user-<id>` handler processes it.
-    if let Some(user_id) = channel.strip_prefix("#server-to-user-") {
+    if let Some(user_id) = channel.strip_prefix(crate::channel::kind::SERVER_TO_USER_PREFIX) {
+        // Reject a malformed empty user id (e.g. exactly "#server-to-user-"):
+        // deliver to nobody rather than returning a misleading 200-with-no-effect.
+        if user_id.is_empty() {
+            return;
+        }
+        // NB: `socket_id` exclusion is intentionally NOT applied to server-to-user
+        // delivery — there is no "originating socket" among the user's connections
+        // (the trigger comes from the server via REST). Matches soketi's user-channel path.
         state
             .adapter
             .send_to_user(

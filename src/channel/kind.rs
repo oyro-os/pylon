@@ -2,6 +2,11 @@
 //! (public / private / presence / private-encrypted) and whether it is a cache
 //! channel (any auth kind plus a `cache-` segment after the auth prefix).
 
+/// Reserved channel namespace for Pusher server-to-user messaging:
+/// `#server-to-user-<user_id>`. Delivery is routed to the user's connections
+/// via the user registry, never the channel registry.
+pub const SERVER_TO_USER_PREFIX: &str = "#server-to-user-";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AuthKind {
     Public,
