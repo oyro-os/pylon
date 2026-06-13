@@ -110,17 +110,23 @@ impl ConnectionContext {
         }
     }
 
-    /// On disconnect: leave every channel, then sign out any bound user.
+    /// On disconnect: leave channels, sign out + emit watchlist offline if this
+    /// was the user's last connection, and drop this connection's own watches.
     pub async fn on_close(&mut self) {
         let channels: Vec<String> = self.subscribed.iter().cloned().collect();
         for channel in channels {
             self.unsubscribe(channel).await;
         }
         if let Some(user) = self.user.take() {
-            self.adapter
+            let outcome = self
+                .adapter
                 .signout_user(&self.app.id, &user.id, &self.socket_id)
                 .await;
+            if outcome.last_for_user {
+                self.notify_watchers(&user.id, "offline").await;
+            }
         }
+        self.adapter.unwatch(&self.app.id, &self.socket_id).await;
     }
 }
 

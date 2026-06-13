@@ -222,6 +222,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn watcher_is_notified_when_watched_user_disconnects() {
+        let adapter: Arc<dyn Adapter> = Arc::new(LocalAdapter::new(Arc::new(Registry::new())));
+        // B signs in (online).
+        let (mut c_b, _rx_b) = ctx_on(adapter.clone(), "2.2");
+        let sig_b = user_signature("app-secret", "2.2", r#"{"id":"B"}"#);
+        c_b.dispatch(ClientCommand::Signin {
+            auth: format!("app-key:{sig_b}"),
+            user_data: r#"{"id":"B"}"#.into(),
+        })
+        .await;
+        // C watches B (B online -> immediate online snapshot, drained below).
+        let (mut c_watch, mut rx_watch) = ctx_on(adapter.clone(), "1.1");
+        let sig_c = user_signature("app-secret", "1.1", r#"{"id":"C","watchlist":["B"]}"#);
+        c_watch
+            .dispatch(ClientCommand::Signin {
+                auth: format!("app-key:{sig_c}"),
+                user_data: r#"{"id":"C","watchlist":["B"]}"#.into(),
+            })
+            .await;
+        while rx_watch.try_recv().is_ok() {} // drain signin_success + online snapshot
+
+        c_b.on_close().await; // B's last connection closes -> offline
+        match rx_watch.try_recv() {
+            Ok(ServerEvent::WatchlistEvents { events }) => {
+                assert_eq!(events[0].name, "offline");
+                assert_eq!(events[0].user_ids, vec!["B".to_string()]);
+            }
+            other => panic!("expected offline WatchlistEvents, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
     async fn second_connection_does_not_reemit_online_to_watchers() {
         let adapter: Arc<dyn Adapter> = Arc::new(LocalAdapter::new(Arc::new(Registry::new())));
         // C watches B.
@@ -263,5 +295,52 @@ mod tests {
             rx_watch.try_recv().is_err(),
             "second connection must NOT re-emit online to watchers"
         );
+    }
+
+    #[tokio::test]
+    async fn non_last_connection_close_does_not_emit_offline_to_watchers() {
+        let adapter: Arc<dyn Adapter> = Arc::new(LocalAdapter::new(Arc::new(Registry::new())));
+        // B signs in on TWO connections.
+        let (mut c_b1, _rx_b1) = ctx_on(adapter.clone(), "2.2");
+        let sig_b1 = user_signature("app-secret", "2.2", r#"{"id":"B"}"#);
+        c_b1.dispatch(ClientCommand::Signin {
+            auth: format!("app-key:{sig_b1}"),
+            user_data: r#"{"id":"B"}"#.into(),
+        })
+        .await;
+        let (mut c_b2, _rx_b2) = ctx_on(adapter.clone(), "3.3");
+        let sig_b2 = user_signature("app-secret", "3.3", r#"{"id":"B"}"#);
+        c_b2.dispatch(ClientCommand::Signin {
+            auth: format!("app-key:{sig_b2}"),
+            user_data: r#"{"id":"B"}"#.into(),
+        })
+        .await;
+        // C watches B (B online -> snapshot, drained).
+        let (mut c_watch, mut rx_watch) = ctx_on(adapter.clone(), "1.1");
+        let sig_c = user_signature("app-secret", "1.1", r#"{"id":"C","watchlist":["B"]}"#);
+        c_watch
+            .dispatch(ClientCommand::Signin {
+                auth: format!("app-key:{sig_c}"),
+                user_data: r#"{"id":"C","watchlist":["B"]}"#.into(),
+            })
+            .await;
+        while rx_watch.try_recv().is_ok() {} // drain signin_success + online snapshot
+
+        // First of B's two connections closes -> NOT last -> no offline.
+        c_b1.on_close().await;
+        assert!(
+            rx_watch.try_recv().is_err(),
+            "non-last connection close must NOT emit offline"
+        );
+
+        // Second (last) connection closes -> offline emitted exactly once.
+        c_b2.on_close().await;
+        match rx_watch.try_recv() {
+            Ok(ServerEvent::WatchlistEvents { events }) => {
+                assert_eq!(events[0].name, "offline");
+                assert_eq!(events[0].user_ids, vec!["B".to_string()]);
+            }
+            other => panic!("expected offline WatchlistEvents, got {other:?}"),
+        }
     }
 }
