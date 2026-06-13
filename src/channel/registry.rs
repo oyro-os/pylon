@@ -1,13 +1,17 @@
-//! Per-(app, channel) subscriber registry. Stores mailbox handles, never sockets.
+//! Per-(app, channel) registry over `ChannelState`. Stores mailbox handles +
+//! presence membership, never sockets. Private store behind `LocalAdapter`.
 
+use crate::channel::outcome::{ChannelSummary, SubscribeOutcome, UnsubscribeOutcome};
+use crate::channel::state::ChannelState;
 use crate::connection::handle::ConnectionHandle;
+use crate::presence::member::PresenceMember;
 use crate::protocol::event::ServerEvent;
 use crate::protocol::socket_id::SocketId;
 use dashmap::DashMap;
 
 #[derive(Default)]
 pub struct Registry {
-    channels: DashMap<(String, String), DashMap<SocketId, ConnectionHandle>>,
+    channels: DashMap<(String, String), ChannelState>,
 }
 
 impl Registry {
@@ -15,33 +19,43 @@ impl Registry {
         Self::default()
     }
 
-    pub fn subscribe(&self, app: &str, channel: &str, handle: ConnectionHandle) {
+    pub fn subscribe(
+        &self,
+        app: &str,
+        channel: &str,
+        handle: ConnectionHandle,
+        member: Option<PresenceMember>,
+    ) -> SubscribeOutcome {
         let key = (app.to_string(), channel.to_string());
-        self.channels
-            .entry(key)
-            .or_default()
-            .insert(handle.socket_id.clone(), handle);
-    }
-
-    pub fn unsubscribe(&self, app: &str, channel: &str, socket_id: &SocketId) {
-        let key = (app.to_string(), channel.to_string());
-        let now_empty = match self.channels.get(&key) {
-            Some(subs) => {
-                subs.remove(socket_id);
-                subs.is_empty()
-            }
-            None => false,
-        };
-        if now_empty {
-            self.channels.remove_if(&key, |_, subs| subs.is_empty());
+        let mut state = self.channels.entry(key).or_default();
+        let presence = state.add(handle, member);
+        SubscribeOutcome {
+            subscription_count: state.subscription_count(),
+            presence,
         }
     }
 
-    pub fn count(&self, app: &str, channel: &str) -> usize {
-        self.channels
-            .get(&(app.to_string(), channel.to_string()))
-            .map(|s| s.len())
-            .unwrap_or(0)
+    pub fn unsubscribe(
+        &self,
+        app: &str,
+        channel: &str,
+        socket_id: &SocketId,
+    ) -> UnsubscribeOutcome {
+        let key = (app.to_string(), channel.to_string());
+        let (count, presence, now_empty) = match self.channels.get_mut(&key) {
+            Some(mut state) => {
+                let presence = state.remove(socket_id);
+                (state.subscription_count(), presence, state.is_empty())
+            }
+            None => (0, None, false),
+        };
+        if now_empty {
+            self.channels.remove_if(&key, |_, s| s.is_empty());
+        }
+        UnsubscribeOutcome {
+            subscription_count: count,
+            presence,
+        }
     }
 
     pub fn broadcast(
@@ -51,18 +65,50 @@ impl Registry {
         event: &ServerEvent,
         except: Option<&SocketId>,
     ) {
-        if let Some(subs) = self.channels.get(&(app.to_string(), channel.to_string())) {
-            for entry in subs.iter() {
-                if Some(entry.key()) == except {
-                    continue;
-                }
-                let _ = entry.value().mailbox.send(event.clone());
-            }
+        if let Some(state) = self.channels.get(&(app.to_string(), channel.to_string())) {
+            state.broadcast(event, except);
         }
     }
 
-    /// Number of `(app, channel)` entries currently tracked. Test-only: lets the
-    /// prune test distinguish "inner map empty" from "outer entry removed".
+    pub fn channel_summary(&self, app: &str, channel: &str) -> ChannelSummary {
+        match self.channels.get(&(app.to_string(), channel.to_string())) {
+            Some(s) => ChannelSummary {
+                name: channel.to_string(),
+                occupied: !s.is_empty(),
+                subscription_count: s.subscription_count(),
+                user_count: s.user_count(),
+            },
+            None => ChannelSummary {
+                name: channel.to_string(),
+                occupied: false,
+                subscription_count: 0,
+                user_count: None,
+            },
+        }
+    }
+
+    pub fn channels(&self, app: &str, prefix: Option<&str>) -> Vec<ChannelSummary> {
+        self.channels
+            .iter()
+            .filter(|e| e.key().0 == app && !e.value().is_empty())
+            .filter(|e| prefix.is_none_or(|p| e.key().1.starts_with(p)))
+            .map(|e| ChannelSummary {
+                name: e.key().1.clone(),
+                occupied: true,
+                subscription_count: e.value().subscription_count(),
+                user_count: e.value().user_count(),
+            })
+            .collect()
+    }
+
+    pub fn presence_members(&self, app: &str, channel: &str) -> Vec<PresenceMember> {
+        self.channels
+            .get(&(app.to_string(), channel.to_string()))
+            .map(|s| s.members())
+            .unwrap_or_default()
+    }
+
+    /// Number of tracked `(app, channel)` entries. Test-only.
     #[cfg(test)]
     pub fn channel_entry_count(&self) -> usize {
         self.channels.len()
@@ -72,6 +118,7 @@ impl Registry {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::protocol::event::ServerEvent;
     use tokio::sync::mpsc;
 
     fn handle() -> (ConnectionHandle, mpsc::UnboundedReceiver<ServerEvent>) {
@@ -86,23 +133,15 @@ mod tests {
     }
 
     #[test]
-    fn subscribe_and_count() {
-        let reg = Registry::new();
-        let (h, _rx) = handle();
-        reg.subscribe("app", "c", h);
-        assert_eq!(reg.count("app", "c"), 1);
-    }
-
-    #[test]
-    fn broadcast_reaches_subscriber_and_excludes_sender() {
+    fn subscribe_counts_and_broadcasts_excluding_sender() {
         let reg = Registry::new();
         let (h1, mut rx1) = handle();
         let (h2, mut rx2) = handle();
         let sid1 = h1.socket_id.clone();
-        reg.subscribe("app", "c", h1);
-        reg.subscribe("app", "c", h2);
+        assert_eq!(reg.subscribe("app", "c", h1, None).subscription_count, 1);
+        assert_eq!(reg.subscribe("app", "c", h2, None).subscription_count, 2);
         reg.broadcast("app", "c", &ServerEvent::Pong, Some(&sid1));
-        assert!(rx1.try_recv().is_err(), "excluded socket must not receive");
+        assert!(rx1.try_recv().is_err());
         assert!(matches!(rx2.try_recv(), Ok(ServerEvent::Pong)));
     }
 
@@ -111,13 +150,28 @@ mod tests {
         let reg = Registry::new();
         let (h, _rx) = handle();
         let sid = h.socket_id.clone();
-        reg.subscribe("app", "c", h);
-        reg.unsubscribe("app", "c", &sid);
-        assert_eq!(reg.count("app", "c"), 0);
+        reg.subscribe("app", "c", h, None);
+        let out = reg.unsubscribe("app", "c", &sid);
+        assert_eq!(out.subscription_count, 0);
         assert_eq!(
             reg.channel_entry_count(),
             0,
-            "outer channel entry should be pruned, not just emptied"
+            "empty channel entry must be pruned"
         );
+    }
+
+    #[test]
+    fn channels_query_filters_by_prefix() {
+        let reg = Registry::new();
+        let (h1, _r1) = handle();
+        let (h2, _r2) = handle();
+        reg.subscribe("app", "private-a", h1, None);
+        reg.subscribe("app", "public-b", h2, None);
+        let names: Vec<String> = reg
+            .channels("app", Some("private-"))
+            .into_iter()
+            .map(|s| s.name)
+            .collect();
+        assert_eq!(names, vec!["private-a".to_string()]);
     }
 }

@@ -53,8 +53,9 @@ impl ConnectionContext {
     async fn subscribe(&mut self, channel: String) {
         match ChannelKind::of(&channel) {
             ChannelKind::Public => {
-                self.registry
-                    .subscribe(&self.app.id, &channel, self.handle());
+                let _ = self
+                    .registry
+                    .subscribe(&self.app.id, &channel, self.handle(), None);
                 self.subscribed.insert(channel.clone());
                 self.send_self(ServerEvent::SubscriptionSucceeded {
                     channel: channel.clone(),
@@ -77,7 +78,10 @@ impl ConnectionContext {
 
     async fn maybe_emit_count(&self, channel: &str) {
         if self.app.subscription_count_enabled {
-            let count = self.registry.count(&self.app.id, channel);
+            let count = self
+                .registry
+                .channel_summary(&self.app.id, channel)
+                .subscription_count;
             self.adapter
                 .broadcast(
                     &self.app.id,
@@ -152,7 +156,10 @@ mod tests {
             rx.try_recv(),
             Ok(ServerEvent::SubscriptionSucceeded { .. })
         ));
-        assert_eq!(c.registry.count("app", "room"), 1);
+        assert_eq!(
+            c.registry.channel_summary("app", "room").subscription_count,
+            1
+        );
     }
 
     #[tokio::test]

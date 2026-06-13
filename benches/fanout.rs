@@ -22,6 +22,7 @@ fn bench_fanout(c: &mut Criterion) {
                     socket_id: SocketId::generate(),
                     mailbox: tx,
                 },
+                None,
             );
         }
         // Measures the broadcast plus a drain (drain keeps the unbounded mailboxes

@@ -47,6 +47,7 @@ mod tests {
                 socket_id: SocketId::generate(),
                 mailbox: tx,
             },
+            None,
         );
         adapter.broadcast("app", "c", ServerEvent::Pong, None).await;
         assert!(matches!(rx.try_recv(), Ok(ServerEvent::Pong)));
