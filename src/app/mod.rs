@@ -11,15 +11,9 @@ pub struct App {
     pub key: String,
     pub secret: String,
     #[serde(default)]
-    pub host: String,
-    #[serde(default)]
-    pub path: String,
-    #[serde(default)]
     pub client_messages_enabled: bool,
     #[serde(default)]
     pub capacity: u32,
-    #[serde(default)]
-    pub statistics_enabled: bool,
     #[serde(default)]
     pub subscription_count_enabled: bool,
 }

@@ -36,9 +36,6 @@ impl PusherError {
     pub fn pong_not_received() -> Self {
         Self::new(4201, "Pong reply not received")
     }
-    pub fn inactive() -> Self {
-        Self::new(4202, "Closed due to inactivity")
-    }
 }
 
 #[cfg(test)]
@@ -54,7 +51,6 @@ mod tests {
         assert_eq!(PusherError::no_protocol().code, 4008);
         assert_eq!(PusherError::unauthorized().code, 4009);
         assert_eq!(PusherError::pong_not_received().code, 4201);
-        assert_eq!(PusherError::inactive().code, 4202);
         assert!(!PusherError::app_not_found().message.is_empty());
     }
 }
