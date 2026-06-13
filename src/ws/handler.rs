@@ -421,6 +421,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn client_event_on_encrypted_channel_is_dropped() {
+        let registry = Arc::new(Registry::new());
+        let adapter: Arc<dyn Adapter> = Arc::new(LocalAdapter::new(registry));
+        let mk = |adapter: Arc<dyn Adapter>| {
+            let (tx, rx) = mpsc::unbounded_channel();
+            let c = ConnectionContext {
+                app: app_with_client_messages(true),
+                socket_id: SocketId::generate(),
+                self_tx: tx,
+                adapter,
+                limits: crate::server::config::ServerConfig::default().limits(),
+                subscribed: HashSet::new(),
+            };
+            (c, rx)
+        };
+        let (mut a, _rxa) = mk(adapter.clone());
+        let (mut b, mut rxb) = mk(adapter.clone());
+        for c in [&mut a, &mut b] {
+            let sid = c.socket_id.as_str().to_string();
+            let sig =
+                crate::auth::signature::channel_signature("s", &sid, "private-encrypted-x", None);
+            c.dispatch(ClientCommand::Subscribe {
+                channel: "private-encrypted-x".into(),
+                auth: Some(format!("k:{sig}")),
+                channel_data: None,
+            })
+            .await;
+        }
+        while rxb.try_recv().is_ok() {} // drain b's subscription_succeeded
+
+        // a sends a client event on the encrypted channel; b must NOT receive it.
+        a.dispatch(ClientCommand::ClientEvent {
+            event: "client-x".into(),
+            channel: "private-encrypted-x".into(),
+            data: serde_json::json!({}),
+        })
+        .await;
+        assert!(
+            rxb.try_recv().is_err(),
+            "client events on encrypted channels must not be relayed"
+        );
+    }
+
+    #[tokio::test]
     async fn presence_over_member_cap_errors() {
         let registry = Arc::new(Registry::new());
         let adapter: Arc<dyn Adapter> = Arc::new(LocalAdapter::new(registry));

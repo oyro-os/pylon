@@ -190,10 +190,8 @@ impl ConnectionContext {
         }
         // Client events are valid only on private/presence channels the sender joined.
         let auth = ChannelInfo::of(&channel).auth;
-        let allowed = matches!(
-            auth,
-            AuthKind::Private | AuthKind::Presence | AuthKind::PrivateEncrypted
-        );
+        // Client libraries cannot trigger events to encrypted channels.
+        let allowed = matches!(auth, AuthKind::Private | AuthKind::Presence);
         if !allowed || !self.subscribed.contains(&channel) {
             return; // silently dropped, matching Soketi/Pusher
         }
