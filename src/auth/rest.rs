@@ -59,7 +59,12 @@ pub fn verify(
     if now.abs_diff(ts) > window {
         return Err(RestAuthError::Expired);
     }
-    if !body.is_empty() {
+    // Enforce body_md5 whenever the signed request committed to one (the param is
+    // present) OR a body was received. This closes a body-stripping gap: a captured
+    // request whose body is removed in transit still carries the signed `body_md5`
+    // param, so the signature alone would pass — without this check verify would
+    // accept the now-empty body. md5_hex(b"") won't match the committed hash.
+    if !body.is_empty() || get("body_md5").is_some() {
         match get("body_md5") {
             Some(m) if constant_time_eq(m, &md5_hex(body)) => {}
             _ => return Err(RestAuthError::BadBodyMd5),
@@ -207,6 +212,67 @@ mod tests {
                 "/apps/1/events",
                 &p,
                 body,
+                1000,
+                600
+            ),
+            Err(RestAuthError::BadBodyMd5)
+        );
+    }
+
+    #[test]
+    fn rejects_missing_timestamp() {
+        let mut p = signed_params("secret", "GET", "/apps/1/channels", 1000, b"");
+        p.remove("auth_timestamp");
+        assert_eq!(
+            verify(
+                "app-key",
+                "secret",
+                "GET",
+                "/apps/1/channels",
+                &p,
+                b"",
+                1000,
+                600
+            ),
+            Err(RestAuthError::MissingParam)
+        );
+    }
+
+    #[test]
+    fn rejects_wrong_key() {
+        // params carry auth_key="app-key" but the app's key is different.
+        let p = signed_params("secret", "GET", "/apps/1/channels", 1000, b"");
+        assert_eq!(
+            verify(
+                "other-key",
+                "secret",
+                "GET",
+                "/apps/1/channels",
+                &p,
+                b"",
+                1000,
+                600
+            ),
+            Err(RestAuthError::KeyMismatch)
+        );
+    }
+
+    #[test]
+    fn rejects_stripped_body_when_md5_present() {
+        // A request signed over a non-empty body (so body_md5 is committed), but the
+        // body is stripped to empty in transit. The signature still matches the
+        // params, yet verify must reject because the committed body_md5 no longer
+        // matches the (now empty) body.
+        let body = br#"{"name":"e","data":"{}"}"#;
+        let p = signed_params("secret", "POST", "/apps/1/events", 1000, body);
+        assert_eq!(
+            verify(
+                "app-key",
+                "secret",
+                "POST",
+                "/apps/1/events",
+                &p,
+                b"",
                 1000,
                 600
             ),
