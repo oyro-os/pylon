@@ -254,6 +254,13 @@ mod tests {
             }
             other => panic!("expected SubscriptionSucceeded, got {other:?}"),
         }
+        assert_eq!(
+            c.adapter
+                .channel("app", "private-encrypted-x")
+                .await
+                .subscription_count,
+            1
+        );
     }
 
     #[tokio::test]
