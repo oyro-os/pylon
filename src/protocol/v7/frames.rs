@@ -75,6 +75,14 @@ pub fn encode(event: &ServerEvent) -> String {
             json!({ "event": "pusher:signin_success", "data": { "user_data": user_data } })
                 .to_string()
         }
+        ServerEvent::WatchlistEvents { events } => {
+            let events: Vec<Value> = events
+                .iter()
+                .map(|e| json!({ "name": e.name, "user_ids": e.user_ids }))
+                .collect();
+            json!({ "event": "pusher_internal:watchlist_events", "data": { "events": events } })
+                .to_string()
+        }
         // Control frame — the connection task intercepts `Close` before encoding,
         // so this arm is unreachable in practice; present only for exhaustiveness.
         ServerEvent::Close { .. } => String::new(),
@@ -357,6 +365,25 @@ mod tests {
             "signin_success data is a plain object"
         );
         assert_eq!(out["data"]["user_data"], r#"{"id":"7"}"#);
+    }
+
+    #[test]
+    fn watchlist_events_frame_is_connection_level_object() {
+        use crate::protocol::event::WatchlistChange;
+        let out = parse(&encode(&ServerEvent::WatchlistEvents {
+            events: vec![WatchlistChange {
+                name: "online".into(),
+                user_ids: vec!["7".into()],
+            }],
+        }));
+        assert_eq!(out["event"], "pusher_internal:watchlist_events");
+        assert!(
+            out.get("channel").is_none(),
+            "watchlist events are not channel-scoped"
+        );
+        assert!(out["data"].is_object());
+        assert_eq!(out["data"]["events"][0]["name"], "online");
+        assert_eq!(out["data"]["events"][0]["user_ids"][0], "7");
     }
 
     #[test]

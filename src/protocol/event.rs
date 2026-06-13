@@ -4,6 +4,14 @@ use crate::protocol::error::PusherError;
 use crate::protocol::socket_id::SocketId;
 use serde_json::{Map, Value};
 
+/// One online/offline change inside a `watchlist_events` batch.
+#[derive(Debug, Clone, PartialEq)]
+pub struct WatchlistChange {
+    /// "online" or "offline".
+    pub name: String,
+    pub user_ids: Vec<String>,
+}
+
 /// Presence roster. Empty in SP1 (no presence channels yet); filled in SP2.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct PresencePayload {
@@ -65,6 +73,12 @@ pub enum ServerEvent {
     /// intentionally do NOT reflect the credential back.)
     SigninSuccess {
         user_data: String,
+    },
+    /// `pusher_internal:watchlist_events` — connection-level; data is a plain
+    /// object `{ "events": [ { "name", "user_ids" } ] }` (pusher-js
+    /// watchlist.ts:17-29 reads `data.events[].name` / `.user_ids`).
+    WatchlistEvents {
+        events: Vec<WatchlistChange>,
     },
     /// A control directive: write a WebSocket Close frame with this code/reason
     /// and end the connection. Intercepted by the connection task — never encoded
