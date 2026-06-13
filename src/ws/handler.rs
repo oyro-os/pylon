@@ -220,6 +220,21 @@ impl ConnectionContext {
                 .adapter
                 .unsubscribe(&self.app.id, &channel, &self.socket_id)
                 .await;
+            if let Some(leave) = out.presence {
+                if leave.last_for_user {
+                    self.adapter
+                        .broadcast(
+                            &self.app.id,
+                            &channel,
+                            ServerEvent::MemberRemoved {
+                                channel: channel.clone(),
+                                user_id: leave.user_id,
+                            },
+                            None,
+                        )
+                        .await;
+                }
+            }
             self.maybe_emit_count(&channel, out.subscription_count)
                 .await;
         }
@@ -400,6 +415,52 @@ mod tests {
             rx.try_recv(),
             Ok(ServerEvent::SubscriptionError { .. })
         ));
+    }
+
+    #[tokio::test]
+    async fn presence_unsubscribe_broadcasts_member_removed_to_others() {
+        // Shared adapter so two contexts see the same channel.
+        let registry = Arc::new(Registry::new());
+        let adapter: Arc<dyn Adapter> = Arc::new(LocalAdapter::new(registry));
+        let mk = |adapter: Arc<dyn Adapter>| {
+            let (tx, rx) = mpsc::unbounded_channel();
+            let c = ConnectionContext {
+                app: app(false),
+                socket_id: SocketId::generate(),
+                self_tx: tx,
+                adapter,
+                limits: crate::server::config::ServerConfig::default().limits(),
+                subscribed: HashSet::new(),
+            };
+            (c, rx)
+        };
+        let (mut a, mut rxa) = mk(adapter.clone());
+        let (mut b, _rxb) = mk(adapter.clone());
+
+        for (c, who) in [(&mut a, "ua"), (&mut b, "ub")] {
+            let sid = c.socket_id.as_str().to_string();
+            let cd = format!(r#"{{"user_id":"{who}"}}"#);
+            let sig = crate::auth::signature::channel_signature("s", &sid, "presence-x", Some(&cd));
+            c.dispatch(ClientCommand::Subscribe {
+                channel: "presence-x".into(),
+                auth: Some(format!("k:{sig}")),
+                channel_data: Some(cd),
+            })
+            .await;
+        }
+        // Drain a's queued frames (its own subscription_succeeded + member_added for ub).
+        while rxa.try_recv().is_ok() {}
+
+        b.unsubscribe("presence-x".into()).await;
+        // a should now see member_removed for ub.
+        let mut saw = false;
+        while let Ok(ev) = rxa.try_recv() {
+            if let ServerEvent::MemberRemoved { user_id, .. } = ev {
+                assert_eq!(user_id, "ub");
+                saw = true;
+            }
+        }
+        assert!(saw, "remaining member should receive member_removed");
     }
 
     #[tokio::test]
