@@ -16,6 +16,9 @@ pub struct ServerConfig {
     pub apps_path: String,
     pub max_presence_members: usize,
     pub max_event_payload_bytes: usize,
+    pub max_channels_per_publish: usize,
+    pub rest_auth_window_secs: u64,
+    pub max_batch_events: usize,
 }
 
 impl Default for ServerConfig {
@@ -29,6 +32,9 @@ impl Default for ServerConfig {
             apps_path: "apps.json".into(),
             max_presence_members: 100,
             max_event_payload_bytes: 10_240,
+            max_channels_per_publish: 100,
+            rest_auth_window_secs: 600,
+            max_batch_events: 10,
         }
     }
 }
@@ -70,6 +76,21 @@ impl ServerConfig {
                 c.max_event_payload_bytes = p;
             }
         }
+        if let Ok(v) = std::env::var("PYLON_MAX_CHANNELS_PER_PUBLISH") {
+            if let Ok(p) = v.parse() {
+                c.max_channels_per_publish = p;
+            }
+        }
+        if let Ok(v) = std::env::var("PYLON_REST_AUTH_WINDOW_SECS") {
+            if let Ok(p) = v.parse() {
+                c.rest_auth_window_secs = p;
+            }
+        }
+        if let Ok(v) = std::env::var("PYLON_MAX_BATCH_EVENTS") {
+            if let Ok(p) = v.parse() {
+                c.max_batch_events = p;
+            }
+        }
         c
     }
 
@@ -94,5 +115,8 @@ mod tests {
         assert!(!c.strict_protocol);
         assert_eq!(c.max_presence_members, 100);
         assert_eq!(c.max_event_payload_bytes, 10_240);
+        assert_eq!(c.max_channels_per_publish, 100);
+        assert_eq!(c.rest_auth_window_secs, 600);
+        assert_eq!(c.max_batch_events, 10);
     }
 }
