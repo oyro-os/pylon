@@ -303,6 +303,25 @@ async fn rest_trigger_relays_to_encrypted_subscriber() {
 }
 
 #[tokio::test]
+async fn rest_trigger_two_encrypted_channels_is_400() {
+    let addr = spawn().await;
+    let body = json!({
+        "name": "secret",
+        "data": "x",
+        "channels": ["private-encrypted-a", "private-encrypted-b"]
+    })
+    .to_string();
+    let q = signed_query("POST", "/apps/app1/events", body.as_bytes(), &[]);
+    let resp = reqwest::Client::new()
+        .post(format!("http://{addr}/apps/app1/events?{q}"))
+        .body(body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400);
+}
+
+#[tokio::test]
 async fn rest_body_too_large_is_413() {
     let addr = spawn().await;
     // Default limits → body cap = 10*10240 + 64KiB ≈ 164KiB; exceed it. The

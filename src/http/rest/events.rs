@@ -1,5 +1,6 @@
 //! POST /apps/{app_id}/events and /batch_events.
 
+use crate::channel::kind::{AuthKind, ChannelInfo};
 use crate::http::error::RestError;
 use crate::http::rest::auth::authenticate;
 use crate::protocol::event::ServerEvent;
@@ -113,6 +114,16 @@ pub async fn post_events(
     };
     if channels.is_empty() || channels.len() > state.config.max_channels_per_publish {
         return Err(RestError::bad_request("invalid channel count"));
+    }
+    // Hosted Pusher forbids triggering to more than one encrypted channel at once.
+    let encrypted = channels
+        .iter()
+        .filter(|c| ChannelInfo::of(c).auth == AuthKind::PrivateEncrypted)
+        .count();
+    if encrypted > 1 {
+        return Err(RestError::bad_request(
+            "cannot trigger to more than one encrypted channel",
+        ));
     }
     for ch in &channels {
         deliver(
