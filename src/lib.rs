@@ -10,7 +10,7 @@ pub mod protocol;
 pub mod server;
 pub mod ws;
 
-pub mod signature;
+pub mod auth;
 
 /// Initialize tracing from `RUST_LOG` (defaults to `info`).
 pub fn init_tracing() {
