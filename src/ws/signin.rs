@@ -36,14 +36,48 @@ impl ConnectionContext {
             }
         };
         // 3. Register and acknowledge.
-        let _outcome = self
+        let outcome = self
             .adapter
             .signin_user(&self.app.id, &user.id, self.handle())
             .await;
         self.send_self(ServerEvent::SigninSuccess {
             user_data: user.user_data_raw.clone(),
         });
+        // Watchlist: notify watchers if this signin brought the user online,
+        // then register this connection's own watchlist and snapshot who's online.
+        if outcome.first_for_user {
+            self.notify_watchers(&user.id, "online").await;
+        }
+        let watched = self.capped_watchlist(&user.watchlist);
+        if !watched.is_empty() {
+            let online = self
+                .adapter
+                .watch(&self.app.id, self.handle(), watched)
+                .await;
+            if !online.is_empty() {
+                self.send_self(ServerEvent::WatchlistEvents {
+                    events: vec![crate::protocol::event::WatchlistChange {
+                        name: "online".to_string(),
+                        user_ids: online,
+                    }],
+                });
+            }
+        }
         self.user = Some(user);
+    }
+
+    /// Truncate the watchlist to the configured cap, emitting a non-fatal 4302
+    /// (overflow) error when it is exceeded. Signin still proceeds.
+    fn capped_watchlist(&self, watchlist: &[String]) -> Vec<String> {
+        let max = self.limits.max_watchlist_size;
+        if watchlist.len() > max {
+            let msg =
+                format!("Watchlist limit exceeded; only the first {max} entries are tracked.");
+            self.send_self(ServerEvent::Error(PusherError::new(4302, msg)));
+            watchlist[..max].to_vec()
+        } else {
+            watchlist.to_vec()
+        }
     }
 
     /// Emit `pusher:error` 4009 then close the connection (fatal, no reconnect).
@@ -81,18 +115,8 @@ mod tests {
     }
 
     fn ctx() -> (ConnectionContext, mpsc::UnboundedReceiver<ServerEvent>) {
-        let (tx, rx) = mpsc::unbounded_channel();
         let adapter: Arc<dyn Adapter> = Arc::new(LocalAdapter::new(Arc::new(Registry::new())));
-        let c = ConnectionContext {
-            app: app(),
-            socket_id: SocketId::from_raw("123.456"),
-            self_tx: tx,
-            adapter,
-            limits: crate::server::config::ServerConfig::default().limits(),
-            subscribed: HashSet::new(),
-            user: None,
-        };
-        (c, rx)
+        ctx_on(adapter, "123.456")
     }
 
     fn signin_cmd(c: &ConnectionContext, user_data: &str) -> ClientCommand {
@@ -146,5 +170,98 @@ mod tests {
             rx.try_recv(),
             Ok(ServerEvent::Close { code: 4009, .. })
         ));
+    }
+
+    fn ctx_on(
+        adapter: Arc<dyn Adapter>,
+        socket: &str,
+    ) -> (ConnectionContext, mpsc::UnboundedReceiver<ServerEvent>) {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let c = ConnectionContext {
+            app: app(),
+            socket_id: SocketId::from_raw(socket),
+            self_tx: tx,
+            adapter,
+            limits: crate::server::config::ServerConfig::default().limits(),
+            subscribed: HashSet::new(),
+            user: None,
+        };
+        (c, rx)
+    }
+
+    #[tokio::test]
+    async fn watcher_is_notified_when_watched_user_signs_in() {
+        let adapter: Arc<dyn Adapter> = Arc::new(LocalAdapter::new(Arc::new(Registry::new())));
+        // watcher C signs in watching B (B offline -> no initial snapshot)
+        let (mut c_watch, mut rx_watch) = ctx_on(adapter.clone(), "1.1");
+        let sig_c = user_signature("app-secret", "1.1", r#"{"id":"C","watchlist":["B"]}"#);
+        c_watch
+            .dispatch(ClientCommand::Signin {
+                auth: format!("app-key:{sig_c}"),
+                user_data: r#"{"id":"C","watchlist":["B"]}"#.into(),
+            })
+            .await;
+        let _ = rx_watch.try_recv(); // signin_success
+        assert!(rx_watch.try_recv().is_err(), "no snapshot while B offline");
+
+        // B signs in -> C receives an online watchlist event for B
+        let (mut c_b, _rx_b) = ctx_on(adapter.clone(), "2.2");
+        let sig_b = user_signature("app-secret", "2.2", r#"{"id":"B"}"#);
+        c_b.dispatch(ClientCommand::Signin {
+            auth: format!("app-key:{sig_b}"),
+            user_data: r#"{"id":"B"}"#.into(),
+        })
+        .await;
+        match rx_watch.try_recv() {
+            Ok(ServerEvent::WatchlistEvents { events }) => {
+                assert_eq!(events[0].name, "online");
+                assert_eq!(events[0].user_ids, vec!["B".to_string()]);
+            }
+            other => panic!("expected online WatchlistEvents, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn second_connection_does_not_reemit_online_to_watchers() {
+        let adapter: Arc<dyn Adapter> = Arc::new(LocalAdapter::new(Arc::new(Registry::new())));
+        // C watches B.
+        let (mut c_watch, mut rx_watch) = ctx_on(adapter.clone(), "1.1");
+        let sig_c = user_signature("app-secret", "1.1", r#"{"id":"C","watchlist":["B"]}"#);
+        c_watch
+            .dispatch(ClientCommand::Signin {
+                auth: format!("app-key:{sig_c}"),
+                user_data: r#"{"id":"C","watchlist":["B"]}"#.into(),
+            })
+            .await;
+        while rx_watch.try_recv().is_ok() {} // drain C's signin_success (B offline, no snapshot)
+
+        // B signs in on connection 1 -> C gets ONE online event.
+        let (mut c_b1, _rx_b1) = ctx_on(adapter.clone(), "2.2");
+        let sig_b1 = user_signature("app-secret", "2.2", r#"{"id":"B"}"#);
+        c_b1.dispatch(ClientCommand::Signin {
+            auth: format!("app-key:{sig_b1}"),
+            user_data: r#"{"id":"B"}"#.into(),
+        })
+        .await;
+        match rx_watch.try_recv() {
+            Ok(ServerEvent::WatchlistEvents { events }) => {
+                assert_eq!(events[0].name, "online");
+                assert_eq!(events[0].user_ids, vec!["B".to_string()]);
+            }
+            other => panic!("expected one online event, got {other:?}"),
+        }
+
+        // B signs in on connection 2 (same user, first_for_user == false) -> C gets NOTHING more.
+        let (mut c_b2, _rx_b2) = ctx_on(adapter.clone(), "3.3");
+        let sig_b2 = user_signature("app-secret", "3.3", r#"{"id":"B"}"#);
+        c_b2.dispatch(ClientCommand::Signin {
+            auth: format!("app-key:{sig_b2}"),
+            user_data: r#"{"id":"B"}"#.into(),
+        })
+        .await;
+        assert!(
+            rx_watch.try_recv().is_err(),
+            "second connection must NOT re-emit online to watchers"
+        );
     }
 }

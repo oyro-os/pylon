@@ -32,6 +32,23 @@ impl ConnectionContext {
         let _ = self.self_tx.send(event);
     }
 
+    /// Push a one-change `watchlist_events` frame to every connection watching `user_id`.
+    pub(in crate::ws) async fn notify_watchers(&self, user_id: &str, name: &str) {
+        let watchers = self.adapter.watchers_of(&self.app.id, user_id).await;
+        if watchers.is_empty() {
+            return;
+        }
+        let ev = ServerEvent::WatchlistEvents {
+            events: vec![crate::protocol::event::WatchlistChange {
+                name: name.to_string(),
+                user_ids: vec![user_id.to_string()],
+            }],
+        };
+        for h in watchers {
+            let _ = h.mailbox.send(ev.clone());
+        }
+    }
+
     pub async fn dispatch(&mut self, cmd: ClientCommand) {
         match cmd {
             ClientCommand::Ping => self.send_self(ServerEvent::Pong),
