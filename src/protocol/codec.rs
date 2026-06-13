@@ -19,7 +19,7 @@ pub enum DecodeError {
     MissingField(&'static str),
 }
 
-pub trait Codec: Send + Sync {
+pub trait Codec: Send + Sync + std::fmt::Debug {
     fn version(&self) -> u8;
     fn capabilities(&self) -> Capabilities;
     fn decode(&self, text: &str) -> Result<ClientCommand, DecodeError>;

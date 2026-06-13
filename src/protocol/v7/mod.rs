@@ -4,6 +4,7 @@ use crate::protocol::codec::{Capabilities, Codec, DecodeError};
 use crate::protocol::command::ClientCommand;
 use crate::protocol::event::ServerEvent;
 
+#[derive(Debug)]
 pub struct V7Codec;
 
 impl Codec for V7Codec {
