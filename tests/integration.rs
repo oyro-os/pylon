@@ -5,6 +5,7 @@ use pylon::adapter::local::LocalAdapter;
 use pylon::adapter::Adapter;
 use pylon::app::static_file::StaticFileAppManager;
 use pylon::app::AppManager;
+use pylon::auth::signature::channel_signature;
 use pylon::channel::registry::Registry;
 use pylon::server::config::ServerConfig;
 use pylon::server::router::{build_router, AppState};
@@ -12,6 +13,34 @@ use serde_json::{json, Value};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio_tungstenite::tungstenite::Message;
+
+const SECRET: &str = "app-secret";
+const KEY: &str = "app-key";
+
+fn auth_token(socket_id: &str, channel: &str, channel_data: Option<&str>) -> String {
+    format!(
+        "{KEY}:{}",
+        channel_signature(SECRET, socket_id, channel, channel_data)
+    )
+}
+
+async fn established_socket_id(ws: &mut Ws) -> String {
+    let frame = next_json(ws).await; // connection_established
+    let data: Value = serde_json::from_str(frame["data"].as_str().unwrap()).unwrap();
+    data["socket_id"].as_str().unwrap().to_string()
+}
+
+/// Read frames until one with the given event name arrives, skipping others
+/// (e.g. the interleaved pusher_internal:subscription_count frames emitted
+/// because the test app has subscription_count_enabled = true).
+async fn next_event_named(ws: &mut Ws, event: &str) -> Value {
+    loop {
+        let f = next_json(ws).await;
+        if f["event"] == event {
+            return f;
+        }
+    }
+}
 
 const APPS: &str = r#"[
     {"name":"Test","id":"app","key":"app-key","secret":"app-secret",
@@ -209,4 +238,136 @@ async fn root_route_identifies_server() {
         .await
         .unwrap();
     assert!(body.to_lowercase().contains("pylon"));
+}
+
+#[tokio::test]
+async fn private_subscribe_invalid_auth_is_non_fatal() {
+    let addr = spawn(ServerConfig::default()).await;
+    let mut ws = connect(addr, "?protocol=7").await;
+    let _ = established_socket_id(&mut ws).await;
+    send_json(
+        &mut ws,
+        json!({
+            "event": "pusher:subscribe",
+            "data": { "channel": "private-x", "auth": "app-key:bad" }
+        }),
+    )
+    .await;
+    let frame = next_json(&mut ws).await;
+    assert_eq!(frame["event"], "pusher:subscription_error");
+    assert_eq!(frame["channel"], "private-x");
+    assert_eq!(frame["data"]["status"], 401);
+    // Connection still works: a ping is answered.
+    send_json(&mut ws, json!({ "event": "pusher:ping", "data": {} })).await;
+    assert_eq!(next_json(&mut ws).await["event"], "pusher:pong");
+}
+
+#[tokio::test]
+async fn private_subscribe_valid_auth_succeeds() {
+    let addr = spawn(ServerConfig::default()).await;
+    let mut ws = connect(addr, "?protocol=7").await;
+    let sid = established_socket_id(&mut ws).await;
+    let token = auth_token(&sid, "private-x", None);
+    send_json(
+        &mut ws,
+        json!({
+            "event": "pusher:subscribe",
+            "data": { "channel": "private-x", "auth": token }
+        }),
+    )
+    .await;
+    let frame = next_json(&mut ws).await;
+    assert_eq!(frame["event"], "pusher_internal:subscription_succeeded");
+    assert_eq!(frame["channel"], "private-x");
+}
+
+#[tokio::test]
+async fn presence_member_added_and_removed() {
+    let addr = spawn(ServerConfig::default()).await;
+
+    // First member.
+    let mut a = connect(addr, "?protocol=7").await;
+    let sid_a = established_socket_id(&mut a).await;
+    let cd_a = r#"{"user_id":"ua","user_info":{"n":"A"}}"#;
+    send_json(
+        &mut a,
+        json!({
+            "event": "pusher:subscribe",
+            "data": {
+                "channel": "presence-room",
+                "auth": auth_token(&sid_a, "presence-room", Some(cd_a)),
+                "channel_data": cd_a
+            }
+        }),
+    )
+    .await;
+    let succ = next_json(&mut a).await;
+    assert_eq!(succ["event"], "pusher_internal:subscription_succeeded");
+    let roster: Value = serde_json::from_str(succ["data"].as_str().unwrap()).unwrap();
+    assert_eq!(roster["presence"]["count"], 1);
+
+    // Second member joins -> a receives member_added for ub.
+    let mut b = connect(addr, "?protocol=7").await;
+    let sid_b = established_socket_id(&mut b).await;
+    let cd_b = r#"{"user_id":"ub","user_info":{"n":"B"}}"#;
+    send_json(
+        &mut b,
+        json!({
+            "event": "pusher:subscribe",
+            "data": {
+                "channel": "presence-room",
+                "auth": auth_token(&sid_b, "presence-room", Some(cd_b)),
+                "channel_data": cd_b
+            }
+        }),
+    )
+    .await;
+    let _ = next_json(&mut b).await; // b's own subscription_succeeded
+    let added = next_event_named(&mut a, "pusher_internal:member_added").await;
+    assert_eq!(added["event"], "pusher_internal:member_added");
+    let added_data: Value = serde_json::from_str(added["data"].as_str().unwrap()).unwrap();
+    assert_eq!(added_data["user_id"], "ub");
+
+    // b disconnects -> a receives member_removed for ub.
+    drop(b);
+    let removed = next_event_named(&mut a, "pusher_internal:member_removed").await;
+    assert_eq!(removed["event"], "pusher_internal:member_removed");
+    let removed_data: Value = serde_json::from_str(removed["data"].as_str().unwrap()).unwrap();
+    assert_eq!(removed_data["user_id"], "ub");
+}
+
+#[tokio::test]
+async fn client_event_broadcast_excludes_sender() {
+    let addr = spawn(ServerConfig::default()).await;
+    let mut a = connect(addr, "?protocol=7").await;
+    let sid_a = established_socket_id(&mut a).await;
+    let mut b = connect(addr, "?protocol=7").await;
+    let sid_b = established_socket_id(&mut b).await;
+    for (ws, sid) in [(&mut a, &sid_a), (&mut b, &sid_b)] {
+        send_json(
+            ws,
+            json!({
+                "event": "pusher:subscribe",
+                "data": { "channel": "private-x", "auth": auth_token(sid, "private-x", None) }
+            }),
+        )
+        .await;
+        let _ = next_json(ws).await; // subscription_succeeded
+    }
+    send_json(
+        &mut a,
+        json!({
+            "event": "client-greet", "channel": "private-x", "data": { "hi": true }
+        }),
+    )
+    .await;
+    let got = next_event_named(&mut b, "client-greet").await;
+    assert_eq!(got["event"], "client-greet");
+    assert_eq!(got["channel"], "private-x");
+    // a (the sender) must not receive its own client event; a ping round-trips instead.
+    send_json(&mut a, json!({ "event": "pusher:ping", "data": {} })).await;
+    assert_eq!(
+        next_event_named(&mut a, "pusher:pong").await["event"],
+        "pusher:pong"
+    );
 }
