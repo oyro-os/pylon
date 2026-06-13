@@ -60,6 +60,13 @@ impl Registry {
             }
         }
     }
+
+    /// Number of `(app, channel)` entries currently tracked. Test-only: lets the
+    /// prune test distinguish "inner map empty" from "outer entry removed".
+    #[cfg(test)]
+    pub fn channel_entry_count(&self) -> usize {
+        self.channels.len()
+    }
 }
 
 #[cfg(test)]
@@ -107,5 +114,10 @@ mod tests {
         reg.subscribe("app", "c", h);
         reg.unsubscribe("app", "c", &sid);
         assert_eq!(reg.count("app", "c"), 0);
+        assert_eq!(
+            reg.channel_entry_count(),
+            0,
+            "outer channel entry should be pruned, not just emptied"
+        );
     }
 }
