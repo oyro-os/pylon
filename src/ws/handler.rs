@@ -17,6 +17,7 @@ pub struct ConnectionContext {
     pub socket_id: SocketId,
     pub self_tx: UnboundedSender<ServerEvent>,
     pub adapter: Arc<dyn Adapter>,
+    pub limits: crate::server::config::Limits,
     pub subscribed: HashSet<String>,
 }
 
@@ -130,6 +131,7 @@ mod tests {
             socket_id: SocketId::generate(),
             self_tx: tx,
             adapter,
+            limits: crate::server::config::ServerConfig::default().limits(),
             subscribed: HashSet::new(),
         };
         (c, rx)

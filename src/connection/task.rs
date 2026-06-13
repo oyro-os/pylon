@@ -19,6 +19,7 @@ use tokio::time::Instant;
 pub struct ConnectionParams {
     pub app: App,
     pub adapter: Arc<dyn Adapter>,
+    pub limits: crate::server::config::Limits,
     pub activity_timeout: u32,
     pub pong_timeout: u32,
     pub conn_count: Arc<AtomicUsize>,
@@ -47,6 +48,7 @@ pub async fn run(socket: WebSocket, codec: Box<dyn Codec>, params: ConnectionPar
         socket_id,
         self_tx: tx.clone(),
         adapter: params.adapter.clone(),
+        limits: params.limits,
         subscribed: HashSet::new(),
     };
 

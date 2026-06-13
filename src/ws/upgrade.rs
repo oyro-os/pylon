@@ -53,6 +53,7 @@ async fn serve(socket: WebSocket, key: String, params: HashMap<String, String>, 
     let cp = ConnectionParams {
         app,
         adapter: state.adapter.clone(),
+        limits: state.config.limits(),
         activity_timeout: state.config.activity_timeout,
         pong_timeout: state.config.pong_timeout,
         conn_count: counter,
