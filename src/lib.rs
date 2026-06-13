@@ -10,7 +10,6 @@ pub mod protocol;
 pub mod server;
 pub mod ws;
 
-pub mod config;
 pub mod signature;
 
 /// Initialize tracing from `RUST_LOG` (defaults to `info`).
