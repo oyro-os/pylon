@@ -3,12 +3,14 @@
 
 pub mod local;
 
+use crate::channel::cache::CachedEvent;
 use crate::channel::outcome::{ChannelSummary, SubscribeOutcome, UnsubscribeOutcome};
 use crate::connection::handle::ConnectionHandle;
 use crate::presence::member::PresenceMember;
 use crate::protocol::event::ServerEvent;
 use crate::protocol::socket_id::SocketId;
 use async_trait::async_trait;
+use std::time::Duration;
 
 #[async_trait]
 pub trait Adapter: Send + Sync {
@@ -40,4 +42,12 @@ pub trait Adapter: Send + Sync {
     async fn channel(&self, app: &str, channel: &str) -> ChannelSummary;
 
     async fn presence_members(&self, app: &str, channel: &str) -> Vec<PresenceMember>;
+
+    /// Store the last event for a cache channel with the given TTL. Overwrites
+    /// any previous entry for `(app, channel)`.
+    async fn cache_set(&self, app: &str, channel: &str, event: CachedEvent, ttl: Duration);
+
+    /// Fetch the last cached event for a cache channel, or `None` if there is
+    /// none or it has expired.
+    async fn cache_get(&self, app: &str, channel: &str) -> Option<CachedEvent>;
 }

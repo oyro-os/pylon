@@ -1,4 +1,5 @@
 use super::Adapter;
+use crate::channel::cache::{CacheStore, CachedEvent};
 use crate::channel::outcome::{ChannelSummary, SubscribeOutcome, UnsubscribeOutcome};
 use crate::channel::registry::Registry;
 use crate::connection::handle::ConnectionHandle;
@@ -7,14 +8,19 @@ use crate::protocol::event::ServerEvent;
 use crate::protocol::socket_id::SocketId;
 use async_trait::async_trait;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 pub struct LocalAdapter {
     registry: Arc<Registry>,
+    cache: CacheStore,
 }
 
 impl LocalAdapter {
     pub fn new(registry: Arc<Registry>) -> Self {
-        Self { registry }
+        Self {
+            registry,
+            cache: CacheStore::new(),
+        }
     }
 }
 
@@ -60,6 +66,30 @@ impl Adapter for LocalAdapter {
 
     async fn presence_members(&self, app: &str, channel: &str) -> Vec<PresenceMember> {
         self.registry.presence_members(app, channel)
+    }
+
+    async fn cache_set(&self, app: &str, channel: &str, event: CachedEvent, ttl: Duration) {
+        let expiry = Instant::now() + ttl;
+        self.cache
+            .insert((app.to_string(), channel.to_string()), (event, expiry));
+    }
+
+    async fn cache_get(&self, app: &str, channel: &str) -> Option<CachedEvent> {
+        let key = (app.to_string(), channel.to_string());
+        // Read under a shard guard; decide expiry, then drop the guard BEFORE any
+        // remove() to avoid a DashMap self-deadlock on the same shard.
+        let expired = {
+            let entry = self.cache.get(&key)?;
+            if Instant::now() >= entry.1 {
+                true
+            } else {
+                return Some(entry.0.clone());
+            }
+        };
+        if expired {
+            self.cache.remove(&key);
+        }
+        None
     }
 }
 
@@ -115,5 +145,74 @@ mod tests {
             adapter.channel("app", "presence-x").await.user_count,
             Some(1)
         );
+    }
+
+    #[tokio::test]
+    async fn cache_set_then_get_round_trips() {
+        let adapter = LocalAdapter::new(Arc::new(Registry::new()));
+        adapter
+            .cache_set(
+                "app",
+                "cache-x",
+                crate::channel::cache::CachedEvent {
+                    event: "e".into(),
+                    data: "d".into(),
+                },
+                std::time::Duration::from_secs(60),
+            )
+            .await;
+        let got = adapter.cache_get("app", "cache-x").await;
+        assert_eq!(
+            got,
+            Some(crate::channel::cache::CachedEvent {
+                event: "e".into(),
+                data: "d".into()
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn cache_set_overwrites_last_event() {
+        let adapter = LocalAdapter::new(Arc::new(Registry::new()));
+        for data in ["one", "two"] {
+            adapter
+                .cache_set(
+                    "app",
+                    "cache-x",
+                    crate::channel::cache::CachedEvent {
+                        event: "e".into(),
+                        data: data.into(),
+                    },
+                    std::time::Duration::from_secs(60),
+                )
+                .await;
+        }
+        assert_eq!(
+            adapter.cache_get("app", "cache-x").await.unwrap().data,
+            "two"
+        );
+    }
+
+    #[tokio::test]
+    async fn cache_get_is_none_when_absent() {
+        let adapter = LocalAdapter::new(Arc::new(Registry::new()));
+        assert_eq!(adapter.cache_get("app", "cache-missing").await, None);
+    }
+
+    #[tokio::test]
+    async fn cache_entry_expires_after_ttl() {
+        let adapter = LocalAdapter::new(Arc::new(Registry::new()));
+        adapter
+            .cache_set(
+                "app",
+                "cache-x",
+                crate::channel::cache::CachedEvent {
+                    event: "e".into(),
+                    data: "d".into(),
+                },
+                std::time::Duration::from_millis(0), // already expired
+            )
+            .await;
+        assert_eq!(adapter.cache_get("app", "cache-x").await, None);
     }
 }
