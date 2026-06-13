@@ -57,7 +57,7 @@ impl ConnectionContext {
         &mut self,
         channel: String,
         auth: Option<String>,
-        _channel_data: Option<String>,
+        channel_data: Option<String>,
     ) {
         match ChannelKind::of(&channel) {
             ChannelKind::Public => {
@@ -107,7 +107,100 @@ impl ConnectionContext {
                 self.maybe_emit_count(&channel, out.subscription_count)
                     .await;
             }
-            // presence / encrypted / cache require auth — SP2/SP3.
+            ChannelKind::Presence => {
+                let token = match auth.as_deref() {
+                    Some(t) => t,
+                    None => {
+                        return self.send_subscription_error(
+                            &channel,
+                            "AuthError",
+                            "Auth signature required",
+                            401,
+                        )
+                    }
+                };
+                let raw = match channel_data.as_deref() {
+                    Some(d) => d,
+                    None => {
+                        return self.send_subscription_error(
+                            &channel,
+                            "AuthError",
+                            "Presence requires channel_data",
+                            401,
+                        )
+                    }
+                };
+                if let Err(e) = crate::auth::channel::verify(
+                    &self.app.key,
+                    &self.app.secret,
+                    self.socket_id.as_str(),
+                    &channel,
+                    Some(raw),
+                    token,
+                ) {
+                    return self.send_subscription_error(&channel, "AuthError", e.message(), 401);
+                }
+                let member = match crate::presence::member::parse_channel_data(raw) {
+                    Ok(m) => m,
+                    Err(_) => {
+                        return self.send_subscription_error(
+                            &channel,
+                            "AuthError",
+                            "Invalid channel_data",
+                            401,
+                        )
+                    }
+                };
+                // Enforce the configurable presence member cap (pylon-chosen rejection shape).
+                let current = self
+                    .adapter
+                    .channel(&self.app.id, &channel)
+                    .await
+                    .user_count
+                    .unwrap_or(0);
+                let already_member = self
+                    .adapter
+                    .presence_members(&self.app.id, &channel)
+                    .await
+                    .iter()
+                    .any(|m| m.user_id == member.user_id);
+                if !already_member && current >= self.limits.max_presence_members {
+                    return self.send_subscription_error(
+                        &channel,
+                        "LimitReached",
+                        "Presence channel is full",
+                        4004,
+                    );
+                }
+                let out = self
+                    .adapter
+                    .subscribe(&self.app.id, &channel, self.handle(), Some(member))
+                    .await;
+                self.subscribed.insert(channel.clone());
+                if let Some(join) = out.presence {
+                    self.send_self(ServerEvent::SubscriptionSucceeded {
+                        channel: channel.clone(),
+                        presence: Some(join.roster),
+                    });
+                    if join.first_for_user {
+                        self.adapter
+                            .broadcast(
+                                &self.app.id,
+                                &channel,
+                                ServerEvent::MemberAdded {
+                                    channel: channel.clone(),
+                                    user_id: join.member.user_id,
+                                    user_info: join.member.user_info,
+                                },
+                                Some(self.socket_id.clone()),
+                            )
+                            .await;
+                    }
+                }
+                self.maybe_emit_count(&channel, out.subscription_count)
+                    .await;
+            }
+            // encrypted / cache require auth — SP3.
             _ => self.send_self(ServerEvent::Error(PusherError::unauthorized())),
         }
     }
@@ -266,6 +359,46 @@ mod tests {
         assert!(matches!(
             rx.try_recv(),
             Ok(ServerEvent::SubscriptionSucceeded { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn presence_subscribe_returns_roster_and_broadcasts_member_added() {
+        let (mut c, mut rx) = ctx(app(false));
+        let sid = c.socket_id.as_str().to_string();
+        let cd = r#"{"user_id":"u1","user_info":{"name":"Ann"}}"#;
+        let sig = crate::auth::signature::channel_signature("s", &sid, "presence-x", Some(cd));
+        c.dispatch(ClientCommand::Subscribe {
+            channel: "presence-x".into(),
+            auth: Some(format!("k:{sig}")),
+            channel_data: Some(cd.into()),
+        })
+        .await;
+        match rx.try_recv() {
+            Ok(ServerEvent::SubscriptionSucceeded {
+                presence: Some(p), ..
+            }) => {
+                assert_eq!(p.count, 1);
+                assert_eq!(p.ids, vec!["u1".to_string()]);
+            }
+            other => panic!("expected presence SubscriptionSucceeded, got {other:?}"),
+        }
+        // Self is excluded from its own member_added, so no further self-delivered event.
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn presence_subscribe_with_bad_auth_errors() {
+        let (mut c, mut rx) = ctx(app(false));
+        c.dispatch(ClientCommand::Subscribe {
+            channel: "presence-x".into(),
+            auth: Some("k:bad".into()),
+            channel_data: Some(r#"{"user_id":"u1"}"#.into()),
+        })
+        .await;
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(ServerEvent::SubscriptionError { .. })
         ));
     }
 
