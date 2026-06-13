@@ -567,6 +567,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn encrypted_cache_subscribe_replays_after_auth() {
+        let (mut c, mut rx) = ctx(app(false));
+        // Seed the cache for the encrypted-cache channel (app id "app" matches the harness).
+        c.adapter
+            .cache_set(
+                "app",
+                "private-encrypted-cache-x",
+                crate::channel::cache::CachedEvent {
+                    event: "secret".into(),
+                    data: "{\"nonce\":\"abc\",\"ciphertext\":\"xyz\"}".into(),
+                },
+                std::time::Duration::from_secs(60),
+            )
+            .await;
+        // Encrypted subscribe = private-style HMAC over socket_id:channel, no channel_data.
+        let sid = c.socket_id.as_str().to_string();
+        let sig =
+            crate::auth::signature::channel_signature("s", &sid, "private-encrypted-cache-x", None);
+        c.dispatch(ClientCommand::Subscribe {
+            channel: "private-encrypted-cache-x".into(),
+            auth: Some(format!("k:{sig}")),
+            channel_data: None,
+        })
+        .await;
+        // First subscription_succeeded (no roster), then the verbatim ciphertext replay.
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(ServerEvent::SubscriptionSucceeded { .. })
+        ));
+        match rx.try_recv() {
+            Ok(ServerEvent::ChannelEvent {
+                channel,
+                event,
+                data,
+            }) => {
+                assert_eq!(channel, "private-encrypted-cache-x");
+                assert_eq!(event, "secret");
+                assert_eq!(
+                    data,
+                    serde_json::Value::String("{\"nonce\":\"abc\",\"ciphertext\":\"xyz\"}".into())
+                );
+            }
+            other => panic!("expected replayed ChannelEvent, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
     async fn presence_over_member_cap_errors() {
         let registry = Arc::new(Registry::new());
         let adapter: Arc<dyn Adapter> = Arc::new(LocalAdapter::new(registry));
