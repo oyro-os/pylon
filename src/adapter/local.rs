@@ -76,19 +76,19 @@ impl Adapter for LocalAdapter {
 
     async fn cache_get(&self, app: &str, channel: &str) -> Option<CachedEvent> {
         let key = (app.to_string(), channel.to_string());
-        // Read under a shard guard; decide expiry, then drop the guard BEFORE any
-        // remove() to avoid a DashMap self-deadlock on the same shard.
-        let expired = {
+        {
+            // Hold the shard read-guard only inside this block. On the live path
+            // we return the clone while still holding it (safe); the expired path
+            // falls through, dropping the guard BEFORE the remove() write-lock
+            // below so DashMap cannot self-deadlock on the same shard.
             let entry = self.cache.get(&key)?;
-            if Instant::now() >= entry.1 {
-                true
-            } else {
+            // `<` (not `<=`): an entry whose expiry instant has been reached is
+            // treated as expired — a ttl of 0 is therefore immediately expired.
+            if Instant::now() < entry.1 {
                 return Some(entry.0.clone());
             }
-        };
-        if expired {
-            self.cache.remove(&key);
         }
+        self.cache.remove(&key);
         None
     }
 }
