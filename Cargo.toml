@@ -25,6 +25,20 @@ anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 dashmap = "6"           # sharded concurrent map for the channel registry
+async-trait = "0.1"
+rand = "0.8"
+futures-util = "0.3"
+thiserror = "1"
+
+[dev-dependencies]
+tokio-tungstenite = "0.24"
+reqwest = { version = "0.12", default-features = false, features = ["json"] }
+criterion = "0.5"
+futures-util = "0.3"
+
+[[bench]]
+name = "fanout"
+harness = false
 
 [profile.release]
 lto = true
