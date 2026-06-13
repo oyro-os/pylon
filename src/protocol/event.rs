@@ -58,6 +58,14 @@ pub enum ServerEvent {
     CacheMiss {
         channel: String,
     },
+    /// `pusher:signin_success` — connection-level; `data` is a plain object
+    /// `{ "user_data": "<echoed string>" }`. pusher-js (`user.ts:99-101`) reads
+    /// only `data.user_data`, so we echo just that. (soketi `ws-handler.ts:688`
+    /// echoes the entire incoming `data` including the `auth` token; we
+    /// intentionally do NOT reflect the credential back.)
+    SigninSuccess {
+        user_data: String,
+    },
 }
 
 #[cfg(test)]

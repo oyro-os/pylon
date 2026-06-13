@@ -19,6 +19,12 @@ pub enum ClientCommand {
         channel: String,
         data: Value,
     },
+    /// `pusher:signin` — bind this connection to a user. Decoded in SP4 (A4);
+    /// handled by the signin handler in A7.
+    Signin {
+        auth: String,
+        user_data: String,
+    },
     /// Unrecognized event name (e.g. `pusher:pong`); logged and ignored.
     Unknown(String),
 }

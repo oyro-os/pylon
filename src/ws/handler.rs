@@ -45,6 +45,9 @@ impl ConnectionContext {
                 channel,
                 data,
             } => self.client_event(event, channel, data).await,
+            ClientCommand::Signin { .. } => {
+                // TODO(SP4): handle pusher:signin — validate auth and emit SigninSuccess
+            }
             ClientCommand::Unknown(_) => {}
         }
     }

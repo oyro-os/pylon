@@ -71,6 +71,10 @@ pub fn encode(event: &ServerEvent) -> String {
         ServerEvent::CacheMiss { channel } => {
             json!({ "event": "pusher:cache_miss", "channel": channel }).to_string()
         }
+        ServerEvent::SigninSuccess { user_data } => {
+            json!({ "event": "pusher:signin_success", "data": { "user_data": user_data } })
+                .to_string()
+        }
     }
 }
 
@@ -108,6 +112,20 @@ pub fn decode(text: &str) -> Result<ClientCommand, DecodeError> {
                 .ok_or(DecodeError::MissingField("channel"))?
                 .to_string();
             Ok(ClientCommand::Unsubscribe { channel })
+        }
+        "pusher:signin" => {
+            let data = v.get("data").ok_or(DecodeError::MissingField("data"))?;
+            let auth = data
+                .get("auth")
+                .and_then(Value::as_str)
+                .ok_or(DecodeError::MissingField("auth"))?
+                .to_string();
+            let user_data = data
+                .get("user_data")
+                .and_then(Value::as_str)
+                .ok_or(DecodeError::MissingField("user_data"))?
+                .to_string();
+            Ok(ClientCommand::Signin { auth, user_data })
         }
         name if name.starts_with("client-") => {
             let channel = v
@@ -308,6 +326,34 @@ mod tests {
             out.get("data").is_none(),
             "cache_miss carries no data field"
         );
+    }
+
+    #[test]
+    fn decodes_signin() {
+        let cmd = decode(
+            r#"{"event":"pusher:signin","data":{"auth":"k:sig","user_data":"{\"id\":\"7\"}"}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            cmd,
+            ClientCommand::Signin {
+                auth: "k:sig".into(),
+                user_data: r#"{"id":"7"}"#.into()
+            }
+        );
+    }
+
+    #[test]
+    fn signin_success_data_is_object_with_user_data_string() {
+        let out = parse(&encode(&ServerEvent::SigninSuccess {
+            user_data: r#"{"id":"7"}"#.into(),
+        }));
+        assert_eq!(out["event"], "pusher:signin_success");
+        assert!(
+            out["data"].is_object(),
+            "signin_success data is a plain object"
+        );
+        assert_eq!(out["data"]["user_data"], r#"{"id":"7"}"#);
     }
 
     #[test]
