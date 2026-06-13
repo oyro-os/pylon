@@ -18,6 +18,11 @@ impl SocketId {
     pub fn as_str(&self) -> &str {
         &self.0
     }
+
+    /// Build a `SocketId` from a client-supplied string (e.g. a REST `socket_id`).
+    pub fn from_raw(raw: impl Into<String>) -> Self {
+        SocketId(raw.into())
+    }
 }
 
 impl fmt::Display for SocketId {
@@ -44,5 +49,11 @@ mod tests {
         let a = SocketId::generate();
         let b = SocketId::generate();
         assert_ne!(a, b);
+    }
+
+    #[test]
+    fn from_raw_round_trips() {
+        let s = SocketId::from_raw("123.456");
+        assert_eq!(s.as_str(), "123.456");
     }
 }
