@@ -1,1 +1,27 @@
+//! Router assembly + shared application state.
 
+use crate::adapter::Adapter;
+use crate::app::AppManager;
+use crate::channel::registry::Registry;
+use crate::server::config::ServerConfig;
+use axum::routing::get;
+use axum::Router;
+use dashmap::DashMap;
+use std::sync::atomic::AtomicUsize;
+use std::sync::Arc;
+
+#[derive(Clone)]
+pub struct AppState {
+    pub config: ServerConfig,
+    pub apps: Arc<dyn AppManager>,
+    pub registry: Arc<Registry>,
+    pub adapter: Arc<dyn Adapter>,
+    pub conn_counts: Arc<DashMap<String, Arc<AtomicUsize>>>,
+}
+
+pub fn build_router(state: AppState) -> Router {
+    Router::new()
+        .route("/", get(crate::http::root))
+        .route("/app/{key}", get(crate::ws::upgrade::upgrade))
+        .with_state(state)
+}
