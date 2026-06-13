@@ -19,6 +19,7 @@ pub struct ServerConfig {
     pub max_channels_per_publish: usize,
     pub rest_auth_window_secs: u64,
     pub max_batch_events: usize,
+    pub cache_ttl_secs: u64,
 }
 
 impl Default for ServerConfig {
@@ -35,6 +36,7 @@ impl Default for ServerConfig {
             max_channels_per_publish: 100,
             rest_auth_window_secs: 600,
             max_batch_events: 10,
+            cache_ttl_secs: 1800,
         }
     }
 }
@@ -91,6 +93,11 @@ impl ServerConfig {
                 c.max_batch_events = p;
             }
         }
+        if let Ok(v) = std::env::var("PYLON_CACHE_TTL_SECS") {
+            if let Ok(p) = v.parse() {
+                c.cache_ttl_secs = p;
+            }
+        }
         c
     }
 
@@ -118,5 +125,6 @@ mod tests {
         assert_eq!(c.max_channels_per_publish, 100);
         assert_eq!(c.rest_auth_window_secs, 600);
         assert_eq!(c.max_batch_events, 10);
+        assert_eq!(c.cache_ttl_secs, 1800);
     }
 }
