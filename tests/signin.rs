@@ -10,11 +10,12 @@ use pylon::adapter::local::LocalAdapter;
 use pylon::adapter::Adapter;
 use pylon::app::static_file::StaticFileAppManager;
 use pylon::app::AppManager;
-use pylon::auth::signature::user_signature;
+use pylon::auth::signature::{hmac_sha256_hex, md5_hex, user_signature};
 use pylon::channel::registry::Registry;
 use pylon::server::config::ServerConfig;
 use pylon::server::router::{build_router, AppState};
 use serde_json::{json, Value};
+use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -145,4 +146,76 @@ async fn signin_bad_auth_errors_4009_then_closes() {
         Ok(Some(Ok(other))) => panic!("expected close after 4009, got {other:?}"),
         Err(_) => panic!("timed out waiting for close after 4009"),
     }
+}
+
+/// Build the signed query string for a Pusher REST request (mirrors the helper
+/// in `tests/rest.rs`; each `tests/*.rs` is its own crate so it's replicated).
+fn signed_query(method: &str, path: &str, body: &[u8]) -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let mut p: BTreeMap<String, String> = BTreeMap::new();
+    p.insert("auth_key".into(), KEY.into());
+    p.insert("auth_timestamp".into(), now.to_string());
+    p.insert("auth_version".into(), "1.0".into());
+    if !body.is_empty() {
+        p.insert("body_md5".into(), md5_hex(body));
+    }
+    let canon = p
+        .iter()
+        .map(|(k, v)| format!("{k}={v}"))
+        .collect::<Vec<_>>()
+        .join("&");
+    let signed = format!("{}\n{}\n{}", method.to_uppercase(), path, canon);
+    let sig = hmac_sha256_hex(SECRET, &signed);
+    format!("{canon}&auth_signature={sig}")
+}
+
+/// A server SDK's `sendToUser(id, ...)` is a REST trigger to `#server-to-user-<id>`.
+/// pylon must route that to the user's live connections via the user registry,
+/// NOT a channel broadcast (the signed-in connection never subscribes a channel).
+#[tokio::test]
+async fn server_to_user_trigger_reaches_signed_in_connection() {
+    const USER_DATA: &str = r#"{"id":"u1"}"#;
+
+    let addr = spawn(ServerConfig::default()).await;
+    let mut ws = connect(addr, "?protocol=7").await;
+    let socket_id = established_socket_id(&mut ws).await;
+
+    // Sign in as user u1.
+    let auth = format!("{KEY}:{}", user_signature(SECRET, &socket_id, USER_DATA));
+    send_json(
+        &mut ws,
+        json!({
+            "event": "pusher:signin",
+            "data": { "auth": auth, "user_data": USER_DATA }
+        }),
+    )
+    .await;
+    let ack = next_json(&mut ws).await;
+    assert_eq!(ack["event"], "pusher:signin_success");
+
+    // Server-to-user trigger: `data` is a JSON-encoded STRING per the Pusher REST API.
+    let body = json!({
+        "name": "notif",
+        "channel": "#server-to-user-u1",
+        "data": "{\"msg\":\"hi\"}"
+    })
+    .to_string();
+    let q = signed_query("POST", "/apps/app/events", body.as_bytes());
+    let resp = reqwest::Client::new()
+        .post(format!("http://{addr}/apps/app/events?{q}"))
+        .body(body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    // The signed-in connection receives a frame identical to a normal channel
+    // event: event name, the `#server-to-user-u1` channel, and verbatim `data`.
+    let frame = next_json(&mut ws).await;
+    assert_eq!(frame["event"], "notif");
+    assert_eq!(frame["channel"], "#server-to-user-u1");
+    assert_eq!(frame["data"], "{\"msg\":\"hi\"}");
 }

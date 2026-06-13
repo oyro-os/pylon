@@ -58,6 +58,26 @@ async fn deliver(
     data: &str,
     socket_id: Option<&str>,
 ) {
+    // Server-to-user: a `sendToUser` REST trigger targets `#server-to-user-<id>`,
+    // which is never a registry channel. Route it to the user's live connections
+    // via the user registry instead of broadcasting (and never cache it). The
+    // delivered frame is byte-identical to a normal channel event so pusher-js's
+    // `#server-to-user-<id>` handler processes it.
+    if let Some(user_id) = channel.strip_prefix("#server-to-user-") {
+        state
+            .adapter
+            .send_to_user(
+                app_id,
+                user_id,
+                ServerEvent::ChannelEvent {
+                    channel: channel.to_string(),
+                    event: name.to_string(),
+                    data: Value::String(data.to_string()),
+                },
+            )
+            .await;
+        return;
+    }
     let except = socket_id.map(|s| SocketId::from_raw(s.to_string()));
     state
         .adapter
