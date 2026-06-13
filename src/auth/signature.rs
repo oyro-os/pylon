@@ -33,6 +33,13 @@ pub fn constant_time_eq(a: &str, b: &str) -> bool {
     a.ct_eq(b).into()
 }
 
+/// User-authentication signature for `pusher:signin`. Signs the exact string
+/// "<socket_id>::user::<user_data>" (pusher-http-node/lib/auth.js:5), where
+/// `user_data` is the verbatim JSON string the client sent.
+pub fn user_signature(secret: &str, socket_id: &str, user_data: &str) -> String {
+    hmac_sha256_hex(secret, &format!("{socket_id}::user::{user_data}"))
+}
+
 /// Channel auth signature. Private channels sign "<socket_id>:<channel>";
 /// presence channels append ":<channel_data>" (the exact JSON string the client sent).
 /// An empty `channel_data` (`Some("")`) is treated as no channel data — it signs
@@ -104,5 +111,14 @@ mod tests {
         assert!(constant_time_eq("abc", "abc"));
         assert!(!constant_time_eq("abc", "abd"));
         assert!(!constant_time_eq("abc", "abcd"));
+    }
+
+    #[test]
+    fn user_signature_matches_signing_string() {
+        // via: printf '%s' '123.456::user::{"id":"42"}' | openssl dgst -sha256 -hmac secret
+        assert_eq!(
+            user_signature("secret", "123.456", r#"{"id":"42"}"#),
+            "9138497a754c66c723513e255348f4d708c0e57fda1e60b613cbe62903a18820"
+        );
     }
 }

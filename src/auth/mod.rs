@@ -4,3 +4,4 @@
 pub mod channel;
 pub mod rest;
 pub mod signature;
+pub mod user;
