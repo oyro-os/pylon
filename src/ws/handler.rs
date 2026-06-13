@@ -3,7 +3,6 @@
 use crate::adapter::Adapter;
 use crate::app::App;
 use crate::channel::kind::ChannelKind;
-use crate::channel::registry::Registry;
 use crate::connection::handle::ConnectionHandle;
 use crate::protocol::command::ClientCommand;
 use crate::protocol::error::PusherError;
@@ -17,7 +16,6 @@ pub struct ConnectionContext {
     pub app: App,
     pub socket_id: SocketId,
     pub self_tx: UnboundedSender<ServerEvent>,
-    pub registry: Arc<Registry>,
     pub adapter: Arc<dyn Adapter>,
     pub subscribed: HashSet<String>,
 }
@@ -53,15 +51,17 @@ impl ConnectionContext {
     async fn subscribe(&mut self, channel: String) {
         match ChannelKind::of(&channel) {
             ChannelKind::Public => {
-                let _ = self
-                    .registry
-                    .subscribe(&self.app.id, &channel, self.handle(), None);
+                let out = self
+                    .adapter
+                    .subscribe(&self.app.id, &channel, self.handle(), None)
+                    .await;
                 self.subscribed.insert(channel.clone());
                 self.send_self(ServerEvent::SubscriptionSucceeded {
                     channel: channel.clone(),
                     presence: None,
                 });
-                self.maybe_emit_count(&channel).await;
+                self.maybe_emit_count(&channel, out.subscription_count)
+                    .await;
             }
             // private / presence / encrypted / cache require auth — SP2/SP3.
             _ => self.send_self(ServerEvent::Error(PusherError::unauthorized())),
@@ -70,18 +70,17 @@ impl ConnectionContext {
 
     async fn unsubscribe(&mut self, channel: String) {
         if self.subscribed.remove(&channel) {
-            self.registry
-                .unsubscribe(&self.app.id, &channel, &self.socket_id);
-            self.maybe_emit_count(&channel).await;
+            let out = self
+                .adapter
+                .unsubscribe(&self.app.id, &channel, &self.socket_id)
+                .await;
+            self.maybe_emit_count(&channel, out.subscription_count)
+                .await;
         }
     }
 
-    async fn maybe_emit_count(&self, channel: &str) {
+    async fn maybe_emit_count(&self, channel: &str, count: usize) {
         if self.app.subscription_count_enabled {
-            let count = self
-                .registry
-                .channel_summary(&self.app.id, channel)
-                .subscription_count;
             self.adapter
                 .broadcast(
                     &self.app.id,
@@ -109,6 +108,7 @@ impl ConnectionContext {
 mod tests {
     use super::*;
     use crate::adapter::local::LocalAdapter;
+    use crate::channel::registry::Registry;
     use serde_json::Value;
     use tokio::sync::mpsc;
 
@@ -124,12 +124,11 @@ mod tests {
     fn ctx(app: App) -> (ConnectionContext, mpsc::UnboundedReceiver<ServerEvent>) {
         let (tx, rx) = mpsc::unbounded_channel();
         let registry = Arc::new(Registry::new());
-        let adapter: Arc<dyn Adapter> = Arc::new(LocalAdapter::new(registry.clone()));
+        let adapter: Arc<dyn Adapter> = Arc::new(LocalAdapter::new(registry));
         let c = ConnectionContext {
             app,
             socket_id: SocketId::generate(),
             self_tx: tx,
-            registry,
             adapter,
             subscribed: HashSet::new(),
         };
@@ -156,10 +155,7 @@ mod tests {
             rx.try_recv(),
             Ok(ServerEvent::SubscriptionSucceeded { .. })
         ));
-        assert_eq!(
-            c.registry.channel_summary("app", "room").subscription_count,
-            1
-        );
+        assert_eq!(c.adapter.channel("app", "room").await.subscription_count, 1);
     }
 
     #[tokio::test]

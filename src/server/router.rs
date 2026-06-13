@@ -2,7 +2,6 @@
 
 use crate::adapter::Adapter;
 use crate::app::AppManager;
-use crate::channel::registry::Registry;
 use crate::server::config::ServerConfig;
 use axum::routing::get;
 use axum::Router;
@@ -14,7 +13,6 @@ use std::sync::Arc;
 pub struct AppState {
     pub config: ServerConfig,
     pub apps: Arc<dyn AppManager>,
-    pub registry: Arc<Registry>,
     pub adapter: Arc<dyn Adapter>,
     pub conn_counts: Arc<DashMap<String, Arc<AtomicUsize>>>,
 }

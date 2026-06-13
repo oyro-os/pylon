@@ -20,9 +20,20 @@ pub trait Adapter: Send + Sync {
         member: Option<PresenceMember>,
     ) -> SubscribeOutcome;
 
-    async fn unsubscribe(&self, app: &str, channel: &str, socket_id: &SocketId) -> UnsubscribeOutcome;
+    async fn unsubscribe(
+        &self,
+        app: &str,
+        channel: &str,
+        socket_id: &SocketId,
+    ) -> UnsubscribeOutcome;
 
-    async fn broadcast(&self, app: &str, channel: &str, event: ServerEvent, except: Option<SocketId>);
+    async fn broadcast(
+        &self,
+        app: &str,
+        channel: &str,
+        event: ServerEvent,
+        except: Option<SocketId>,
+    );
 
     async fn channels(&self, app: &str, prefix: Option<&str>) -> Vec<ChannelSummary>;
 

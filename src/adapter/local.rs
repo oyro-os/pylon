@@ -30,12 +30,24 @@ impl Adapter for LocalAdapter {
         self.registry.subscribe(app, channel, handle, member)
     }
 
-    async fn unsubscribe(&self, app: &str, channel: &str, socket_id: &SocketId) -> UnsubscribeOutcome {
+    async fn unsubscribe(
+        &self,
+        app: &str,
+        channel: &str,
+        socket_id: &SocketId,
+    ) -> UnsubscribeOutcome {
         self.registry.unsubscribe(app, channel, socket_id)
     }
 
-    async fn broadcast(&self, app: &str, channel: &str, event: ServerEvent, except: Option<SocketId>) {
-        self.registry.broadcast(app, channel, &event, except.as_ref());
+    async fn broadcast(
+        &self,
+        app: &str,
+        channel: &str,
+        event: ServerEvent,
+        except: Option<SocketId>,
+    ) {
+        self.registry
+            .broadcast(app, channel, &event, except.as_ref());
     }
 
     async fn channels(&self, app: &str, prefix: Option<&str>) -> Vec<ChannelSummary> {
@@ -62,7 +74,15 @@ mod tests {
         let adapter = LocalAdapter::new(reg.clone());
         let (tx, mut rx) = mpsc::unbounded_channel();
         let out = adapter
-            .subscribe("app", "c", ConnectionHandle { socket_id: SocketId::generate(), mailbox: tx }, None)
+            .subscribe(
+                "app",
+                "c",
+                ConnectionHandle {
+                    socket_id: SocketId::generate(),
+                    mailbox: tx,
+                },
+                None,
+            )
             .await;
         assert_eq!(out.subscription_count, 1);
         adapter.broadcast("app", "c", ServerEvent::Pong, None).await;
@@ -78,13 +98,22 @@ mod tests {
             .subscribe(
                 "app",
                 "presence-x",
-                ConnectionHandle { socket_id: SocketId::generate(), mailbox: tx },
-                Some(PresenceMember { user_id: "u1".into(), user_info: serde_json::json!({}) }),
+                ConnectionHandle {
+                    socket_id: SocketId::generate(),
+                    mailbox: tx,
+                },
+                Some(PresenceMember {
+                    user_id: "u1".into(),
+                    user_info: serde_json::json!({}),
+                }),
             )
             .await;
         let members = adapter.presence_members("app", "presence-x").await;
         assert_eq!(members.len(), 1);
         assert_eq!(members[0].user_id, "u1");
-        assert_eq!(adapter.channel("app", "presence-x").await.user_count, Some(1));
+        assert_eq!(
+            adapter.channel("app", "presence-x").await.user_count,
+            Some(1)
+        );
     }
 }

@@ -16,11 +16,10 @@ async fn main() -> anyhow::Result<()> {
     let config = ServerConfig::from_env();
     let apps: Arc<dyn AppManager> = Arc::new(StaticFileAppManager::from_file(&config.apps_path)?);
     let registry = Arc::new(Registry::new());
-    let adapter: Arc<dyn Adapter> = Arc::new(LocalAdapter::new(registry.clone()));
+    let adapter: Arc<dyn Adapter> = Arc::new(LocalAdapter::new(registry));
     let state = AppState {
         config: config.clone(),
         apps,
-        registry,
         adapter,
         conn_counts: Arc::new(Default::default()),
     };

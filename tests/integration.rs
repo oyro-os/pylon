@@ -24,11 +24,10 @@ type Ws =
 async fn spawn(config: ServerConfig) -> SocketAddr {
     let apps: Arc<dyn AppManager> = Arc::new(StaticFileAppManager::from_json(APPS).unwrap());
     let registry = Arc::new(Registry::new());
-    let adapter: Arc<dyn Adapter> = Arc::new(LocalAdapter::new(registry.clone()));
+    let adapter: Arc<dyn Adapter> = Arc::new(LocalAdapter::new(registry));
     let state = AppState {
         config,
         apps,
-        registry,
         adapter,
         conn_counts: Arc::new(Default::default()),
     };

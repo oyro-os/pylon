@@ -52,7 +52,6 @@ async fn serve(socket: WebSocket, key: String, params: HashMap<String, String>, 
 
     let cp = ConnectionParams {
         app,
-        registry: state.registry.clone(),
         adapter: state.adapter.clone(),
         activity_timeout: state.config.activity_timeout,
         pong_timeout: state.config.pong_timeout,

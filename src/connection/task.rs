@@ -2,7 +2,6 @@
 
 use crate::adapter::Adapter;
 use crate::app::App;
-use crate::channel::registry::Registry;
 use crate::protocol::codec::Codec;
 use crate::protocol::error::PusherError;
 use crate::protocol::event::ServerEvent;
@@ -19,7 +18,6 @@ use tokio::time::Instant;
 
 pub struct ConnectionParams {
     pub app: App,
-    pub registry: Arc<Registry>,
     pub adapter: Arc<dyn Adapter>,
     pub activity_timeout: u32,
     pub pong_timeout: u32,
@@ -48,7 +46,6 @@ pub async fn run(socket: WebSocket, codec: Box<dyn Codec>, params: ConnectionPar
         app: params.app.clone(),
         socket_id,
         self_tx: tx.clone(),
-        registry: params.registry.clone(),
         adapter: params.adapter.clone(),
         subscribed: HashSet::new(),
     };
