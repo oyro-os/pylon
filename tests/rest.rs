@@ -372,6 +372,59 @@ async fn rest_trigger_caches_event_for_later_subscriber() {
 }
 
 #[tokio::test]
+async fn cache_subscribe_with_no_cache_emits_cache_miss() {
+    let addr = spawn().await;
+    let mut ws = connect_ws(addr).await;
+    let _ = next_json(&mut ws).await; // established
+    ws.send(Message::Text(
+        json!({"event":"pusher:subscribe","data":{"channel":"cache-empty"}}).to_string(),
+    ))
+    .await
+    .unwrap();
+    let succ = next_json(&mut ws).await;
+    assert_eq!(succ["event"], "pusher_internal:subscription_succeeded");
+    let miss = next_json(&mut ws).await;
+    assert_eq!(miss["event"], "pusher:cache_miss");
+    assert_eq!(miss["channel"], "cache-empty");
+    assert!(miss.get("data").is_none(), "cache_miss has no data field");
+}
+
+#[tokio::test]
+async fn private_cache_subscribe_replays_after_auth() {
+    let addr = spawn().await;
+
+    // Cache an event on a private-cache channel via REST.
+    let body = json!({"name":"e","data":"\"v\"","channels":["private-cache-x"]}).to_string();
+    let q = signed_query("POST", "/apps/app1/events", body.as_bytes(), &[]);
+    let resp = reqwest::Client::new()
+        .post(format!("http://{addr}/apps/app1/events?{q}"))
+        .body(body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    // Authenticate + subscribe, then receive the replay.
+    let mut ws = connect_ws(addr).await;
+    let socket_id = established_socket_id(&mut ws).await;
+    let token = format!(
+        "app-key:{}",
+        channel_signature(SECRET, &socket_id, "private-cache-x", None)
+    );
+    ws.send(Message::Text(
+        json!({"event":"pusher:subscribe","data":{"channel":"private-cache-x","auth":token}})
+            .to_string(),
+    ))
+    .await
+    .unwrap();
+    let succ = next_json(&mut ws).await;
+    assert_eq!(succ["event"], "pusher_internal:subscription_succeeded");
+    let replay = next_json(&mut ws).await;
+    assert_eq!(replay["event"], "e");
+    assert_eq!(replay["channel"], "private-cache-x");
+}
+
+#[tokio::test]
 async fn rest_body_too_large_is_413() {
     let addr = spawn().await;
     // Default limits → body cap = 10*10240 + 64KiB ≈ 164KiB; exceed it. The

@@ -465,6 +465,65 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cache_subscribe_replays_cached_event() {
+        let (mut c, mut rx) = ctx(app(false));
+        // Seed the cache directly through the adapter seam.
+        c.adapter
+            .cache_set(
+                "app",
+                "cache-feed",
+                crate::channel::cache::CachedEvent {
+                    event: "my-event".into(),
+                    data: "{\"hi\":1}".into(),
+                },
+                std::time::Duration::from_secs(60),
+            )
+            .await;
+        c.dispatch(ClientCommand::Subscribe {
+            channel: "cache-feed".into(),
+            auth: None,
+            channel_data: None,
+        })
+        .await;
+        // First the success frame, then the replayed cached event.
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(ServerEvent::SubscriptionSucceeded { .. })
+        ));
+        match rx.try_recv() {
+            Ok(ServerEvent::ChannelEvent {
+                channel,
+                event,
+                data,
+            }) => {
+                assert_eq!(channel, "cache-feed");
+                assert_eq!(event, "my-event");
+                assert_eq!(data, serde_json::Value::String("{\"hi\":1}".into()));
+            }
+            other => panic!("expected replayed ChannelEvent, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn cache_subscribe_with_empty_cache_emits_cache_miss() {
+        let (mut c, mut rx) = ctx(app(false));
+        c.dispatch(ClientCommand::Subscribe {
+            channel: "cache-feed".into(),
+            auth: None,
+            channel_data: None,
+        })
+        .await;
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(ServerEvent::SubscriptionSucceeded { .. })
+        ));
+        match rx.try_recv() {
+            Ok(ServerEvent::CacheMiss { channel }) => assert_eq!(channel, "cache-feed"),
+            other => panic!("expected CacheMiss, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
     async fn presence_over_member_cap_errors() {
         let registry = Arc::new(Registry::new());
         let adapter: Arc<dyn Adapter> = Arc::new(LocalAdapter::new(registry));

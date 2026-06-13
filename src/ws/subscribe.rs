@@ -163,6 +163,22 @@ impl ConnectionContext {
                     .await;
             }
         }
+
+        // Cache channels: after subscription_succeeded, replay the last event to
+        // this new subscriber only — or signal a miss. `subscribed` contains the
+        // channel iff the subscribe above succeeded (auth failures returned early).
+        if info.cache && self.subscribed.contains(&channel) {
+            match self.adapter.cache_get(&self.app.id, &channel).await {
+                Some(cached) => self.send_self(ServerEvent::ChannelEvent {
+                    channel: channel.clone(),
+                    event: cached.event,
+                    data: Value::String(cached.data),
+                }),
+                None => self.send_self(ServerEvent::CacheMiss {
+                    channel: channel.clone(),
+                }),
+            }
+        }
     }
 
     pub(in crate::ws) fn send_subscription_error(
