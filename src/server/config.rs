@@ -4,6 +4,7 @@
 pub struct Limits {
     pub max_presence_members: usize,
     pub max_event_payload_bytes: usize,
+    pub max_watchlist_size: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -20,6 +21,7 @@ pub struct ServerConfig {
     pub rest_auth_window_secs: u64,
     pub max_batch_events: usize,
     pub cache_ttl_secs: u64,
+    pub max_watchlist_size: usize,
 }
 
 impl Default for ServerConfig {
@@ -37,6 +39,7 @@ impl Default for ServerConfig {
             rest_auth_window_secs: 600,
             max_batch_events: 10,
             cache_ttl_secs: 1800,
+            max_watchlist_size: 100,
         }
     }
 }
@@ -98,6 +101,11 @@ impl ServerConfig {
                 c.cache_ttl_secs = p;
             }
         }
+        if let Ok(v) = std::env::var("PYLON_MAX_WATCHLIST_SIZE") {
+            if let Ok(p) = v.parse() {
+                c.max_watchlist_size = p;
+            }
+        }
         c
     }
 
@@ -105,6 +113,7 @@ impl ServerConfig {
         Limits {
             max_presence_members: self.max_presence_members,
             max_event_payload_bytes: self.max_event_payload_bytes,
+            max_watchlist_size: self.max_watchlist_size,
         }
     }
 }
@@ -126,5 +135,6 @@ mod tests {
         assert_eq!(c.rest_auth_window_secs, 600);
         assert_eq!(c.max_batch_events, 10);
         assert_eq!(c.cache_ttl_secs, 1800);
+        assert_eq!(c.max_watchlist_size, 100);
     }
 }
