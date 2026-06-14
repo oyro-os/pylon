@@ -170,12 +170,38 @@ mod frame_tests {
 
 use crate::metrics::{Counters, Latency};
 use futures_util::{SinkExt, StreamExt};
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::Instant;
-use tokio::net::TcpStream;
-use tokio_tungstenite::{connect_async, tungstenite::Message, MaybeTlsStream, WebSocketStream};
+use tokio::net::{TcpSocket, TcpStream};
+use tokio_tungstenite::{client_async, tungstenite::Message, MaybeTlsStream, WebSocketStream};
 
 pub type Ws = WebSocketStream<MaybeTlsStream<TcpStream>>;
+
+/// Open a TCP stream from a specific source IP to the ws host, then do the WS upgrade.
+/// `src_ip` of `None` lets the OS pick the source address (default behavior).
+async fn connect_bound(url: &str, src_ip: Option<IpAddr>) -> anyhow::Result<Ws> {
+    let parsed = url::Url::parse(url)?;
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| anyhow::anyhow!("no host"))?;
+    let port = parsed.port().unwrap_or(80);
+    // The host is an IP literal in our usage; otherwise resolve it.
+    let addr: SocketAddr = match format!("{host}:{port}").parse() {
+        Ok(a) => a,
+        Err(_) => tokio::net::lookup_host(format!("{host}:{port}"))
+            .await?
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("no address for {host}:{port}"))?,
+    };
+    let socket = TcpSocket::new_v4()?;
+    if let Some(ip) = src_ip {
+        socket.bind(SocketAddr::new(ip, 0))?;
+    }
+    let stream = socket.connect(addr).await?;
+    let (ws, _) = client_async(url, MaybeTlsStream::Plain(stream)).await?;
+    Ok(ws)
+}
 
 /// Monotonic nanos since a shared process epoch, so publisher and subscribers share a clock.
 pub fn epoch() -> Instant {
@@ -189,6 +215,8 @@ pub struct ClientConfig {
     pub secret: String,
     pub channel: String,
     pub private: bool, // sign the subscribe
+    /// Source IP to bind the TCP socket to (None = OS default).
+    pub src_ip: Option<IpAddr>,
 }
 
 /// Connect, handshake, subscribe, then receive until `shutdown` notifies. Records latency
@@ -200,11 +228,11 @@ pub async fn run_client(
     counters: Arc<Counters>,
     shutdown: Arc<tokio::sync::Notify>,
 ) -> anyhow::Result<()> {
-    let (mut ws, _) = match connect_async(&cfg.url).await {
+    let mut ws = match connect_bound(&cfg.url, cfg.src_ip).await {
         Ok(ok) => ok,
         Err(e) => {
             Counters::inc(&counters.connect_failed);
-            return Err(e.into());
+            return Err(e);
         }
     };
     Counters::inc(&counters.connected);

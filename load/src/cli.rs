@@ -41,6 +41,10 @@ pub struct Cli {
     /// Server PID to sample CPU/RSS (optional)
     #[arg(long)]
     pub server_pid: Option<u32>,
+    /// Comma-separated client source IPs to spread sockets across (ephemeral-port headroom),
+    /// e.g. 127.0.0.1,127.0.0.2,127.0.0.3,127.0.0.4
+    #[arg(long, value_delimiter = ',', default_value = "127.0.0.1")]
+    pub client_ips: Vec<String>,
 }
 
 #[derive(ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]

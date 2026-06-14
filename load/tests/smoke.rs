@@ -45,7 +45,7 @@ async fn fanout_smoke_delivers_to_all() {
     for _ in 0..K {
         let cfg = ClientConfig {
             url: url.clone(), key: "app-key".into(), secret: "app-secret".into(),
-            channel: "bench".into(), private: false,
+            channel: "bench".into(), private: false, src_ip: None,
         };
         let (l, c, s) = (lat.clone(), counters.clone(), shutdown.clone());
         tasks.push(tokio::spawn(async move { let _ = run_client(cfg, epoch, l, c, s).await; }));
