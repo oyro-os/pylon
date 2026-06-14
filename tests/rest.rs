@@ -356,6 +356,66 @@ async fn rest_get_channels_lists_occupied_channel() {
     assert!(v["channels"]["public-room"].is_object());
 }
 
+// P15 — GET /channels list must emit per-channel subscription_count
+
+/// GET /channels?info=subscription_count with flag ON → each channel carries subscription_count.
+#[tokio::test]
+async fn rest_get_channels_list_subscription_count_enabled() {
+    let addr = spawn().await;
+    // Connect on app2 which has subscription_count_enabled=true.
+    let mut ws = connect_ws2(addr).await;
+    let _ = next_json(&mut ws).await; // established
+    subscribe_public(&mut ws, "public-room").await;
+
+    let q = signed_query2(
+        "GET",
+        "/apps/app2/channels",
+        b"",
+        &[("info", "subscription_count")],
+    );
+    let resp = reqwest::Client::new()
+        .get(format!("http://{addr}/apps/app2/channels?{q}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let v: Value = resp.json().await.unwrap();
+    assert_eq!(
+        v["channels"]["public-room"]["subscription_count"], 1,
+        "GET /channels with flag ON must emit subscription_count per channel (P15), got: {v}"
+    );
+}
+
+/// GET /channels?info=subscription_count with flag OFF → attribute absent.
+#[tokio::test]
+async fn rest_get_channels_list_subscription_count_disabled() {
+    let addr = spawn().await;
+    // app1 has subscription_count_enabled=false.
+    let mut ws = connect_ws(addr).await;
+    let _ = next_json(&mut ws).await;
+    subscribe_public(&mut ws, "public-room").await;
+
+    let q = signed_query(
+        "GET",
+        "/apps/app1/channels",
+        b"",
+        &[("info", "subscription_count")],
+    );
+    let resp = reqwest::Client::new()
+        .get(format!("http://{addr}/apps/app1/channels?{q}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let v: Value = resp.json().await.unwrap();
+    assert!(
+        v["channels"]["public-room"]
+            .get("subscription_count")
+            .is_none(),
+        "GET /channels with flag OFF must NOT emit subscription_count (P15), got: {v}"
+    );
+}
+
 #[tokio::test]
 async fn rest_get_users_lists_presence_members() {
     let addr = spawn().await;
