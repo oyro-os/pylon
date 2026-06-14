@@ -60,6 +60,9 @@ mimalloc = { version = "0.1", default-features = false }
 socket2 = { version = "0.5", features = ["all"] }
 # Pin each per-core worker thread to a CPU (SP9 multi-worker core affinity).
 core_affinity = "0.8"
+# Parallelize the per-subscriber broadcast enqueue across a work-stealing pool
+# (SP9 fan-out): the single-threaded mailbox.send loop caps large-channel fan-out.
+rayon = "1"
 
 [dev-dependencies]
 # Enables paused-time control (`start_paused`, `tokio::time::advance`) in tests.

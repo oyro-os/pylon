@@ -1490,6 +1490,7 @@ dependencies = [
  "mimalloc",
  "mio",
  "rand 0.8.6",
+ "rayon",
  "reqwest",
  "serde",
  "serde_json",

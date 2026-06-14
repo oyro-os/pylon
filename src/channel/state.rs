@@ -6,8 +6,20 @@ use crate::connection::handle::ConnectionHandle;
 use crate::presence::member::PresenceMember;
 use crate::protocol::event::{PresencePayload, ServerEvent};
 use crate::protocol::socket_id::SocketId;
+use rayon::prelude::*;
 use serde_json::Value;
 use std::collections::HashMap;
+use tokio::sync::mpsc::UnboundedSender;
+
+/// Above this subscriber count, `broadcast` fans the per-mailbox enqueue out
+/// across the rayon pool; at or below it the serial loop is cheaper than the
+/// pool dispatch overhead (presence/small channels stay serial).
+const PARALLEL_THRESHOLD: usize = 256;
+
+/// Subscribers per rayon job in the parallel fan-out. Sized so each job amortizes
+/// the work-stealing dispatch cost over a batch of (cheap) mailbox sends while
+/// still producing enough jobs to spread across the pool at N≫threshold.
+const SEND_CHUNK: usize = 512;
 
 struct Subscriber {
     handle: ConnectionHandle,
@@ -136,17 +148,45 @@ impl ChannelState {
     /// N local subscribers). If the event is already pre-encoded (`Raw`, e.g. a
     /// broadcast relayed verbatim from another node), reuse its `Arc`. Control
     /// events (`Close`) never reach `broadcast`.
+    ///
+    /// For large channels the serial per-subscriber `mailbox.send` loop becomes
+    /// the publish-side bottleneck (at N=10k it caps fan-out below the worker
+    /// ceiling). Above [`PARALLEL_THRESHOLD`] we fan the enqueue out across the
+    /// rayon work-stealing pool. This is correctness-safe: subscribers are keyed
+    /// by `SocketId`, so each distinct mailbox appears in `targets` at most once
+    /// and is sent to exactly once per broadcast — no two threads ever push to the
+    /// same mailbox, and per-channel send ordering is preserved (a connection only
+    /// receives via its own mailbox). Small broadcasts stay on the serial path so
+    /// presence/small channels pay zero pool overhead.
     pub fn broadcast(&self, event: &ServerEvent, except: Option<&SocketId>) {
         let frame: std::sync::Arc<str> = match event {
             ServerEvent::Raw(f) => f.clone(),
             other => std::sync::Arc::from(crate::protocol::v7::frames::encode(other).as_str()),
         };
-        for (sid, sub) in &self.subscribers {
-            if Some(sid) == except {
-                continue;
+        if self.subscribers.len() <= PARALLEL_THRESHOLD {
+            for (sid, sub) in &self.subscribers {
+                if Some(sid) == except {
+                    continue;
+                }
+                let _ = sub.handle.mailbox.send(ServerEvent::Raw(frame.clone()));
             }
-            let _ = sub.handle.mailbox.send(ServerEvent::Raw(frame.clone()));
+            return;
         }
+        let targets: Vec<&UnboundedSender<ServerEvent>> = self
+            .subscribers
+            .iter()
+            .filter(|(sid, _)| Some(*sid) != except)
+            .map(|(_, sub)| &sub.handle.mailbox)
+            .collect();
+        // Chunk the fan-out so each rayon job does a meaningful batch of sends
+        // (a single `UnboundedSender::send` is ~tens of ns; per-element rayon
+        // dispatch would otherwise dominate). The frame `Arc` is cloned once per
+        // batch closure entry and once per send.
+        targets.par_chunks(SEND_CHUNK).for_each(|chunk| {
+            for tx in chunk {
+                let _ = tx.send(ServerEvent::Raw(frame.clone()));
+            }
+        });
     }
 }
 
@@ -243,6 +283,53 @@ mod tests {
                 other => panic!("expected Raw, got {other:?}"),
             }
         }
+    }
+
+    #[test]
+    fn broadcast_parallel_path_delivers_to_all_and_excludes_sender() {
+        // > PARALLEL_THRESHOLD subscribers forces the rayon fan-out path; verify
+        // every mailbox receives exactly the encoded frame and `except` is skipped.
+        let mut s = ChannelState::default();
+        let n = PARALLEL_THRESHOLD + 50;
+        let mut rxs = Vec::with_capacity(n);
+        let mut excluded_sid = None;
+        for i in 0..n {
+            let (h, rx) = handle_with_rx();
+            if i == 0 {
+                excluded_sid = Some(h.socket_id.clone());
+            }
+            s.add(h, None);
+            rxs.push((i, rx));
+        }
+        let except = excluded_sid.unwrap();
+
+        let original = ServerEvent::ChannelEvent {
+            channel: "big".into(),
+            event: "ev".into(),
+            data: serde_json::json!({"k": "v"}),
+            user_id: None,
+        };
+        let expected = crate::protocol::v7::frames::encode(&original);
+
+        s.broadcast(&original, Some(&except));
+
+        let mut delivered = 0;
+        for (i, rx) in &mut rxs {
+            match rx.try_recv() {
+                Ok(ServerEvent::Raw(f)) => {
+                    assert_eq!(&*f, expected.as_str());
+                    delivered += 1;
+                }
+                Ok(other) => panic!("expected Raw, got {other:?}"),
+                Err(_) if *i == 0 => {} // the excluded sender receives nothing
+                Err(e) => panic!("subscriber {i} got no frame: {e:?}"),
+            }
+        }
+        assert_eq!(
+            delivered,
+            n - 1,
+            "every subscriber except `except` receives the frame exactly once"
+        );
     }
 
     #[test]
