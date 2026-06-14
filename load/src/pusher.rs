@@ -167,3 +167,146 @@ mod frame_tests {
         assert_eq!(extract_nanos(&p), Some(123_456_789));
     }
 }
+
+use crate::metrics::{Counters, Latency};
+use futures_util::{SinkExt, StreamExt};
+use std::sync::atomic::Ordering;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+use tokio::net::TcpStream;
+use tokio_tungstenite::{connect_async, tungstenite::Message, MaybeTlsStream, WebSocketStream};
+
+pub type Ws = WebSocketStream<MaybeTlsStream<TcpStream>>;
+
+/// Monotonic nanos since a shared process epoch, so publisher and subscribers share a clock.
+pub fn epoch() -> Instant {
+    // Callers pass a single shared Instant; this is a convenience for tests.
+    Instant::now()
+}
+
+pub struct ClientConfig {
+    pub url: String,
+    pub key: String,
+    pub secret: String,
+    pub channel: String,
+    pub private: bool, // sign the subscribe
+}
+
+/// Connect, handshake, subscribe, then receive until `shutdown` notifies. Records latency
+/// of every `data` event carrying a timestamp; replies to ping with pong.
+pub async fn run_client(
+    cfg: ClientConfig,
+    epoch: Instant,
+    lat: Arc<Latency>,
+    counters: Arc<Counters>,
+    shutdown: Arc<tokio::sync::Notify>,
+) -> anyhow::Result<()> {
+    let (mut ws, _) = match connect_async(&cfg.url).await {
+        Ok(ok) => ok,
+        Err(e) => {
+            Counters::inc(&counters.connect_failed);
+            return Err(e.into());
+        }
+    };
+    Counters::inc(&counters.connected);
+
+    // 1. connection_established → socket_id
+    let socket_id = loop {
+        match ws.next().await {
+            Some(Ok(Message::Text(t))) => {
+                if let Some(f) = parse_frame(&t) {
+                    if f.event == "pusher:connection_established" {
+                        let inner: Value = serde_json::from_str(f.data.as_deref().unwrap_or("{}"))?;
+                        break inner["socket_id"].as_str().unwrap_or_default().to_string();
+                    }
+                }
+            }
+            Some(Ok(_)) => {}
+            _ => anyhow::bail!("closed before established"),
+        }
+    };
+
+    // 2. subscribe (signed if private)
+    let auth = if cfg.private {
+        Some(channel_auth(&cfg.key, &cfg.secret, &socket_id, &cfg.channel, None))
+    } else {
+        None
+    };
+    ws.send(Message::Text(subscribe_frame(&cfg.channel, auth.as_deref(), None)))
+        .await?;
+
+    // 3. receive loop
+    loop {
+        tokio::select! {
+            _ = shutdown.notified() => break,
+            msg = ws.next() => match msg {
+                Some(Ok(Message::Text(t))) => {
+                    if let Some(f) = parse_frame(&t) {
+                        match f.event.as_str() {
+                            "pusher_internal:subscription_succeeded" => {
+                                Counters::inc(&counters.subscribed);
+                            }
+                            "pusher:ping" => {
+                                ws.send(Message::Text(pong_frame())).await.ok();
+                            }
+                            _ => {
+                                if let Some(data) = f.data.as_deref() {
+                                    if let Some(t_ns) = extract_nanos(data) {
+                                        let now = epoch.elapsed().as_nanos();
+                                        let d = now.saturating_sub(t_ns);
+                                        lat.record_nanos(d.min(u64::MAX as u128) as u64);
+                                        Counters::inc(&counters.received);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                Some(Ok(Message::Ping(p))) => { ws.send(Message::Pong(p)).await.ok(); }
+                Some(Ok(_)) => {}
+                _ => break,
+            }
+        }
+    }
+    let _ = ws.close(None).await;
+    Ok(())
+}
+
+/// Signed REST publisher. `base` like "http://127.0.0.1:7000".
+pub struct Publisher {
+    http: reqwest::Client,
+    base: String,
+    app_id: String,
+    key: String,
+    secret: String,
+}
+
+impl Publisher {
+    pub fn new(base: String, app_id: String, key: String, secret: String) -> Self {
+        Self { http: reqwest::Client::new(), base, app_id, key, secret }
+    }
+
+    /// Publish `event` to `channel` with a timestamped payload. `now_unix` = wall-clock secs.
+    pub async fn publish(
+        &self,
+        channel: &str,
+        event: &str,
+        payload: &str,
+        now_unix: u64,
+    ) -> anyhow::Result<()> {
+        let body = json!({ "name": event, "channel": channel, "data": payload }).to_string();
+        let query = sign_post_events(&self.key, &self.secret, &self.app_id, &body, now_unix);
+        let url = format!("{}/apps/{}/events?{}", self.base, self.app_id, query);
+        let resp = self.http.post(url).header("Content-Type", "application/json").body(body).send().await?;
+        anyhow::ensure!(resp.status().is_success(), "publish status {}", resp.status());
+        Ok(())
+    }
+}
+
+/// Wall-clock unix seconds (for the auth_timestamp).
+pub fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+}
