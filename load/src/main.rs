@@ -1,13 +1,21 @@
-//! pylon-load — Pusher-protocol load-test harness. See
-//! docs/superpowers/specs/2026-06-14-pylon-sp8-load-test-design.md
-// The `pusher` module is a library of protocol helpers consumed by later SP8
-// tasks (WS client, REST publisher); they are exercised by unit tests now and
-// wired into `main` in subsequent tasks, so allow the not-yet-used API.
+//! pylon-load — Pusher-protocol load-test harness.
 #![allow(dead_code)]
-
+mod cli;
 mod metrics;
 mod pusher;
+mod scenario;
 
-fn main() {
-    println!("pylon-load");
+use clap::Parser;
+use cli::{Cli, Scenario};
+
+#[tokio::main(flavor = "multi_thread")]
+async fn main() -> anyhow::Result<()> {
+    tracing_subscriber::fmt().with_env_filter("info").try_init().ok();
+    let cli = Cli::parse();
+    match cli.scenario {
+        Scenario::Fanout => scenario::fanout::run(&cli).await,
+        Scenario::Connect => scenario::connect::run(&cli).await,
+        Scenario::Channels => scenario::channels::run(&cli).await,
+        Scenario::Cluster => scenario::cluster::run(&cli).await,
+    }
 }
