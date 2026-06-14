@@ -31,7 +31,8 @@ pub async fn run(cli: &Cli) -> anyhow::Result<()> {
     }
     tokio::time::sleep(Duration::from_millis(500)).await;
     let proc = if let Some(s) = sampler { s.await.ok().flatten() } else { None };
-    super::fanout::report("channels", cli, &h, proc);
+    // conns are spread across `m` channels → each event reaches ~conns/m subscribers
+    super::fanout::report("channels", cli, &h, proc, (cli.conns / m) as u64);
     h.drain().await;
     Ok(())
 }

@@ -36,19 +36,22 @@ pub async fn run(cli: &Cli) -> anyhow::Result<()> {
     tokio::time::sleep(Duration::from_millis(500)).await;
 
     let proc = if let Some(s) = sampler { s.await.ok().flatten() } else { None };
-    report("fanout", cli, &h, proc);
+    // single channel → every connection is a recipient of every event
+    report("fanout", cli, &h, proc, cli.conns as u64);
     h.drain().await;
     Ok(())
 }
 
-pub fn report(name: &str, cli: &Cli, h: &Harness, proc: Option<(u64, f64)>) {
+/// `recipients_per_event` = how many connections each published event is expected to reach
+/// (all connections for single-channel fan-out; conns/channels for the many-channels case).
+pub fn report(name: &str, cli: &Cli, h: &Harness, proc: Option<(u64, f64)>, recipients_per_event: u64) {
     let c = &h.counters;
     let sent = c.sent.load(Ordering::Relaxed);
     let recv = c.received.load(Ordering::Relaxed);
     let (count, p50, p99, p999, max) = h.lat.summary_us();
     println!("=== scenario: {name} ===");
     println!("conns={} subscribed={} sent={} received={} (expected≈{})",
-        cli.conns, c.subscribed.load(Ordering::Relaxed), sent, recv, sent * cli.conns as u64);
+        cli.conns, c.subscribed.load(Ordering::Relaxed), sent, recv, sent * recipients_per_event);
     println!("latency µs: count={count} p50={p50} p99={p99} p99.9={p999} max={max}");
     if let Some((rss_mb, cpu)) = proc {
         println!("server: peak_rss={rss_mb}MB mean_cpu={cpu:.1}%");
