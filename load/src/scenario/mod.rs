@@ -37,7 +37,11 @@ impl Harness {
         n: usize,
         channel_of: impl Fn(usize) -> String,
     ) {
-        let ramp = if cli.ramp_per_sec == 0 { n } else { cli.ramp_per_sec };
+        // Smooth ramp: pace spawns in ~100ms slices so the accept rate is steady rather
+        // than a burst-then-1s-pause sawtooth. `per_sec` = target new conns/sec (0 = all at
+        // once). No pacing when per_sec >= n (the whole set fits in under a second).
+        let per_sec = if cli.ramp_per_sec == 0 { n } else { cli.ramp_per_sec };
+        let batch = (per_sec / 10).max(1);
         // Parse client source IPs once. If parsing fails or the list is just the single
         // default 127.0.0.1, keep the OS-default behavior (src_ip = None).
         let ips: Vec<IpAddr> = cli
@@ -70,8 +74,8 @@ impl Harness {
             self.tasks.push(tokio::spawn(async move {
                 let _ = run_client(cfg, e, l, c, s).await;
             }));
-            if ramp > 0 && (i + 1) % ramp == 0 {
-                tokio::time::sleep(Duration::from_secs(1)).await;
+            if per_sec < n && (i + 1) % batch == 0 {
+                tokio::time::sleep(Duration::from_millis(100)).await;
             }
         }
     }
@@ -84,14 +88,24 @@ impl Harness {
     }
 }
 
-/// Wait until at least `target` subscribes are acked or `timeout` elapses.
+/// Wait until at least `target` subscribes are acked or `timeout` elapses. On timeout with a
+/// shortfall, emit a loud stderr warning so a truncated run is never silently reported as if it
+/// hit the target (the spec's #1 footgun).
 pub async fn wait_subscribed(counters: &Counters, target: u64, timeout: Duration) {
     let start = Instant::now();
     loop {
-        if counters.subscribed.load(std::sync::atomic::Ordering::Relaxed) >= target {
+        let got = counters.subscribed.load(std::sync::atomic::Ordering::Relaxed);
+        if got >= target {
             return;
         }
         if start.elapsed() > timeout {
+            let failed = counters.connect_failed.load(std::sync::atomic::Ordering::Relaxed);
+            eprintln!(
+                "WARNING: TRUNCATED RUN — only {got}/{target} subscribed after {:.0}s \
+                 ({failed} connect failures). Results below reflect {got} connections, NOT {target}. \
+                 Likely causes: ephemeral-port exhaustion (add more --client-ips) or server backpressure.",
+                start.elapsed().as_secs_f64()
+            );
             return;
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
