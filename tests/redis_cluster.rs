@@ -1311,6 +1311,92 @@ async fn cross_node_watchlist_online_offline() {
     .expect("cross-node watchlist test must not hang (Redis up?)");
 }
 
+/// D1: the membership heartbeat + lease-locked sweeper extend to USER BINDINGS, so a
+/// crashed node's signed-in user goes offline (and its watchers are notified) within the
+/// TTL. A watches u7 on node A; B signs u7 in (cluster online edge → A's watcher sees
+/// "online"). B "crashes" (drop aborts its heartbeat) so u7's `usr` binding goes stale.
+/// After the TTL elapses, A's sweep reaps u7's last (dead-node) binding → the cluster →0
+/// edge publishes WatchOffline → A's watcher receives a `WatchlistEvents` "offline", and
+/// `is_user_online` reads false.
+///
+/// (RED before D1: without the user-binding heartbeat re-stamp + sweep, u7's binding is
+/// never refreshed NOR reaped on B's crash — `is_user_online` stays true and no offline
+/// notify ever reaches A's watcher.)
+#[tokio::test]
+async fn sweeper_offline_on_user_crash_notifies_watchers() {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let prefix = random_prefix();
+        let keys = Keys::new(&prefix);
+
+        // A watches u7 with a short TTL (2s) + heartbeat (1s) — the proven crash margin.
+        let adapter_a = connect_adapter_with_prefix_ttl(&prefix, 2, 1).await;
+        let (_s, watcher, mut rx) = recording_handle();
+        let online = adapter_a.watch(TEST_APP, watcher, vec!["u7".into()]).await;
+        assert!(
+            online.is_empty(),
+            "u7 is not online yet → watch() initial snapshot must be empty (got {online:?})"
+        );
+        assert!(
+            await_tracked(
+                &adapter_a,
+                &keys.watch(TEST_APP, "u7"),
+                Duration::from_secs(2)
+            )
+            .await,
+            "A must SUBSCRIBE watch(u7) on the 0→1 local watcher edge"
+        );
+
+        // B signs u7 in → cluster online edge → publishes WatchOnline on watch(u7). A's
+        // watcher receives the "online" first; drain it so we can assert the "offline".
+        let adapter_b = connect_adapter_with_prefix_ttl(&prefix, 2, 1).await;
+        let (_sb, b_handle, _rx_b) = recording_handle();
+        adapter_b.signin_user(TEST_APP, "u7", b_handle).await;
+
+        let got = with_timeout(async { rx.recv().await }).await;
+        match got {
+            Some(ServerEvent::WatchlistEvents { events }) => {
+                assert_eq!(events.len(), 1, "exactly one watchlist change");
+                assert_eq!(events[0].name, "online", "u7 came online via B's signin");
+                assert_eq!(events[0].user_ids, vec!["u7".to_string()]);
+            }
+            other => panic!("expected WatchlistEvents online on A, got {other:?}"),
+        }
+
+        // Crash B: dropping the adapter aborts its heartbeat, so u7's `usr` binding stops
+        // being re-stamped and its `expireAt` falls into the past. (Must be the LAST ref.)
+        drop(adapter_b);
+
+        // Sleep past u7's worst-case `expireAt` (≤ ~2s after its last stamp) so the
+        // binding is reliably stale, while A's heartbeat keeps A's own state alive.
+        tokio::time::sleep(Duration::from_millis(2600)).await;
+
+        // A sweeps: it holds the lease (nobody else does), reaps u7's stale binding, and
+        // the user branch's →0 edge publishes WatchOffline → A notifies its local watcher.
+        let webhooks = pylon::webhook::WebhookHandle::null();
+        let (acquired, _reaped, _vacated) = adapter_a.sweep_now(&webhooks, now_ms()).await;
+        assert!(acquired, "A must acquire the sweep lease (no other holder)");
+
+        // A's watcher receives a WatchlistEvents "offline" for u7.
+        let got = with_timeout(async { rx.recv().await }).await;
+        match got {
+            Some(ServerEvent::WatchlistEvents { events }) => {
+                assert_eq!(events.len(), 1, "exactly one watchlist change");
+                assert_eq!(events[0].name, "offline", "u7 went offline on B's crash");
+                assert_eq!(events[0].user_ids, vec!["u7".to_string()]);
+            }
+            other => panic!("expected WatchlistEvents offline on A, got {other:?}"),
+        }
+
+        // And the cluster online check now reads false (the `usr` binding was reaped).
+        assert!(
+            !adapter_a.is_user_online(TEST_APP, "u7").await,
+            "u7 must be offline cluster-wide after the sweep reaped its dead-node binding"
+        );
+    })
+    .await
+    .expect("sweeper user-crash offline test must not hang (Redis up?)");
+}
+
 /// C1: the `watch` initial-online snapshot is CLUSTER-wide. If a user is already
 /// online on ANOTHER node when a connection starts watching it, that user must be in
 /// the returned online set (driven by the cluster `is_user_online`, i.e. `HLEN usr`),

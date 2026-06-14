@@ -164,6 +164,34 @@ pub(crate) async fn sweep_once(
         }
     }
 
+    // User-binding reap: a crashed node's signed-in user goes offline here. A live node
+    // re-stamps its OWN bindings' `expireAt` (the membership heartbeat); a crashed node
+    // stops, so its bindings go stale and — like the channel sweep above — the per-user
+    // `users(app)` index outlives the (TTL-expiring) `usr` hash. Reaping the user's LAST
+    // cluster binding (or finding the hash already TTL-gone while still indexed) is the
+    // cluster offline edge: publish WatchOffline so every live node notifies its local
+    // watchers, then de-index. Still under the lease; re-`SMEMBERS apps` (the channel
+    // loop consumed the earlier Vec).
+    let apps: Vec<String> = match pool.next().smembers(keys.apps()).await {
+        Ok(a) => a,
+        Err(e) => {
+            tracing::warn!(error = %e, "sweeper: SMEMBERS apps failed; skipping user reap this pass");
+            Vec::new()
+        }
+    };
+    for app in &apps {
+        let users: Vec<String> = match pool.next().smembers(keys.users(app)).await {
+            Ok(u) => u,
+            Err(e) => {
+                tracing::warn!(error = %e, app, "sweeper: SMEMBERS users failed");
+                continue;
+            }
+        };
+        for user_id in users {
+            super::user::reap_user(pool, keys, app, &user_id, now).await;
+        }
+    }
+
     // Secondary: prune dead nodes from the nodes set (their `node` key TTL-expired).
     // Member reaping above is the real cleanup; this just keeps the set tidy.
     let nodes: Vec<String> = match pool.next().smembers(keys.nodes()).await {

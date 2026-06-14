@@ -35,6 +35,13 @@ impl LocalAdapter {
         self.registry.local_members()
     }
 
+    /// Every local user binding as `(app, user_id, socket_id)`. Exposed so the Redis
+    /// adapter's membership heartbeat can re-stamp each local user binding's `expireAt`
+    /// without reaching into the private user registry.
+    pub fn local_user_bindings(&self) -> Vec<(String, String, SocketId)> {
+        self.users.local_bindings()
+    }
+
     /// Record watchers locally and report the per-user LOCAL watcher edges. Returns
     /// `(online, newly_watched)` — the node-local online subset plus the users whose
     /// LOCAL watcher set went 0→1 here. The composing `RedisAdapter` calls this (not

@@ -139,6 +139,21 @@ impl UserRegistry {
             .map(|e| e.values().cloned().collect())
             .unwrap_or_default()
     }
+
+    /// All local (app, user_id, socket_id) signed-in bindings — for the membership heartbeat.
+    pub fn local_bindings(&self) -> Vec<(String, String, SocketId)> {
+        self.users
+            .iter()
+            .flat_map(|e| {
+                let (app, user) = e.key().clone();
+                e.value()
+                    .keys()
+                    .cloned()
+                    .map(move |sid| (app.clone(), user.clone(), sid))
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }
 }
 
 #[cfg(test)]
@@ -220,6 +235,34 @@ mod tests {
         // And a final unwatch clears everything.
         let _ = r.unwatch("app", &sock);
         assert!(r.watchers_of("app", "c").is_empty());
+    }
+
+    #[test]
+    fn local_bindings_enumerates_every_signed_in_connection() {
+        let r = UserRegistry::new();
+        let (h1, _r1) = handle();
+        let (h2, _r2) = handle();
+        let (h3, _r3) = handle();
+        let s1 = h1.socket_id.clone();
+        let s2 = h2.socket_id.clone();
+        let s3 = h3.socket_id.clone();
+        // Two sockets for user "u" and one for user "v", all under app "app".
+        r.signin("app", "u", h1);
+        r.signin("app", "u", h2);
+        r.signin("app", "v", h3);
+
+        let mut got = r.local_bindings();
+        got.sort();
+        let mut want = vec![
+            ("app".to_string(), "u".to_string(), s1),
+            ("app".to_string(), "u".to_string(), s2),
+            ("app".to_string(), "v".to_string(), s3),
+        ];
+        want.sort();
+        assert_eq!(
+            got, want,
+            "local_bindings must enumerate every (app, user, socket) signed-in tuple"
+        );
     }
 
     #[test]

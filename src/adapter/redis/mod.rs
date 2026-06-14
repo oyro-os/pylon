@@ -85,6 +85,27 @@ async fn heartbeat_loop(
                 );
             }
         }
+
+        // Re-stamp this node's own user bindings (the `usr(app,user)` HASH), exactly as
+        // for channel members above: a live node keeps its bindings' `expireAt` in the
+        // future so the sweeper never reaps them; a crashed node stops ticking and its
+        // bindings go stale, firing the cluster offline edge once the user's last
+        // cluster connection (on the dead node) is reaped.
+        for (app, user_id, socket_id) in local.local_user_bindings() {
+            let usr = keys.usr(&app, &user_id);
+            let token = keys::member_token(&node_id, socket_id.as_str());
+            let pipe = pool.next().pipeline();
+            if let Err(e) = async {
+                pipe.hset::<(), _, _>(&usr, (token.clone(), expire_at.clone()))
+                    .await?;
+                pipe.expire::<(), _>(&usr, ttl_secs as i64, None).await?;
+                pipe.all::<()>().await
+            }
+            .await
+            {
+                tracing::warn!(error = %e, app, user_id, "redis user-binding heartbeat refresh failed; skipping");
+            }
+        }
     }
 }
 
@@ -723,6 +744,21 @@ impl Adapter for RedisAdapter {
             {
                 tracing::warn!(error = %e, app, user_id, "failed to SUBSCRIBE usermsg on local 0→1");
             }
+        }
+
+        // Index the app so the sweeper can enumerate it (SMEMBERS apps → SMEMBERS
+        // users(app)) for the user-binding sweep — exactly as `subscribe` does for the
+        // channel sweep. Without this, a user that only ever SIGNED IN (never subscribed
+        // a channel) would leave `apps` empty and the sweeper could not reap its stale
+        // bindings on a crash. Idempotent + cheap; log + ignore errors (best-effort).
+        if let Err(e) = self
+            .clients
+            .pool
+            .next()
+            .sadd::<i64, _, _>(self.keys.apps(), app.to_string())
+            .await
+        {
+            tracing::warn!(error = %e, app, "redis SADD apps (signin) failed; sweeper may miss this app");
         }
 
         // Cluster online edge: USER_SIGNIN returns the cluster `first_for_user`

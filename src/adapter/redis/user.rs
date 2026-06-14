@@ -8,7 +8,7 @@ use super::envelope::{Envelope, EnvelopeKind};
 use super::keys::{member_token, Keys};
 use crate::protocol::socket_id::SocketId;
 use fred::clients::Pool;
-use fred::interfaces::{HashesInterface, PubsubInterface};
+use fred::interfaces::{HashesInterface, KeysInterface, PubsubInterface, SetsInterface};
 use serde_json::Value;
 
 /// Run USER_SIGNIN. Returns the cluster `first_for_user` edge (HLEN == 1 → the user
@@ -73,6 +73,93 @@ pub(super) async fn is_online(
 ) -> anyhow::Result<bool> {
     let n: i64 = pool.next().hlen(keys.usr(app, user_id)).await?;
     Ok(n > 0)
+}
+
+/// Sweeper crash-time reap of ONE indexed user's stale bindings. A live node re-stamps
+/// its own bindings' `expireAt`; a crashed node stops, so its bindings go stale. This
+/// HDELs every stale token of `user_id`; when no fresh binding remains — the user's last
+/// cluster connection was on the dead node, OR the `usr` hash already TTL-expired while
+/// still indexed in `users(app)` (the orphan case, mirroring the channel sweep) — it is
+/// the cluster offline edge: DEL the (now-empty) hash, de-index, and publish WatchOffline
+/// so every live node notifies its local watchers. Best-effort; logs + continues.
+///
+/// The WatchOffline envelope's publisher `node_id` is the DEAD node (the stale token's
+/// prefix, or an empty sentinel for an already-gone hash) so this sweeper's OWN receive
+/// loop does NOT self-dedup it — A must still notify its local watchers of u7's offline.
+pub(super) async fn reap_user(pool: &Pool, keys: &Keys, app: &str, user_id: &str, now: u64) {
+    let usr = keys.usr(app, user_id);
+    let members: Vec<(String, String)> = match pool.next().hgetall(&usr).await {
+        Ok(m) => m,
+        Err(e) => {
+            tracing::warn!(error = %e, app, user_id, "sweeper: HGETALL usr failed");
+            return;
+        }
+    };
+
+    // Partition into stale tokens (to HDEL) and a dead-node attribution for the offline
+    // publish. A fresh (future-`expireAt`) binding means a live node still holds the user.
+    let mut stale: Vec<String> = Vec::new();
+    let mut had_fresh = false;
+    let mut dead_node = String::new();
+    for (token, expire_at) in &members {
+        let is_stale = expire_at
+            .parse::<u64>()
+            .map(|exp| exp < now)
+            .unwrap_or(true);
+        if is_stale {
+            if dead_node.is_empty() {
+                if let Some((n, _)) = token.split_once(':') {
+                    dead_node = n.to_string();
+                }
+            }
+            stale.push(token.clone());
+        } else {
+            had_fresh = true;
+        }
+    }
+
+    if !stale.is_empty() {
+        if let Err(e) = pool.next().hdel::<i64, _, _>(&usr, stale.clone()).await {
+            tracing::warn!(error = %e, app, user_id, "sweeper: HDEL usr stale failed");
+            return;
+        }
+    }
+
+    // A user with any fresh binding is still online cluster-wide — leave it.
+    if had_fresh {
+        return;
+    }
+
+    // No fresh binding remains. `HLEN usr` is the authoritative post-reap count (also 0
+    // when the hash already TTL-expired). A non-zero count means a concurrent signin
+    // landed between our HGETALL and now — skip the offline edge for it.
+    let remaining: i64 = match pool.next().hlen(&usr).await {
+        Ok(n) => n,
+        Err(e) => {
+            tracing::warn!(error = %e, app, user_id, "sweeper: HLEN usr failed");
+            return;
+        }
+    };
+    if remaining != 0 {
+        return;
+    }
+
+    // Cluster offline edge: DEL the (now-empty) hash, de-index, publish WatchOffline.
+    let _ = pool.next().del::<i64, _>(&usr).await;
+    let _ = pool
+        .next()
+        .srem::<i64, _, _>(keys.users(app), user_id.to_string())
+        .await;
+    publish(
+        pool,
+        &keys.watch(app, user_id),
+        &dead_node,
+        app,
+        user_id,
+        super::envelope::EnvelopeKind::WatchOffline,
+        serde_json::Value::Null,
+    )
+    .await;
 }
 
 /// Publish a control/notify envelope on a per-user channel. `frame` is the
