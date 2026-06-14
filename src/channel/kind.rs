@@ -48,6 +48,20 @@ impl ChannelInfo {
     }
 }
 
+/// Returns `true` if `name` is a valid channel name under Pusher's rules:
+/// - length ≤ `max_len`
+/// - every character is in `[A-Za-z0-9_\-=@,.;]`
+///
+/// The `#` prefix used by server-to-user channels is handled before this
+/// function is called and must NOT be stripped here.
+pub fn validate_channel_name(name: &str, max_len: usize) -> bool {
+    if name.len() > max_len {
+        return false;
+    }
+    name.chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '=' | '@' | ',' | '.' | ';'))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -81,5 +95,38 @@ mod tests {
         assert!(AuthKind::Private.requires_auth());
         assert!(AuthKind::Presence.requires_auth());
         assert!(AuthKind::PrivateEncrypted.requires_auth());
+    }
+
+    // P8 — channel-name validation
+    #[test]
+    fn validate_channel_name_accepts_valid_names() {
+        assert!(validate_channel_name("my-channel", 164));
+        assert!(validate_channel_name("presence-room", 164));
+        assert!(validate_channel_name("private-x", 164));
+        assert!(validate_channel_name("a", 164));
+        assert!(validate_channel_name(
+            "abc_123-def=ghi@jkl,mno.pqr;stu",
+            164
+        ));
+        // exactly 164 chars must pass
+        let at_limit = "a".repeat(164);
+        assert!(validate_channel_name(&at_limit, 164));
+    }
+
+    #[test]
+    fn validate_channel_name_rejects_over_length() {
+        let long = "a".repeat(165);
+        assert!(!validate_channel_name(&long, 164));
+        let exactly_200 = "a".repeat(200);
+        assert!(!validate_channel_name(&exactly_200, 164));
+    }
+
+    #[test]
+    fn validate_channel_name_rejects_illegal_chars() {
+        assert!(!validate_channel_name("bad channel", 164)); // space
+        assert!(!validate_channel_name("bad!channel", 164)); // !
+        assert!(!validate_channel_name("bad#channel", 164)); // # (not in charset)
+        assert!(!validate_channel_name("bad/channel", 164)); // /
+        assert!(!validate_channel_name("bad\tchannel", 164)); // tab
     }
 }

@@ -1,7 +1,7 @@
 //! Subscribe/unsubscribe and client-event handling, split from `ws::handler`.
 
 use super::handler::ConnectionContext;
-use crate::channel::kind::{AuthKind, ChannelInfo, SERVER_TO_USER_PREFIX};
+use crate::channel::kind::{validate_channel_name, AuthKind, ChannelInfo, SERVER_TO_USER_PREFIX};
 use crate::protocol::error::PusherError;
 use crate::protocol::event::ServerEvent;
 use serde_json::Value;
@@ -35,6 +35,16 @@ impl ConnectionContext {
         }
         if channel.starts_with('#') {
             return self.send_subscription_error(&channel, "AuthError", "Unknown channel", 401);
+        }
+
+        // P8: enforce channel name length + charset before any auth or registry work.
+        if !validate_channel_name(&channel, self.limits.max_channel_name_length) {
+            return self.send_subscription_error(
+                &channel,
+                "InvalidChannel",
+                "Invalid channel name",
+                4009,
+            );
         }
 
         let info = ChannelInfo::of(&channel);

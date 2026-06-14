@@ -1109,6 +1109,121 @@ async fn cache_channel_miss_emits_cache_miss_webhook() {
     assert_eq!(env["events"][0]["channel"], "cache-x");
 }
 
+// P8 — channel-name length + charset validation
+
+#[tokio::test]
+async fn subscribe_over_length_channel_name_errors_4009() {
+    let long_name = "a".repeat(165); // > default max of 164
+    let (mut c, mut rx) = ctx(app(false));
+    c.dispatch(ClientCommand::Subscribe {
+        channel: long_name.clone(),
+        auth: None,
+        channel_data: None,
+    })
+    .await;
+    match rx.try_recv() {
+        Ok(ServerEvent::SubscriptionError {
+            channel, status, ..
+        }) => {
+            assert_eq!(channel, long_name);
+            assert_eq!(status, 4009);
+        }
+        other => panic!("expected SubscriptionError 4009 for over-length channel, got {other:?}"),
+    }
+    // Must NOT be in the registry
+    assert_eq!(
+        c.adapter
+            .channel("app", &long_name)
+            .await
+            .subscription_count,
+        0
+    );
+}
+
+#[tokio::test]
+async fn subscribe_illegal_char_channel_name_errors_4009() {
+    let bad_name = "bad channel!"; // space and ! are illegal
+    let (mut c, mut rx) = ctx(app(false));
+    c.dispatch(ClientCommand::Subscribe {
+        channel: bad_name.to_string(),
+        auth: None,
+        channel_data: None,
+    })
+    .await;
+    match rx.try_recv() {
+        Ok(ServerEvent::SubscriptionError {
+            channel, status, ..
+        }) => {
+            assert_eq!(channel, bad_name);
+            assert_eq!(status, 4009);
+        }
+        other => panic!("expected SubscriptionError 4009 for bad-charset channel, got {other:?}"),
+    }
+    assert_eq!(
+        c.adapter.channel("app", bad_name).await.subscription_count,
+        0
+    );
+}
+
+#[tokio::test]
+async fn subscribe_valid_channel_names_still_succeed() {
+    for name in ["my-channel", "presence-room", "private-x", "cache-feed"] {
+        let (mut c, mut rx) = ctx(app(false));
+        if name.starts_with("private-") || name.starts_with("presence-") {
+            // Auth required; just confirm no channel-name error
+            c.dispatch(ClientCommand::Subscribe {
+                channel: name.to_string(),
+                auth: None,
+                channel_data: None,
+            })
+            .await;
+            // Will get an auth error (401) — but NOT a 4009 charset error
+            match rx.try_recv() {
+                Ok(ServerEvent::SubscriptionError { status, .. }) => {
+                    assert_ne!(status, 4009, "valid name '{name}' must not get 4009");
+                }
+                other => panic!("expected SubscriptionError for unauthed {name}, got {other:?}"),
+            }
+        } else {
+            c.dispatch(ClientCommand::Subscribe {
+                channel: name.to_string(),
+                auth: None,
+                channel_data: None,
+            })
+            .await;
+            assert!(
+                matches!(rx.try_recv(), Ok(ServerEvent::SubscriptionSucceeded { .. })),
+                "valid name '{name}' must subscribe successfully"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn subscribe_server_to_user_channel_still_works_after_p8() {
+    // #server-to-user- channels must NOT be run through charset validation
+    // (the # is handled by the reserved-prefix path before validation).
+    use crate::auth::signature::user_signature;
+    let (mut c, mut rx) = ctx(app(false));
+    let sig = user_signature("s", c.socket_id.as_str(), r#"{"id":"9"}"#);
+    c.dispatch(ClientCommand::Signin {
+        auth: format!("k:{sig}"),
+        user_data: r#"{"id":"9"}"#.into(),
+    })
+    .await;
+    let _ = rx.try_recv(); // drain signin_success
+    c.dispatch(ClientCommand::Subscribe {
+        channel: "#server-to-user-9".into(),
+        auth: None,
+        channel_data: None,
+    })
+    .await;
+    assert!(
+        matches!(rx.try_recv(), Ok(ServerEvent::SubscriptionSucceeded { .. })),
+        "#server-to-user- channel must still succeed after P8 charset validation"
+    );
+}
+
 // P4 — presence channels must NOT receive pusher_internal:subscription_count
 
 /// Subscribe to `channel` (with valid auth if presence) on an app that has

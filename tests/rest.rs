@@ -706,6 +706,63 @@ async fn rest_users_on_presence_channel_is_200() {
     );
 }
 
+// ── P8 parity tests — channel-name length + charset ─────────────────────────
+
+/// P8: POST /events with a channel name exceeding 164 chars → 400.
+#[tokio::test]
+async fn rest_trigger_channel_name_over_length_is_400() {
+    let addr = spawn().await;
+    let long_name = "a".repeat(165);
+    let body = json!({"name":"ev","data":"{}","channels":[long_name]}).to_string();
+    let q = signed_query("POST", "/apps/app1/events", body.as_bytes(), &[]);
+    let resp = reqwest::Client::new()
+        .post(format!("http://{addr}/apps/app1/events?{q}"))
+        .body(body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        400,
+        "channel name over 164 chars must be 400"
+    );
+}
+
+/// P8: POST /events with a channel name containing an illegal char → 400.
+#[tokio::test]
+async fn rest_trigger_channel_name_bad_charset_is_400() {
+    let addr = spawn().await;
+    let body = json!({"name":"ev","data":"{}","channels":["bad channel!"]}).to_string();
+    let q = signed_query("POST", "/apps/app1/events", body.as_bytes(), &[]);
+    let resp = reqwest::Client::new()
+        .post(format!("http://{addr}/apps/app1/events?{q}"))
+        .body(body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        400,
+        "channel name with illegal chars must be 400"
+    );
+}
+
+/// P8: POST /events with a valid channel name → 200 (regression guard).
+#[tokio::test]
+async fn rest_trigger_valid_channel_name_is_200() {
+    let addr = spawn().await;
+    let body =
+        json!({"name":"ev","data":"{}","channels":["my-valid_channel.name@here"]}).to_string();
+    let q = signed_query("POST", "/apps/app1/events", body.as_bytes(), &[]);
+    let resp = reqwest::Client::new()
+        .post(format!("http://{addr}/apps/app1/events?{q}"))
+        .body(body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "valid channel name must still be 200");
+}
+
 #[tokio::test]
 async fn rest_body_too_large_is_413() {
     let addr = spawn().await;

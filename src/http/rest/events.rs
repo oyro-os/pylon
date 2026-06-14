@@ -1,7 +1,7 @@
 //! POST /apps/{app_id}/events and /batch_events.
 
 use crate::channel::cache::CachedEvent;
-use crate::channel::kind::{AuthKind, ChannelInfo};
+use crate::channel::kind::{validate_channel_name, AuthKind, ChannelInfo};
 use crate::http::error::RestError;
 use crate::http::rest::auth::authenticate;
 use crate::protocol::event::ServerEvent;
@@ -165,6 +165,16 @@ pub async fn post_events(
     if channels.is_empty() || channels.len() > state.config.max_channels_per_publish {
         return Err(RestError::bad_request("invalid channel count"));
     }
+    // P8: validate every channel name (length + charset).
+    // `#server-to-user-` channels are a special reserved namespace handled by
+    // `deliver()` and are exempt from the normal charset check (they start with `#`).
+    for ch in &channels {
+        if !ch.starts_with(crate::channel::kind::SERVER_TO_USER_PREFIX)
+            && !validate_channel_name(ch, state.config.max_channel_name_length)
+        {
+            return Err(RestError::bad_request("Invalid channel name"));
+        }
+    }
     // Encrypted channels must be triggered solo — no mixing with any other channel.
     let encrypted = channels
         .iter()
@@ -225,6 +235,17 @@ pub async fn post_batch(
     for item in &b.batch {
         if item.data.len() > state.config.max_event_payload_bytes {
             return Err(RestError::payload_too_large("Event message over 10k"));
+        }
+    }
+    // P8: validate every channel name (length + charset).
+    // `#server-to-user-` channels are exempt (handled as special reserved namespace).
+    for item in &b.batch {
+        if !item
+            .channel
+            .starts_with(crate::channel::kind::SERVER_TO_USER_PREFIX)
+            && !validate_channel_name(&item.channel, state.config.max_channel_name_length)
+        {
+            return Err(RestError::bad_request("Invalid channel name"));
         }
     }
     for item in &b.batch {

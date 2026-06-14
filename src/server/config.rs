@@ -5,6 +5,7 @@ pub struct Limits {
     pub max_presence_members: usize,
     pub max_event_payload_bytes: usize,
     pub max_watchlist_size: usize,
+    pub max_channel_name_length: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -27,6 +28,7 @@ pub struct ServerConfig {
     pub webhook_max_retries: u32,
     pub webhook_retry_base_ms: u64,
     pub webhook_max_concurrency: usize,
+    pub max_channel_name_length: usize,
 }
 
 impl Default for ServerConfig {
@@ -50,6 +52,7 @@ impl Default for ServerConfig {
             webhook_max_retries: 3,
             webhook_retry_base_ms: 100,
             webhook_max_concurrency: 100,
+            max_channel_name_length: 164,
         }
     }
 }
@@ -141,6 +144,11 @@ impl ServerConfig {
                 c.webhook_max_concurrency = p;
             }
         }
+        if let Ok(v) = std::env::var("PYLON_MAX_CHANNEL_NAME_LENGTH") {
+            if let Ok(p) = v.parse() {
+                c.max_channel_name_length = p;
+            }
+        }
         c
     }
 
@@ -149,6 +157,7 @@ impl ServerConfig {
             max_presence_members: self.max_presence_members,
             max_event_payload_bytes: self.max_event_payload_bytes,
             max_watchlist_size: self.max_watchlist_size,
+            max_channel_name_length: self.max_channel_name_length,
         }
     }
 }
@@ -171,6 +180,7 @@ mod tests {
         assert_eq!(c.max_batch_events, 10);
         assert_eq!(c.cache_ttl_secs, 1800);
         assert_eq!(c.max_watchlist_size, 100);
+        assert_eq!(c.max_channel_name_length, 164);
         // webhook tunables (spec §6)
         assert_eq!(c.webhook_batch_ms, 50);
         assert_eq!(c.webhook_timeout_ms, 5000);
