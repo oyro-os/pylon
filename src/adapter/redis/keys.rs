@@ -1,5 +1,12 @@
-//! Redis key schema for Pylon. All channel-scoped keys use hash-tags (`{channel}`)
-//! so that multi-key Lua scripts over one channel are Redis Cluster slot-safe.
+//! Redis key schema for Pylon. Channel-scoped keys (`msg`/`occ`/`cache`) wrap the
+//! channel in a hash-tag (`{channel}`) so all keys for one channel co-locate on a
+//! single Redis Cluster slot.
+//!
+//! SP7a targets a single Redis instance. The membership Lua intentionally spans the
+//! per-channel `occ` hash and the app-level `chans` index set, which live on
+//! different slots — fine on a single instance, but a known constraint to resolve
+//! (e.g. co-locating or de-atomizing the `chans` index write) when Cluster mode
+//! lands. Do not assume cross-key scripts here are CROSSSLOT-safe under Cluster.
 
 /// Builds Redis keys for all Pylon data structures under a given prefix.
 #[derive(Clone)]
