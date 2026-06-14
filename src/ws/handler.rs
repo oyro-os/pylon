@@ -84,6 +84,7 @@ impl ConnectionContext {
                 .await;
             if let Some(leave) = out.presence {
                 if leave.last_for_user {
+                    let uid = leave.user_id.clone();
                     self.adapter
                         .broadcast(
                             &self.app.id,
@@ -95,6 +96,13 @@ impl ConnectionContext {
                             None,
                         )
                         .await;
+                    if self.app.has_member_removed_webhooks {
+                        self.emit_webhook(crate::webhook::event::WebhookEvent::MemberRemoved {
+                            app: self.app.id.clone(),
+                            channel: channel.clone(),
+                            user_id: uid,
+                        });
+                    }
                 }
             }
             if out.vacated && self.app.has_channel_vacated_webhooks {

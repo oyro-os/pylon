@@ -167,6 +167,7 @@ impl ConnectionContext {
                         presence: Some(join.roster),
                     });
                     if join.first_for_user {
+                        let uid = join.member.user_id.clone();
                         self.adapter
                             .broadcast(
                                 &self.app.id,
@@ -179,6 +180,13 @@ impl ConnectionContext {
                                 Some(self.socket_id.clone()),
                             )
                             .await;
+                        if self.app.has_member_added_webhooks {
+                            self.emit_webhook(crate::webhook::event::WebhookEvent::MemberAdded {
+                                app: self.app.id.clone(),
+                                channel: channel.clone(),
+                                user_id: uid,
+                            });
+                        }
                     }
                 }
                 self.maybe_emit_count(&channel, out.subscription_count)

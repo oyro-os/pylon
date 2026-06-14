@@ -822,3 +822,81 @@ async fn rapid_subscribe_unsubscribe_in_window_emits_nothing() {
         "occupied+vacated in one window must coalesce to no delivery"
     );
 }
+
+#[tokio::test]
+async fn presence_first_and_last_emit_member_added_then_removed() {
+    let mut app = serde_json::from_value::<crate::app::App>(serde_json::json!({
+        "name": "t", "id": "app", "key": "app-key", "secret": "app-secret",
+        "webhooks": [{ "url": "https://e.test/wh",
+            "event_types": ["member_added","member_removed"] }]
+    }))
+    .unwrap();
+    app.recompute_has_flags();
+
+    let (webhooks, recorder) = recording_webhooks(app.clone(), 30);
+    let adapter: std::sync::Arc<dyn crate::adapter::Adapter> =
+        std::sync::Arc::new(crate::adapter::local::LocalAdapter::new(
+            std::sync::Arc::new(crate::channel::registry::Registry::new()),
+        ));
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+    let socket = crate::protocol::socket_id::SocketId::from_raw("9.9");
+    let cd = r#"{"user_id":"u1"}"#;
+    let auth = format!(
+        "app-key:{}",
+        crate::auth::signature::channel_signature("app-secret", "9.9", "presence-room", Some(cd))
+    );
+    let mut c = crate::ws::handler::ConnectionContext {
+        app,
+        socket_id: socket,
+        self_tx: tx,
+        adapter,
+        limits: crate::server::config::ServerConfig::default().limits(),
+        subscribed: std::collections::HashSet::new(),
+        user: None,
+        webhooks,
+        presence_membership: std::collections::HashMap::new(),
+    };
+
+    c.dispatch(crate::protocol::command::ClientCommand::Subscribe {
+        channel: "presence-room".into(),
+        auth: Some(auth),
+        channel_data: Some(cd.into()),
+    })
+    .await;
+    // Sleep longer than the batch window (30ms) so member_added lands in its own
+    // batch before member_removed fires; prevents coalescing cancellation.
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    c.on_close().await;
+
+    // Wait out the member_removed batch window + margin.
+    tokio::time::sleep(std::time::Duration::from_millis(120)).await;
+
+    let names: Vec<String> = recorder
+        .recorded()
+        .await
+        .iter()
+        .flat_map(|d| {
+            let env: serde_json::Value = serde_json::from_str(&d.body).unwrap();
+            env["events"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|e| {
+                    format!(
+                        "{}:{}",
+                        e["name"].as_str().unwrap(),
+                        e["user_id"].as_str().unwrap_or("")
+                    )
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    assert!(
+        names.contains(&"member_added:u1".to_string()),
+        "got {names:?}"
+    );
+    assert!(
+        names.contains(&"member_removed:u1".to_string()),
+        "got {names:?}"
+    );
+}
