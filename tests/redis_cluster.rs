@@ -1081,3 +1081,67 @@ async fn sweeper_emits_member_removed_for_crashed_presence_member() {
     .await
     .expect("sweeper member_removed test must not hang (Redis up?)");
 }
+
+/// A2: user online/offline is a SINGLE cluster-wide edge, not per-node. The FIRST
+/// connection for a user anywhere in the cluster reports `first_for_user`; a second
+/// connection on ANOTHER node does NOT. `is_user_online` reads cluster truth (`HLEN
+/// usr`). Signing out the cluster-last connection (regardless of node) reports
+/// `last_for_user`; an earlier signout on the other node does not. While `signin_user`
+/// delegated to the node-local registry, B would see its own first/last edges as true
+/// — this test pins the cluster single-emit semantics.
+#[tokio::test]
+async fn cross_node_user_online_offline_single_emit() {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let prefix = random_prefix();
+        let adapter_a = connect_adapter_with_prefix(&prefix).await;
+        let adapter_b = connect_adapter_with_prefix(&prefix).await;
+
+        // 1. First connection for "u7" (socket sA on A): cluster online edge.
+        let (sock_a, handle_a) = fake_handle();
+        let out_a = adapter_a.signin_user(TEST_APP, "u7", handle_a).await;
+        assert!(
+            out_a.first_for_user,
+            "first cluster connection for u7 → first_for_user (cluster online edge)"
+        );
+
+        // 2. Second connection (socket sB on B): NOT the cluster online edge.
+        let (sock_b, handle_b) = fake_handle();
+        let out_b = adapter_b.signin_user(TEST_APP, "u7", handle_b).await;
+        assert!(
+            !out_b.first_for_user,
+            "second cluster connection on another node must NOT report first_for_user"
+        );
+
+        // 3. Cluster online check sees the user from either node.
+        assert!(
+            adapter_a.is_user_online(TEST_APP, "u7").await,
+            "is_user_online must read cluster truth (HLEN usr > 0)"
+        );
+
+        // 4. Sign out B's connection → NOT the cluster-last edge (A still holds one).
+        let out_b = adapter_b.signout_user(TEST_APP, "u7", &sock_b).await;
+        assert!(
+            !out_b.last_for_user,
+            "a non-cluster-last signout must NOT report last_for_user"
+        );
+        assert!(
+            adapter_a.is_user_online(TEST_APP, "u7").await,
+            "u7 still online cluster-wide while A's connection remains"
+        );
+
+        // 5. Sign out A's connection → the cluster-last edge.
+        let out_a = adapter_a.signout_user(TEST_APP, "u7", &sock_a).await;
+        assert!(
+            out_a.last_for_user,
+            "the cluster-last signout must report last_for_user (cluster offline edge)"
+        );
+
+        // 6. Now offline cluster-wide.
+        assert!(
+            !adapter_a.is_user_online(TEST_APP, "u7").await,
+            "u7 must be offline cluster-wide after the last connection signs out"
+        );
+    })
+    .await
+    .expect("cross-node user online/offline test must not hang (Redis up?)");
+}

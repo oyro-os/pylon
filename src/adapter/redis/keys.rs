@@ -77,6 +77,26 @@ impl Keys {
     pub fn presmembers(&self, app: &str, channel: &str) -> String {
         format!("{}:presmembers:{}:{{{}}}", self.prefix, app, channel)
     }
+
+    /// User binding: HASH member_token -> expireAt (HLEN = cluster connection count).
+    pub fn usr(&self, app: &str, user_id: &str) -> String {
+        format!("{}:usr:{}:{{{}}}", self.prefix, app, user_id)
+    }
+
+    /// Per-app SET of users with >=1 cluster connection (sweeper enumerates this).
+    pub fn users(&self, app: &str) -> String {
+        format!("{}:users:{}", self.prefix, app)
+    }
+
+    /// Per-user pub/sub channel for send_to_user / terminate_user fan-out.
+    pub fn usermsg(&self, app: &str, user_id: &str) -> String {
+        format!("{}:usermsg:{}:{{{}}}", self.prefix, app, user_id)
+    }
+
+    /// Per-user pub/sub channel for watchlist online/offline notifications.
+    pub fn watch(&self, app: &str, user_id: &str) -> String {
+        format!("{}:watch:{}:{{{}}}", self.prefix, app, user_id)
+    }
 }
 
 /// Composite token uniquely identifying one socket connection across the cluster.
@@ -111,6 +131,10 @@ mod tests {
             k.presmembers("app1", "presence-room"),
             "pylon:presmembers:app1:{presence-room}"
         );
+        assert_eq!(k.usr("app1", "u7"), "pylon:usr:app1:{u7}");
+        assert_eq!(k.users("app1"), "pylon:users:app1");
+        assert_eq!(k.usermsg("app1", "u7"), "pylon:usermsg:app1:{u7}");
+        assert_eq!(k.watch("app1", "u7"), "pylon:watch:app1:{u7}");
     }
     #[test]
     fn member_token_is_node_and_socket() {

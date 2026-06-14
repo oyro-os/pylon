@@ -106,6 +106,34 @@ if conn <= 0 then redis.call('HDEL', KEYS[1], ARGV[1]); redis.call('HDEL', KEYS[
 return conn
 "#;
 
+/// USER_SIGNIN. Records this connection's binding token, refreshes the whole-key
+/// TTL backstop, and — on the cluster 0→1 user edge (HLEN == 1) — indexes the user
+/// in the app's `users` set. Returns the new `HLEN` (cluster-wide connection count).
+///
+/// `KEYS[1]` = usr hash, `KEYS[2]` = users set.
+/// `ARGV[1]` = member_token, `ARGV[2]` = expire_at_ms, `ARGV[3]` = ttl_secs,
+/// `ARGV[4]` = user_id.
+const USER_SIGNIN_LUA: &str = r#"
+redis.call('HSET', KEYS[1], ARGV[1], ARGV[2])
+redis.call('EXPIRE', KEYS[1], ARGV[3])
+local conn = redis.call('HLEN', KEYS[1])
+if conn == 1 then redis.call('SADD', KEYS[2], ARGV[4]) end
+return conn
+"#;
+
+/// USER_SIGNOUT. Removes this connection's binding token and — on the cluster 1→0
+/// user edge — deletes the now-empty hash and de-indexes the user. Returns the
+/// remaining `HLEN` (authoritative cluster-wide connection count).
+///
+/// `KEYS[1]` = usr hash, `KEYS[2]` = users set.
+/// `ARGV[1]` = member_token, `ARGV[2]` = user_id.
+const USER_SIGNOUT_LUA: &str = r#"
+redis.call('HDEL', KEYS[1], ARGV[1])
+local conn = redis.call('HLEN', KEYS[1])
+if conn <= 0 then redis.call('DEL', KEYS[1]); redis.call('SREM', KEYS[2], ARGV[2]) end
+return conn
+"#;
+
 /// The membership/presence Lua scripts, compiled (SHA-1 hashed) at adapter build
 /// time. `Script::from_lua` is purely local — no Redis round-trip — and the scripts
 /// are loaded lazily on first use via `evalsha_with_reload`'s NOSCRIPT fallback.
@@ -118,6 +146,10 @@ pub struct Scripts {
     pub presence_join: Script,
     /// Records a presence leave and returns the user's remaining connection refcount.
     pub presence_leave: Script,
+    /// Records a user signin and returns the user's new cluster connection count.
+    pub user_signin: Script,
+    /// Records a user signout and returns the user's remaining cluster connection count.
+    pub user_signout: Script,
 }
 
 impl Scripts {
@@ -128,6 +160,8 @@ impl Scripts {
             unsubscribe: Script::from_lua(UNSUBSCRIBE_LUA),
             presence_join: Script::from_lua(PRESENCE_JOIN_LUA),
             presence_leave: Script::from_lua(PRESENCE_LEAVE_LUA),
+            user_signin: Script::from_lua(USER_SIGNIN_LUA),
+            user_signout: Script::from_lua(USER_SIGNOUT_LUA),
         }
     }
 }
@@ -147,5 +181,12 @@ mod tests {
         let s = Scripts::new();
         assert_ne!(s.presence_join.sha1(), s.presence_leave.sha1());
         assert_ne!(s.subscribe.sha1(), s.presence_join.sha1());
+    }
+
+    #[test]
+    fn scripts_compile_including_user() {
+        let s = Scripts::new();
+        assert_ne!(s.user_signin.sha1(), s.user_signout.sha1());
+        assert_ne!(s.user_signin.sha1(), s.subscribe.sha1());
     }
 }

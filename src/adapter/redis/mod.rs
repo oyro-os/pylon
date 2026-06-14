@@ -13,6 +13,7 @@ pub mod keys;
 pub mod presence;
 pub mod pubsub;
 pub mod sweeper;
+pub mod user;
 
 use super::Adapter;
 use crate::adapter::local::LocalAdapter;
@@ -704,7 +705,63 @@ impl Adapter for RedisAdapter {
         user_id: &str,
         handle: ConnectionHandle,
     ) -> UserJoinOutcome {
-        self.local.signin_user(app, user_id, handle).await
+        // Capture the socket id BEFORE `handle` is moved into the local adapter —
+        // we need it to form this connection's binding token for Redis.
+        let socket_id = handle.socket_id.clone();
+        let mut out = self.local.signin_user(app, user_id, handle).await;
+
+        // usermsg sub lifecycle on the node-LOCAL first-connection edge. Read it
+        // BEFORE the cluster Lua overwrites `out.first_for_user`: when this node
+        // gains its first connection for the user (0→1), SUBSCRIBE the per-user
+        // `usermsg` channel so cross-node send/terminate reach this node.
+        if out.first_for_user {
+            if let Err(e) = self
+                .clients
+                .sub
+                .subscribe(self.keys.usermsg(app, user_id))
+                .await
+            {
+                tracing::warn!(error = %e, app, user_id, "failed to SUBSCRIBE usermsg on local 0→1");
+            }
+        }
+
+        // Cluster online edge: USER_SIGNIN returns the cluster `first_for_user`
+        // (HLEN == 1). On any Redis error, keep the node-local outcome.
+        match user::signin(
+            &self.scripts,
+            &self.clients.pool,
+            &self.keys,
+            &self.node_id,
+            app,
+            user_id,
+            &socket_id,
+            self.cfg.membership_ttl_secs,
+        )
+        .await
+        {
+            Ok(first) => {
+                out.first_for_user = first;
+                if first {
+                    // Notify the cluster the user came online. Remote nodes deliver
+                    // it to their local watchers; the origin's local watchers are
+                    // notified directly (self-dedup'd by the receive loop).
+                    user::publish(
+                        &self.clients.pool,
+                        &self.keys.watch(app, user_id),
+                        &self.node_id,
+                        app,
+                        user_id,
+                        envelope::EnvelopeKind::WatchOnline,
+                        serde_json::Value::Null,
+                    )
+                    .await;
+                }
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, app, user_id, "redis user signin failed; keeping node-local")
+            }
+        }
+        out
     }
 
     async fn signout_user(
@@ -713,11 +770,64 @@ impl Adapter for RedisAdapter {
         user_id: &str,
         socket_id: &SocketId,
     ) -> UserLeaveOutcome {
-        self.local.signout_user(app, user_id, socket_id).await
+        let mut out = self.local.signout_user(app, user_id, socket_id).await;
+
+        // usermsg sub teardown on the node-LOCAL last-connection edge (1→0). Read
+        // it BEFORE the cluster Lua overwrites `out.last_for_user`.
+        if out.last_for_user {
+            if let Err(e) = self
+                .clients
+                .sub
+                .unsubscribe(self.keys.usermsg(app, user_id))
+                .await
+            {
+                tracing::warn!(error = %e, app, user_id, "failed to UNSUBSCRIBE usermsg on local 1→0");
+            }
+        }
+
+        // Cluster offline edge: USER_SIGNOUT returns the cluster `last_for_user`
+        // (HLEN == 0). On any Redis error, keep the node-local outcome.
+        match user::signout(
+            &self.scripts,
+            &self.clients.pool,
+            &self.keys,
+            &self.node_id,
+            app,
+            user_id,
+            socket_id,
+        )
+        .await
+        {
+            Ok(last) => {
+                out.last_for_user = last;
+                if last {
+                    user::publish(
+                        &self.clients.pool,
+                        &self.keys.watch(app, user_id),
+                        &self.node_id,
+                        app,
+                        user_id,
+                        envelope::EnvelopeKind::WatchOffline,
+                        serde_json::Value::Null,
+                    )
+                    .await;
+                }
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, app, user_id, "redis user signout failed; keeping node-local")
+            }
+        }
+        out
     }
 
     async fn is_user_online(&self, app: &str, user_id: &str) -> bool {
-        self.local.is_user_online(app, user_id).await
+        match user::is_online(&self.clients.pool, &self.keys, app, user_id).await {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::warn!(error = %e, app, user_id, "redis is_user_online failed; falling back to local");
+                self.local.is_user_online(app, user_id).await
+            }
+        }
     }
 
     async fn send_to_user(&self, app: &str, user_id: &str, event: ServerEvent) {
