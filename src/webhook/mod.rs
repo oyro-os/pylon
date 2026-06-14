@@ -24,6 +24,15 @@ pub struct WebhookHandle {
 }
 
 impl WebhookHandle {
+    /// A handle whose dispatcher is a draining sink (no deliveries). Used by tests
+    /// and by any caller that wants webhooks disabled. Spawns a task that drains the
+    /// receiver so enqueues never error; must run inside a tokio runtime.
+    pub fn null() -> Self {
+        let (tx, mut rx) = mpsc::channel(1024);
+        tokio::spawn(async move { while rx.recv().await.is_some() {} });
+        WebhookHandle { tx }
+    }
+
     /// Non-blocking enqueue. Drops + logs on a full or closed mailbox.
     pub fn enqueue(&self, event: WebhookEvent) {
         match self.tx.try_send(event) {

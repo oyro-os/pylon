@@ -57,6 +57,7 @@ async fn serve(socket: WebSocket, key: String, params: HashMap<String, String>, 
         activity_timeout: state.config.activity_timeout,
         pong_timeout: state.config.pong_timeout,
         conn_count: counter,
+        webhooks: state.webhooks.clone(),
     };
     run(socket, codec, cp).await;
 }

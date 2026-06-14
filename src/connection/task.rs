@@ -23,6 +23,7 @@ pub struct ConnectionParams {
     pub activity_timeout: u32,
     pub pong_timeout: u32,
     pub conn_count: Arc<AtomicUsize>,
+    pub webhooks: crate::webhook::WebhookHandle,
 }
 
 pub async fn run(socket: WebSocket, codec: Box<dyn Codec>, params: ConnectionParams) {
@@ -51,6 +52,8 @@ pub async fn run(socket: WebSocket, codec: Box<dyn Codec>, params: ConnectionPar
         limits: params.limits,
         subscribed: HashSet::new(),
         user: None,
+        webhooks: params.webhooks.clone(),
+        presence_membership: std::collections::HashMap::new(),
     };
 
     let activity = Duration::from_secs(params.activity_timeout as u64);

@@ -32,6 +32,8 @@ fn ctx(app: App) -> (ConnectionContext, mpsc::UnboundedReceiver<ServerEvent>) {
         limits: crate::server::config::ServerConfig::default().limits(),
         subscribed: HashSet::new(),
         user: None,
+        webhooks: crate::webhook::WebhookHandle::null(),
+        presence_membership: std::collections::HashMap::new(),
     };
     (c, rx)
 }
@@ -235,6 +237,8 @@ async fn presence_unsubscribe_broadcasts_member_removed_to_others() {
             limits: crate::server::config::ServerConfig::default().limits(),
             subscribed: HashSet::new(),
             user: None,
+            webhooks: crate::webhook::WebhookHandle::null(),
+            presence_membership: std::collections::HashMap::new(),
         };
         (c, rx)
     };
@@ -332,6 +336,8 @@ async fn client_event_on_encrypted_channel_is_dropped() {
             limits: crate::server::config::ServerConfig::default().limits(),
             subscribed: HashSet::new(),
             user: None,
+            webhooks: crate::webhook::WebhookHandle::null(),
+            presence_membership: std::collections::HashMap::new(),
         };
         (c, rx)
     };
@@ -527,6 +533,8 @@ async fn presence_over_member_cap_errors() {
             limits,
             subscribed: HashSet::new(),
             user: None,
+            webhooks: crate::webhook::WebhookHandle::null(),
+            presence_membership: std::collections::HashMap::new(),
         };
         (c, rx)
     };

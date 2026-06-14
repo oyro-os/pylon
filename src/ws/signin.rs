@@ -185,6 +185,8 @@ mod tests {
             limits: crate::server::config::ServerConfig::default().limits(),
             subscribed: HashSet::new(),
             user: None,
+            webhooks: crate::webhook::WebhookHandle::null(),
+            presence_membership: std::collections::HashMap::new(),
         };
         (c, rx)
     }

@@ -22,6 +22,8 @@ async fn main() -> anyhow::Result<()> {
         apps,
         adapter,
         conn_counts: Arc::new(Default::default()),
+        // TEMP(B4a): C1 replaces this with the real HttpTransport-backed dispatcher spawn
+        webhooks: pylon::webhook::WebhookHandle::null(),
     };
     let listener = tokio::net::TcpListener::bind((config.bind.as_str(), config.port)).await?;
     tracing::info!("pylon listening on {}:{}", config.bind, config.port);

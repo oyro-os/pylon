@@ -18,6 +18,9 @@ pub struct ConnectionContext {
     pub limits: crate::server::config::Limits,
     pub subscribed: HashSet<String>,
     pub user: Option<crate::user::AuthenticatedUser>,
+    pub webhooks: crate::webhook::WebhookHandle,
+    /// presence channel → this connection's member user_id (for client_event.user_id).
+    pub presence_membership: std::collections::HashMap<String, String>,
 }
 
 impl ConnectionContext {

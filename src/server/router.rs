@@ -3,6 +3,7 @@
 use crate::adapter::Adapter;
 use crate::app::AppManager;
 use crate::server::config::ServerConfig;
+use crate::webhook::WebhookHandle;
 use axum::routing::get;
 use axum::Router;
 use dashmap::DashMap;
@@ -15,6 +16,7 @@ pub struct AppState {
     pub apps: Arc<dyn AppManager>,
     pub adapter: Arc<dyn Adapter>,
     pub conn_counts: Arc<DashMap<String, Arc<AtomicUsize>>>,
+    pub webhooks: WebhookHandle,
 }
 
 pub fn build_router(state: AppState) -> Router {
