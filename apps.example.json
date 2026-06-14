@@ -8,6 +8,20 @@
     "path": "",
     "client_messages_enabled": true,
     "capacity": 10000,
-    "statistics_enabled": false
+    "statistics_enabled": false,
+    "webhooks": [
+      {
+        "url": "https://example.test/pusher/webhooks",
+        "event_types": [
+          "channel_occupied",
+          "channel_vacated",
+          "member_added",
+          "member_removed",
+          "client_event",
+          "cache_miss"
+        ],
+        "headers": { "X-Custom": "value" }
+      }
+    ]
   }
 ]

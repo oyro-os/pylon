@@ -22,6 +22,11 @@ pub struct ServerConfig {
     pub max_batch_events: usize,
     pub cache_ttl_secs: u64,
     pub max_watchlist_size: usize,
+    pub webhook_batch_ms: u64,
+    pub webhook_timeout_ms: u64,
+    pub webhook_max_retries: u32,
+    pub webhook_retry_base_ms: u64,
+    pub webhook_max_concurrency: usize,
 }
 
 impl Default for ServerConfig {
@@ -40,6 +45,11 @@ impl Default for ServerConfig {
             max_batch_events: 10,
             cache_ttl_secs: 1800,
             max_watchlist_size: 100,
+            webhook_batch_ms: 50,
+            webhook_timeout_ms: 5000,
+            webhook_max_retries: 3,
+            webhook_retry_base_ms: 100,
+            webhook_max_concurrency: 100,
         }
     }
 }
@@ -106,6 +116,31 @@ impl ServerConfig {
                 c.max_watchlist_size = p;
             }
         }
+        if let Ok(v) = std::env::var("PYLON_WEBHOOK_BATCH_MS") {
+            if let Ok(p) = v.parse() {
+                c.webhook_batch_ms = p;
+            }
+        }
+        if let Ok(v) = std::env::var("PYLON_WEBHOOK_TIMEOUT_MS") {
+            if let Ok(p) = v.parse() {
+                c.webhook_timeout_ms = p;
+            }
+        }
+        if let Ok(v) = std::env::var("PYLON_WEBHOOK_MAX_RETRIES") {
+            if let Ok(p) = v.parse() {
+                c.webhook_max_retries = p;
+            }
+        }
+        if let Ok(v) = std::env::var("PYLON_WEBHOOK_RETRY_BASE_MS") {
+            if let Ok(p) = v.parse() {
+                c.webhook_retry_base_ms = p;
+            }
+        }
+        if let Ok(v) = std::env::var("PYLON_WEBHOOK_MAX_CONCURRENCY") {
+            if let Ok(p) = v.parse() {
+                c.webhook_max_concurrency = p;
+            }
+        }
         c
     }
 
@@ -136,5 +171,32 @@ mod tests {
         assert_eq!(c.max_batch_events, 10);
         assert_eq!(c.cache_ttl_secs, 1800);
         assert_eq!(c.max_watchlist_size, 100);
+        // webhook tunables (spec §6)
+        assert_eq!(c.webhook_batch_ms, 50);
+        assert_eq!(c.webhook_timeout_ms, 5000);
+        assert_eq!(c.webhook_max_retries, 3);
+        assert_eq!(c.webhook_retry_base_ms, 100);
+        assert_eq!(c.webhook_max_concurrency, 100);
+    }
+
+    #[test]
+    fn webhook_env_overrides_apply() {
+        // Use a guarded set/remove to avoid cross-test env bleed.
+        std::env::set_var("PYLON_WEBHOOK_BATCH_MS", "25");
+        std::env::set_var("PYLON_WEBHOOK_TIMEOUT_MS", "1234");
+        std::env::set_var("PYLON_WEBHOOK_MAX_RETRIES", "7");
+        std::env::set_var("PYLON_WEBHOOK_RETRY_BASE_MS", "10");
+        std::env::set_var("PYLON_WEBHOOK_MAX_CONCURRENCY", "5");
+        let c = ServerConfig::from_env();
+        assert_eq!(c.webhook_batch_ms, 25);
+        assert_eq!(c.webhook_timeout_ms, 1234);
+        assert_eq!(c.webhook_max_retries, 7);
+        assert_eq!(c.webhook_retry_base_ms, 10);
+        assert_eq!(c.webhook_max_concurrency, 5);
+        std::env::remove_var("PYLON_WEBHOOK_BATCH_MS");
+        std::env::remove_var("PYLON_WEBHOOK_TIMEOUT_MS");
+        std::env::remove_var("PYLON_WEBHOOK_MAX_RETRIES");
+        std::env::remove_var("PYLON_WEBHOOK_RETRY_BASE_MS");
+        std::env::remove_var("PYLON_WEBHOOK_MAX_CONCURRENCY");
     }
 }
