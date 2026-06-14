@@ -897,3 +897,35 @@ async fn rest_batch_event_name_over_200_is_400() {
         "batch event name over 200 chars must be 400"
     );
 }
+
+// ── P13 parity tests — pre-handshake reject must carry Pusher 4xxx close code ─
+
+/// Connecting to an unknown app key triggers a 4001 rejection.  The WebSocket Close
+/// frame must carry code 4001 (not 1005 / no-status-received), so pusher-js
+/// resolves `getCloseAction` → `"refused"` rather than `null → backoff`.
+#[tokio::test]
+async fn ws_unknown_app_key_close_frame_carries_4001() {
+    use tokio_tungstenite::tungstenite::Message;
+    let addr = spawn().await;
+    let (mut ws, _) =
+        tokio_tungstenite::connect_async(format!("ws://{addr}/app/no-such-key?protocol=7"))
+            .await
+            .unwrap();
+
+    // Drain frames until we see a Close.
+    let mut close_code: Option<u16> = None;
+    while let Some(Ok(msg)) = ws.next().await {
+        match msg {
+            Message::Close(frame) => {
+                close_code = frame.map(|f| u16::from(f.code));
+                break;
+            }
+            _ => {}
+        }
+    }
+    assert_eq!(
+        close_code,
+        Some(4001),
+        "unknown-app-key reject must close with code 4001 (P13), got: {close_code:?}"
+    );
+}

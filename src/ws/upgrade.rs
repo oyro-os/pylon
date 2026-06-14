@@ -77,5 +77,10 @@ async fn reject(mut socket: WebSocket, e: &PusherError, codec: Option<&dyn Codec
         .to_string(),
     };
     let _ = socket.send(Message::Text(frame.into())).await;
-    let _ = socket.send(Message::Close(None)).await;
+    let _ = socket
+        .send(Message::Close(Some(axum::extract::ws::CloseFrame {
+            code: e.code,
+            reason: e.message.clone().into(),
+        })))
+        .await;
 }
