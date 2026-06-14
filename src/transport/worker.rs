@@ -13,26 +13,66 @@
 //! the queue drains. This keeps the loop from spinning on a writable socket with
 //! nothing to send.
 //!
-//! For this task the only behaviour is [`Mode::Echo`]: every inbound data frame
-//! is re-encoded and queued straight back, pings are answered with pongs, and a
-//! close (or any protocol/EOF error) tears the connection down. Real protocol
-//! dispatch arrives in a later task. 100% safe Rust — the crate root sets
-//! `#![forbid(unsafe_code)]`.
+//! Two behaviours are supported:
+//!
+//! * [`Mode::Echo`] — every inbound data frame is re-encoded and queued straight
+//!   back, pings are answered with pongs, a close tears the connection down.
+//!   Used by the transport's own unit tests.
+//! * [`Mode::Dispatch`] — the real Pusher v7 protocol. On handshake completion
+//!   the worker resolves the `/app/{key}` tenant, builds a
+//!   [`ConnectionContext`] (mirroring `ws::upgrade`), emits
+//!   `pusher:connection_established`, and from then on decodes each inbound Text
+//!   frame to a [`ClientCommand`] and drives `ctx.dispatch(..)` via
+//!   `block_on`. After every dispatch (and once per loop iteration) every Open
+//!   connection's mailbox is drained: queued [`ServerEvent`]s are encoded and
+//!   written, so broadcast fan-out reaches its subscribers. This REUSES all
+//!   subscribe/presence/client-event/signin logic — it does not reimplement the
+//!   protocol.
+//!
+//! `block_on` is safe here because the [`LocalAdapter`](crate::adapter::local)
+//! async methods never await real I/O; they complete synchronously.
+//!
+//! 100% safe Rust — the crate root sets `#![forbid(unsafe_code)]`.
 
+use crate::adapter::Adapter;
+use crate::app::AppManager;
+use crate::protocol::command::ClientCommand;
+use crate::protocol::event::ServerEvent;
+use crate::protocol::socket_id::SocketId;
+use crate::protocol::{codec::Codec, negotiate};
 use crate::transport::conn::{ConnError, ConnState, Connection, WriteStatus};
 use crate::transport::frame::{self, OpCode};
 use crate::transport::handshake::{self, HeadResult};
+use crate::ws::handler::ConnectionContext;
 use bytes::BytesMut;
+use dashmap::DashMap;
 use mio::net::TcpListener;
 use mio::{Events, Interest, Poll, Token};
+use std::collections::{HashMap, HashSet};
 use std::io::{ErrorKind, Read};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::mpsc;
 
 /// Reserved token for the listener. Slab keys grow from 0, so the maximum
 /// `usize` is guaranteed never to collide with a connection token.
 const LISTENER: Token = Token(usize::MAX);
+
+/// Shared, `Arc`-cloneable bundle of the `AppState` pieces a [`Mode::Dispatch`]
+/// worker needs to build a [`ConnectionContext`] per connection — the same
+/// inputs `ws::upgrade::serve` threads into `ConnectionParams`.
+pub struct DispatchEnv {
+    pub apps: Arc<dyn AppManager>,
+    pub adapter: Arc<dyn Adapter>,
+    pub limits: crate::server::config::Limits,
+    pub activity_timeout: u32,
+    pub strict_protocol: bool,
+    /// Per-app live connection counters (shared with the rest of the server),
+    /// mirroring `AppState::conn_counts`.
+    pub conn_counts: Arc<DashMap<String, Arc<AtomicUsize>>>,
+    pub webhooks: crate::webhook::WebhookHandle,
+}
 
 /// Configuration for a single worker event loop.
 pub struct WorkerConfig {
@@ -42,31 +82,44 @@ pub struct WorkerConfig {
     pub max_payload: usize,
     /// Per-connection outbound high-water mark (bytes) before backpressure-close.
     pub high_water: usize,
-    /// Behaviour applied to inbound frames. [`Mode::Echo`] for this task.
+    /// Behaviour applied to inbound frames.
     pub mode: Mode,
 }
 
 /// Worker behaviour for inbound frames.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
     /// Echo every data frame back to the sender; answer pings with pongs.
     Echo,
+    /// Drive the real Pusher v7 protocol via [`ConnectionContext::dispatch`].
+    Dispatch(Arc<DispatchEnv>),
 }
 
-/// Per-connection slab entry: the [`Connection`] plus its read remainder.
+/// Per-connection v7 protocol state, present once the WS handshake completes on
+/// a [`Mode::Dispatch`] worker. Mirrors what `connection::task::run` owns.
+struct Session {
+    ctx: ConnectionContext,
+    /// Inbound side of the connection mailbox; the matching sender lives in
+    /// `ctx.self_tx` (and is handed to other connections via `ctx.handle()`).
+    rx: mpsc::UnboundedReceiver<ServerEvent>,
+    codec: Box<dyn Codec>,
+    /// The app id + its connection counter, so disconnect can decrement.
+    conn_count: Arc<AtomicUsize>,
+}
+
+/// Per-connection slab entry: the [`Connection`] plus its read remainder and,
+/// for dispatch workers, the v7 [`Session`] built at handshake completion.
 ///
 /// `inbuf` is empty or tiny when the connection is idle (it only holds bytes
-/// that arrived mid-frame), so it does not reintroduce a large per-connection
-/// buffer. During [`ConnState::Handshaking`] it doubles as the head-accumulation
-/// buffer until [`handshake::read_head`] returns something other than
-/// [`HeadResult::NeedMore`].
+/// that arrived mid-frame). During [`ConnState::Handshaking`] it doubles as the
+/// head-accumulation buffer until [`handshake::read_head`] returns something
+/// other than [`HeadResult::NeedMore`].
 struct Entry {
     conn: Connection,
     inbuf: BytesMut,
     /// The [`Token`] this connection is registered under (== `Token(slab_key)`).
-    /// Stored so flush-driven interest re-arming can reregister without
-    /// threading the key through every call.
     token: Token,
+    /// v7 protocol state; `None` for echo workers and pre-handshake connections.
+    session: Option<Session>,
 }
 
 /// Run the worker event loop until `shutdown` is set. Blocks the calling thread.
@@ -131,6 +184,15 @@ pub fn run(cfg: WorkerConfig, shutdown: Arc<AtomicBool>) -> std::io::Result<()> 
                 }
             }
         }
+
+        // TODO(phase4): selective drain via Waker. For this task's scale (tests,
+        // a handful of connections) draining every Open dispatch connection once
+        // per loop iteration is correct and simple: a broadcast queued onto a
+        // *peer's* mailbox (which had no readiness event of its own) is flushed
+        // here so fan-out is delivered without waiting for that peer to speak.
+        if matches!(cfg.mode, Mode::Dispatch(_)) {
+            drain_all_sessions(&poll, &mut conns);
+        }
     }
 }
 
@@ -166,6 +228,7 @@ fn accept_ready(
                     conn: Connection::new(stream, cfg.high_water),
                     inbuf: BytesMut::new(),
                     token: Token(key),
+                    session: None,
                 });
             }
             Err(ref e) if e.kind() == ErrorKind::WouldBlock => break,
@@ -187,13 +250,13 @@ fn handle_readable(
 ) -> Action {
     let entry = &mut conns[key];
     match entry.conn.state {
-        ConnState::Handshaking => handle_handshake(poll, entry),
+        ConnState::Handshaking => handle_handshake(poll, entry, cfg),
         ConnState::Open | ConnState::Closing => handle_frames(poll, entry, cfg),
     }
 }
 
 /// Accumulate request-head bytes and, once complete, complete the WS upgrade.
-fn handle_handshake(poll: &Poll, entry: &mut Entry) -> Action {
+fn handle_handshake(poll: &Poll, entry: &mut Entry, cfg: &WorkerConfig) -> Action {
     // Pull all available bytes into the head-accumulation buffer (`inbuf`).
     if drain_into(&mut entry.conn, &mut entry.inbuf) == ReadOutcome::Closed {
         return Action::Close;
@@ -201,7 +264,7 @@ fn handle_handshake(poll: &Poll, entry: &mut Entry) -> Action {
 
     match handshake::read_head(&entry.inbuf) {
         HeadResult::NeedMore => Action::Keep,
-        HeadResult::WsUpgrade { key: ws_key, .. } => {
+        HeadResult::WsUpgrade { key: ws_key, path } => {
             let response = handshake::accept_response(&ws_key).into_boxed_slice();
             if entry.conn.queue(Arc::from(response)).is_err() {
                 return Action::Close;
@@ -210,6 +273,36 @@ fn handle_handshake(poll: &Poll, entry: &mut Entry) -> Action {
             // after the head would be a protocol error anyway; clearing is safe.
             entry.inbuf.clear();
             entry.conn.state = ConnState::Open;
+
+            // For a dispatch worker, build the v7 session now: resolve the app,
+            // check capacity, create the mailbox + ConnectionContext, and queue
+            // the connection_established frame. On failure we just close the
+            // socket (acceptable for this task; the legacy path sends an error
+            // frame first).
+            if let Mode::Dispatch(env) = &cfg.mode {
+                match establish_session(env, &path) {
+                    Some(session) => {
+                        let established = ServerEvent::ConnectionEstablished {
+                            socket_id: session.ctx.socket_id.clone(),
+                            activity_timeout: env.activity_timeout,
+                        };
+                        let text = session.codec.encode(&established);
+                        let mut out = BytesMut::new();
+                        frame::encode_text(&mut out, text.as_bytes());
+                        if entry
+                            .conn
+                            .queue(Arc::from(out.to_vec().into_boxed_slice()))
+                            .is_err()
+                        {
+                            session.conn_count.fetch_sub(1, Ordering::SeqCst);
+                            return Action::Close;
+                        }
+                        entry.session = Some(session);
+                    }
+                    None => return Action::Close,
+                }
+            }
+
             flush_and_arm(poll, entry)
         }
         // TODO(3.4): hand off to the tokio REST control plane (replay the head).
@@ -218,7 +311,73 @@ fn handle_handshake(poll: &Poll, entry: &mut Entry) -> Action {
     }
 }
 
-/// Read and echo every complete frame currently buffered.
+/// Resolve the app + protocol from a `/app/{key}?protocol=N` path and build the
+/// v7 [`Session`], mirroring `ws::upgrade::serve`: negotiate codec, look up the
+/// app by key, enforce per-app capacity, and assemble the [`ConnectionContext`]
+/// the same way `connection::task::run` does. Returns `None` (→ close) on any
+/// rejection (bad protocol, unknown app, over capacity).
+fn establish_session(env: &Arc<DispatchEnv>, path: &str) -> Option<Session> {
+    let (key, protocol) = parse_app_path(path);
+
+    let codec = negotiate(protocol.as_deref(), env.strict_protocol).ok()?;
+
+    let app = futures_executor::block_on(env.apps.by_key(&key))?;
+
+    let counter = env
+        .conn_counts
+        .entry(app.id.clone())
+        .or_insert_with(|| Arc::new(AtomicUsize::new(0)))
+        .clone();
+    let current = counter.fetch_add(1, Ordering::SeqCst);
+    if app.capacity != 0 && current >= app.capacity as usize {
+        counter.fetch_sub(1, Ordering::SeqCst);
+        return None;
+    }
+
+    let socket_id = SocketId::generate();
+    let (tx, rx) = mpsc::unbounded_channel::<ServerEvent>();
+    let ctx = ConnectionContext {
+        app,
+        socket_id,
+        self_tx: tx,
+        adapter: env.adapter.clone(),
+        client_event_rate: crate::ws::rate::RateWindow::new(
+            env.limits.max_client_events_per_second,
+        ),
+        limits: env.limits,
+        subscribed: HashSet::new(),
+        user: None,
+        webhooks: env.webhooks.clone(),
+        presence_membership: HashMap::new(),
+    };
+
+    Some(Session {
+        ctx,
+        rx,
+        codec,
+        conn_count: counter,
+    })
+}
+
+/// Split a `/app/{key}` path (with an optional `?protocol=N&...` query) into the
+/// app key and the `protocol` query value, mirroring how axum's `Path`/`Query`
+/// extractors feed `ws::upgrade`.
+fn parse_app_path(path: &str) -> (String, Option<String>) {
+    let (raw_path, query) = match path.split_once('?') {
+        Some((p, q)) => (p, Some(q)),
+        None => (path, None),
+    };
+    let key = raw_path.strip_prefix("/app/").unwrap_or("").to_string();
+    let protocol = query.and_then(|q| {
+        q.split('&').find_map(|pair| {
+            let (k, v) = pair.split_once('=')?;
+            (k == "protocol").then(|| v.to_string())
+        })
+    });
+    (key, protocol)
+}
+
+/// Read and process every complete frame currently buffered, per [`Mode`].
 fn handle_frames(poll: &Poll, entry: &mut Entry, cfg: &WorkerConfig) -> Action {
     let frames = {
         // Split the borrow so `inbuf` (the read remainder) and `conn` can be
@@ -228,45 +387,50 @@ fn handle_frames(poll: &Poll, entry: &mut Entry, cfg: &WorkerConfig) -> Action {
         entry.inbuf = scratch;
         match result {
             Ok(frames) => frames,
-            // EOF or a fatal protocol violation: close. (For Echo we don't
-            // bother sending a courtesy close frame.)
+            // EOF or a fatal protocol violation: close.
             Err(ConnError::Closed) | Err(ConnError::Protocol(_)) => return Action::Close,
             Err(ConnError::Backpressure) => return Action::Close,
         }
     };
 
+    match &cfg.mode {
+        Mode::Echo => echo_frames(poll, entry, frames),
+        Mode::Dispatch(_) => dispatch_frames(poll, entry, frames),
+    }
+}
+
+/// [`Mode::Echo`]: re-encode every data frame back, answer pings with pongs.
+fn echo_frames(poll: &Poll, entry: &mut Entry, frames: Vec<frame::Frame>) -> Action {
     let mut wrote = false;
     for f in frames {
-        match cfg.mode {
-            Mode::Echo => match f.opcode {
-                OpCode::Text | OpCode::Binary | OpCode::Continuation => {
-                    let mut out = BytesMut::new();
-                    frame::encode(&mut out, f.fin, f.opcode, &f.payload);
-                    if entry
-                        .conn
-                        .queue(Arc::from(out.to_vec().into_boxed_slice()))
-                        .is_err()
-                    {
-                        return Action::Close;
-                    }
-                    wrote = true;
+        match f.opcode {
+            OpCode::Text | OpCode::Binary | OpCode::Continuation => {
+                let mut out = BytesMut::new();
+                frame::encode(&mut out, f.fin, f.opcode, &f.payload);
+                if entry
+                    .conn
+                    .queue(Arc::from(out.to_vec().into_boxed_slice()))
+                    .is_err()
+                {
+                    return Action::Close;
                 }
-                OpCode::Ping => {
-                    let mut out = BytesMut::new();
-                    frame::encode(&mut out, true, OpCode::Pong, &f.payload);
-                    if entry
-                        .conn
-                        .queue(Arc::from(out.to_vec().into_boxed_slice()))
-                        .is_err()
-                    {
-                        return Action::Close;
-                    }
-                    wrote = true;
+                wrote = true;
+            }
+            OpCode::Ping => {
+                let mut out = BytesMut::new();
+                frame::encode(&mut out, true, OpCode::Pong, &f.payload);
+                if entry
+                    .conn
+                    .queue(Arc::from(out.to_vec().into_boxed_slice()))
+                    .is_err()
+                {
+                    return Action::Close;
                 }
-                // A peer pong is unsolicited noise here; ignore it.
-                OpCode::Pong => {}
-                OpCode::Close => return Action::Close,
-            },
+                wrote = true;
+            }
+            // A peer pong is unsolicited noise here; ignore it.
+            OpCode::Pong => {}
+            OpCode::Close => return Action::Close,
         }
     }
 
@@ -274,6 +438,137 @@ fn handle_frames(poll: &Poll, entry: &mut Entry, cfg: &WorkerConfig) -> Action {
         flush_and_arm(poll, entry)
     } else {
         Action::Keep
+    }
+}
+
+/// [`Mode::Dispatch`]: decode each Text frame to a [`ClientCommand`] and drive
+/// `ctx.dispatch`, answer pings with pongs, close on a Close frame, then drain
+/// this connection's mailbox so any self-directed replies go out.
+fn dispatch_frames(poll: &Poll, entry: &mut Entry, frames: Vec<frame::Frame>) -> Action {
+    for f in frames {
+        match f.opcode {
+            OpCode::Text => {
+                // The session always exists once Open on a dispatch worker.
+                let Some(session) = entry.session.as_mut() else {
+                    return Action::Close;
+                };
+                let text = match std::str::from_utf8(&f.payload) {
+                    Ok(t) => t,
+                    // A non-UTF-8 text frame is malformed; mirror legacy and drop.
+                    Err(_) => continue,
+                };
+                match session.codec.decode(text) {
+                    Ok(cmd) => dispatch_command(session, cmd),
+                    Err(e) => {
+                        // Unparseable frames are silently dropped (parity with
+                        // `connection::task`); 4200 is a close/reconnect code and
+                        // must not be sent in-band.
+                        tracing::trace!("dropping malformed client frame: {e}");
+                    }
+                }
+            }
+            OpCode::Ping => {
+                let mut out = BytesMut::new();
+                frame::encode(&mut out, true, OpCode::Pong, &f.payload);
+                if entry
+                    .conn
+                    .queue(Arc::from(out.to_vec().into_boxed_slice()))
+                    .is_err()
+                {
+                    return Action::Close;
+                }
+            }
+            OpCode::Pong => {}
+            // Binary/Continuation are not part of the Pusher protocol; ignore.
+            OpCode::Binary | OpCode::Continuation => {}
+            OpCode::Close => return Action::Close,
+        }
+    }
+
+    // Drain this connection's mailbox: dispatch may have enqueued self-directed
+    // replies (subscription_succeeded, pong, errors) plus the adapter may have
+    // fanned a broadcast onto it.
+    drain_session(poll, entry)
+}
+
+/// Run one command through the (async) protocol handler synchronously.
+fn dispatch_command(session: &mut Session, cmd: ClientCommand) {
+    futures_executor::block_on(session.ctx.dispatch(cmd));
+}
+
+/// Drain every queued [`ServerEvent`] from this connection's mailbox: encode and
+/// queue each as a Text frame, except [`ServerEvent::Close`] which becomes a
+/// WebSocket Close frame and ends the connection. Returns [`Action::Close`] if a
+/// close was requested or a write failed.
+fn drain_session(poll: &Poll, entry: &mut Entry) -> Action {
+    let Some(session) = entry.session.as_mut() else {
+        return Action::Keep;
+    };
+
+    let mut close_after = false;
+    let mut wrote = false;
+    while let Ok(ev) = session.rx.try_recv() {
+        match ev {
+            ServerEvent::Close { code, reason } => {
+                let mut out = BytesMut::new();
+                let mut frame_body = Vec::with_capacity(2 + reason.len());
+                frame_body.extend_from_slice(&code.to_be_bytes());
+                frame_body.extend_from_slice(reason.as_bytes());
+                frame::encode(&mut out, true, OpCode::Close, &frame_body);
+                if entry
+                    .conn
+                    .queue(Arc::from(out.to_vec().into_boxed_slice()))
+                    .is_err()
+                {
+                    return Action::Close;
+                }
+                wrote = true;
+                close_after = true;
+                break;
+            }
+            other => {
+                let text = session.codec.encode(&other);
+                let mut out = BytesMut::new();
+                frame::encode_text(&mut out, text.as_bytes());
+                if entry
+                    .conn
+                    .queue(Arc::from(out.to_vec().into_boxed_slice()))
+                    .is_err()
+                {
+                    return Action::Close;
+                }
+                wrote = true;
+            }
+        }
+    }
+
+    if wrote && flush_and_arm(poll, entry) == Action::Close {
+        return Action::Close;
+    }
+    if close_after {
+        Action::Close
+    } else {
+        Action::Keep
+    }
+}
+
+/// Drain every Open dispatch connection's mailbox once. Connections that request
+/// a close (or whose write fails) are torn down. Called once per loop iteration
+/// so a broadcast queued onto a peer's mailbox is delivered even when that peer
+/// produced no readiness event of its own.
+fn drain_all_sessions(poll: &Poll, conns: &mut slab::Slab<Entry>) {
+    let keys: Vec<usize> = conns
+        .iter()
+        .filter(|(_, e)| e.session.is_some() && e.conn.state == ConnState::Open)
+        .map(|(k, _)| k)
+        .collect();
+    for key in keys {
+        if !conns.contains(key) {
+            continue;
+        }
+        if drain_session(poll, &mut conns[key]) == Action::Close {
+            remove(poll, conns, key);
+        }
     }
 }
 
@@ -342,9 +637,15 @@ fn drain_into(conn: &mut Connection, buf: &mut BytesMut) -> ReadOutcome {
     }
 }
 
-/// Remove a connection: deregister its socket and drop the slab entry.
+/// Remove a connection: run the protocol on-close hook (dispatch only),
+/// decrement the app's connection counter, deregister its socket, and drop the
+/// slab entry.
 fn remove(poll: &Poll, conns: &mut slab::Slab<Entry>, key: usize) {
     if let Some(mut entry) = conns.try_remove(key) {
+        if let Some(mut session) = entry.session.take() {
+            futures_executor::block_on(session.ctx.on_close());
+            session.conn_count.fetch_sub(1, Ordering::SeqCst);
+        }
         let _ = poll.registry().deregister(&mut entry.conn.stream);
     }
 }
@@ -469,5 +770,21 @@ mod tests {
 
         shutdown.store(true, Ordering::SeqCst);
         handle.join().unwrap();
+    }
+
+    #[test]
+    fn parse_app_path_extracts_key_and_protocol() {
+        assert_eq!(
+            parse_app_path("/app/app-key?protocol=7"),
+            ("app-key".to_string(), Some("7".to_string()))
+        );
+        assert_eq!(
+            parse_app_path("/app/app-key"),
+            ("app-key".to_string(), None)
+        );
+        assert_eq!(
+            parse_app_path("/app/k?foo=1&protocol=7&bar=2"),
+            ("k".to_string(), Some("7".to_string()))
+        );
     }
 }

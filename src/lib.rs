@@ -9,10 +9,10 @@ pub mod http;
 pub mod presence;
 pub mod protocol;
 pub mod server;
-// SP9 lean per-core transport. Self-contained RFC 6455 frame codec; not yet wired
-// into the server, so the whole module is allowed to be dead for now.
+// SP9 lean per-core transport. Self-contained RFC 6455 frame codec + the
+// readiness-driven worker event loop that drives the v7 protocol dispatch.
 #[allow(dead_code)]
-mod transport;
+pub mod transport;
 pub mod user;
 pub mod webhook;
 pub mod ws;

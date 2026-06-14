@@ -1432,6 +1432,7 @@ dependencies = [
  "criterion",
  "dashmap",
  "fred",
+ "futures-executor",
  "futures-util",
  "hex",
  "hmac",

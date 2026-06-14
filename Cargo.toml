@@ -39,6 +39,10 @@ dashmap = "6"           # sharded concurrent map for the channel registry
 async-trait = "0.1"
 rand = "0.8"
 futures-util = "0.3"
+# Synchronous `block_on` to drive the async protocol dispatch from the
+# readiness-driven (non-async) per-core worker loop (SP9). LocalAdapter's async
+# methods never await real I/O, so this completes without parking a runtime.
+futures-executor = "0.3"
 thiserror = "1"
 # Outbound HTTP for webhook delivery. rustls (no OpenSSL system dep) to reach https endpoints.
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
