@@ -54,6 +54,12 @@ fred = { version = "10", default-features = false, features = ["subscriber-clien
 uuid = { version = "1", features = ["v4"] }
 # Global allocator: faster + better cross-thread alloc/free for the cross-core fan-out pattern.
 mimalloc = { version = "0.1", default-features = false }
+# SO_REUSEPORT/SO_REUSEADDR listener sockets — one per per-core worker so the
+# kernel load-balances accepts across worker threads (SP9 multi-worker). The
+# `all` feature unlocks `set_reuse_port` (gated `cfg(all(feature="all", unix))`).
+socket2 = { version = "0.5", features = ["all"] }
+# Pin each per-core worker thread to a CPU (SP9 multi-worker core affinity).
+core_affinity = "0.8"
 
 [dev-dependencies]
 # Enables paused-time control (`start_paused`, `tokio::time::advance`) in tests.

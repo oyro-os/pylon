@@ -67,6 +67,9 @@ pub struct ServerConfig {
     pub webhook_vacated_grace_ms: u64,
     pub redis_sharded_pubsub: bool,
     pub transport: TransportMode,
+    /// Number of per-core worker threads for `TransportMode::Percore`. `0` means
+    /// "auto" — one worker per available CPU. See [`ServerConfig::worker_count`].
+    pub workers: usize,
 }
 
 impl Default for ServerConfig {
@@ -106,6 +109,7 @@ impl Default for ServerConfig {
             webhook_vacated_grace_ms: 3000,
             redis_sharded_pubsub: false,
             transport: TransportMode::Legacy,
+            workers: 0,
         }
     }
 }
@@ -269,7 +273,25 @@ impl ServerConfig {
                 c.transport = m;
             }
         }
+        if let Ok(v) = std::env::var("PYLON_WORKERS") {
+            if let Ok(p) = v.parse() {
+                c.workers = p;
+            }
+        }
         c
+    }
+
+    /// Resolve the per-core worker count: the configured value, or — when `0`
+    /// ("auto") — the number of available CPUs (falling back to `1` if the OS
+    /// won't report it).
+    pub fn worker_count(&self) -> usize {
+        if self.workers == 0 {
+            std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(1)
+        } else {
+            self.workers
+        }
     }
 
     pub fn limits(&self) -> Limits {
@@ -367,6 +389,32 @@ mod tests {
     fn transport_defaults_to_legacy() {
         let c = ServerConfig::default();
         assert_eq!(c.transport, TransportMode::Legacy);
+    }
+
+    #[test]
+    fn workers_default_is_auto() {
+        let c = ServerConfig::default();
+        assert_eq!(c.workers, 0);
+        // Auto resolves to >= 1 (available_parallelism, or the fallback of 1).
+        assert!(c.worker_count() >= 1);
+    }
+
+    #[test]
+    fn worker_count_uses_explicit_value() {
+        let c = ServerConfig {
+            workers: 4,
+            ..ServerConfig::default()
+        };
+        assert_eq!(c.worker_count(), 4);
+    }
+
+    #[test]
+    fn workers_env_override_applies() {
+        std::env::set_var("PYLON_WORKERS", "3");
+        let c = ServerConfig::from_env();
+        assert_eq!(c.workers, 3);
+        assert_eq!(c.worker_count(), 3);
+        std::env::remove_var("PYLON_WORKERS");
     }
 
     #[test]

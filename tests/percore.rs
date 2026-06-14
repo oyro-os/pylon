@@ -88,6 +88,7 @@ async fn spawn(config: ServerConfig) -> Harness {
                 high_water: 1 << 20,
                 mode: Mode::Dispatch(env),
                 rest_handoff: None,
+                worker_id: 0,
             },
             sd,
         )

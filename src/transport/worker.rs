@@ -32,7 +32,12 @@
 //! `block_on` is safe here because the [`LocalAdapter`](crate::adapter::local)
 //! async methods never await real I/O; they complete synchronously.
 //!
-//! 100% safe Rust — the crate root sets `#![forbid(unsafe_code)]`.
+//! Safe Rust — the crate root sets `#![deny(unsafe_code)]`; this module adds no
+//! `unsafe`.
+//!
+//! Multiple of these worker loops run in `TransportMode::Percore` (one per CPU),
+//! each with its own `SO_REUSEPORT` listener on the same `bind:port`, so the
+//! kernel spreads accepts across workers; see [`crate::transport::run_percore`].
 
 use crate::adapter::Adapter;
 use crate::app::AppManager;
@@ -88,6 +93,10 @@ pub struct WorkerConfig {
     /// tokio/axum plane (SP9 §3.4). `None` ⇒ no REST plane (the worker's own
     /// tests); a `Rest` head is then closed as before.
     pub rest_handoff: Option<mpsc::UnboundedSender<crate::transport::rest::RestConn>>,
+    /// This worker's index among the spawned per-core workers, used only for
+    /// accept-distribution logging (so an operator can confirm `SO_REUSEPORT` is
+    /// spreading connections across cores). `0` for a lone/test worker.
+    pub worker_id: usize,
 }
 
 /// Worker behaviour for inbound frames.
@@ -126,27 +135,68 @@ struct Entry {
     session: Option<Session>,
 }
 
+/// Build a `mio` listener bound to `addr` with `SO_REUSEADDR` + `SO_REUSEPORT`
+/// set before bind. `SO_REUSEPORT` lets every per-core worker bind the SAME
+/// `bind:port` independently; the kernel then load-balances incoming connections
+/// across the workers' listener sockets (one accept queue per worker).
+fn reuseport_listener(addr: std::net::SocketAddr) -> std::io::Result<TcpListener> {
+    let sock = socket2::Socket::new(
+        socket2::Domain::for_address(addr),
+        socket2::Type::STREAM,
+        Some(socket2::Protocol::TCP),
+    )?;
+    sock.set_reuse_address(true)?;
+    sock.set_reuse_port(true)?; // SO_REUSEPORT — kernel load-balances accepts across workers
+    sock.set_nonblocking(true)?;
+    sock.bind(&addr.into())?;
+    sock.listen(1024)?;
+    Ok(TcpListener::from_std(std::net::TcpListener::from(sock)))
+}
+
 /// Run the worker event loop until `shutdown` is set. Blocks the calling thread.
 ///
-/// Returns once `shutdown` is observed `true` (clean stop) or a fatal I/O error
-/// occurs while binding/polling.
+/// Builds its OWN `SO_REUSEPORT` listener on `cfg.addr` — every worker calls this
+/// with the same address, and the kernel spreads accepts across them. Returns
+/// once `shutdown` is observed `true` (clean stop) or a fatal I/O error occurs
+/// while binding/polling.
 pub fn run(cfg: WorkerConfig, shutdown: Arc<AtomicBool>) -> std::io::Result<()> {
     let mut poll = Poll::new()?;
-    let mut listener = TcpListener::bind(cfg.addr)?;
+    let mut listener = reuseport_listener(cfg.addr)?;
     poll.registry()
         .register(&mut listener, LISTENER, Interest::READABLE)?;
 
     let mut events = Events::with_capacity(1024);
     let mut conns: slab::Slab<Entry> = slab::Slab::new();
 
+    // Adaptive poll timeout: when the previous iteration did real work (or any
+    // connection still has buffered writes), poll non-blocking so cross-worker
+    // mailbox deliveries drain promptly under load; when idle, block up to 50ms
+    // (which also bounds how long `shutdown` goes unchecked) to avoid spinning.
+    // TODO(followup): Waker-based selective drain for low-latency idle cross-worker delivery.
+    let mut did_work = true;
+    let dispatch = matches!(cfg.mode, Mode::Dispatch(_));
+    // Total connections this worker has accepted — logged at shutdown so an
+    // operator can confirm SO_REUSEPORT spread accepts across cores.
+    let mut accepted_total: u64 = 0;
+
     loop {
         if shutdown.load(Ordering::SeqCst) {
+            tracing::debug!(
+                worker = cfg.worker_id,
+                accepted = accepted_total,
+                "percore worker stopping"
+            );
             return Ok(());
         }
 
-        // The 100ms timeout bounds how long we sleep so `shutdown` is checked
-        // even when no readiness events fire.
-        if let Err(e) = poll.poll(&mut events, Some(Duration::from_millis(100))) {
+        let pending_writes = conns.iter().any(|(_, e)| e.conn.has_pending_writes());
+        let timeout = if did_work || pending_writes {
+            Some(Duration::from_millis(0))
+        } else {
+            Some(Duration::from_millis(50))
+        };
+
+        if let Err(e) = poll.poll(&mut events, timeout) {
             // A signal can interrupt the poll syscall; just retry.
             if e.kind() == ErrorKind::Interrupted {
                 continue;
@@ -154,9 +204,15 @@ pub fn run(cfg: WorkerConfig, shutdown: Arc<AtomicBool>) -> std::io::Result<()> 
             return Err(e);
         }
 
+        // Track whether this iteration accomplished anything worth a tight
+        // re-poll: any readiness event, or a non-empty cross-worker drain below.
+        let mut work = !events.is_empty();
+
         for event in events.iter() {
             match event.token() {
-                LISTENER => accept_ready(&poll, &mut listener, &mut conns, &cfg),
+                LISTENER => {
+                    accepted_total += accept_ready(&poll, &mut listener, &mut conns, &cfg);
+                }
                 token => {
                     let key = token.0;
                     // The connection may have been removed earlier in this same
@@ -196,14 +252,17 @@ pub fn run(cfg: WorkerConfig, shutdown: Arc<AtomicBool>) -> std::io::Result<()> 
             }
         }
 
-        // TODO(phase4): selective drain via Waker. For this task's scale (tests,
-        // a handful of connections) draining every Open dispatch connection once
-        // per loop iteration is correct and simple: a broadcast queued onto a
-        // *peer's* mailbox (which had no readiness event of its own) is flushed
-        // here so fan-out is delivered without waiting for that peer to speak.
-        if matches!(cfg.mode, Mode::Dispatch(_)) {
-            drain_all_sessions(&poll, &mut conns);
+        // Draining every Open dispatch connection once per loop iteration is how
+        // a broadcast queued onto a *peer's* mailbox (which had no readiness
+        // event of its own — including a peer owned by a different worker, since
+        // fan-out writes cross-thread into per-conn mailboxes) is flushed without
+        // waiting for that peer to speak. `drain_all_sessions` reports whether it
+        // actually wrote anything so the adaptive timeout stays tight under load.
+        if dispatch && drain_all_sessions(&poll, &mut conns) {
+            work = true;
         }
+
+        did_work = work;
     }
 }
 
@@ -220,12 +279,15 @@ enum Action {
 }
 
 /// Drain the listener's accept backlog, registering every accepted socket.
+/// Returns the number of connections accepted this call (for accept-distribution
+/// accounting).
 fn accept_ready(
     poll: &Poll,
     listener: &mut TcpListener,
     conns: &mut slab::Slab<Entry>,
     cfg: &WorkerConfig,
-) {
+) -> u64 {
+    let mut accepted = 0;
     loop {
         match listener.accept() {
             Ok((mut stream, _peer)) => {
@@ -246,6 +308,7 @@ fn accept_ready(
                     token: Token(key),
                     session: None,
                 });
+                accepted += 1;
             }
             Err(ref e) if e.kind() == ErrorKind::WouldBlock => break,
             Err(ref e) if e.kind() == ErrorKind::Interrupted => continue,
@@ -255,6 +318,7 @@ fn accept_ready(
             }
         }
     }
+    accepted
 }
 
 /// Handle a readable event: either advance the handshake or process frames.
@@ -514,7 +578,7 @@ fn dispatch_frames(poll: &Poll, entry: &mut Entry, frames: Vec<frame::Frame>) ->
     // Drain this connection's mailbox: dispatch may have enqueued self-directed
     // replies (subscription_succeeded, pong, errors) plus the adapter may have
     // fanned a broadcast onto it.
-    drain_session(poll, entry)
+    drain_session(poll, entry).0
 }
 
 /// Run one command through the (async) protocol handler synchronously.
@@ -524,11 +588,12 @@ fn dispatch_command(session: &mut Session, cmd: ClientCommand) {
 
 /// Drain every queued [`ServerEvent`] from this connection's mailbox: encode and
 /// queue each as a Text frame, except [`ServerEvent::Close`] which becomes a
-/// WebSocket Close frame and ends the connection. Returns [`Action::Close`] if a
-/// close was requested or a write failed.
-fn drain_session(poll: &Poll, entry: &mut Entry) -> Action {
+/// WebSocket Close frame and ends the connection. Returns the resulting
+/// [`Action`] (`Close` if a close was requested or a write failed) plus whether
+/// anything was actually written (so the loop's adaptive poll stays tight).
+fn drain_session(poll: &Poll, entry: &mut Entry) -> (Action, bool) {
     let Some(session) = entry.session.as_mut() else {
-        return Action::Keep;
+        return (Action::Keep, false);
     };
 
     let mut close_after = false;
@@ -546,7 +611,7 @@ fn drain_session(poll: &Poll, entry: &mut Entry) -> Action {
                     .queue(Arc::from(out.to_vec().into_boxed_slice()))
                     .is_err()
                 {
-                    return Action::Close;
+                    return (Action::Close, wrote);
                 }
                 wrote = true;
                 close_after = true;
@@ -561,7 +626,7 @@ fn drain_session(poll: &Poll, entry: &mut Entry) -> Action {
                     .queue(Arc::from(out.to_vec().into_boxed_slice()))
                     .is_err()
                 {
-                    return Action::Close;
+                    return (Action::Close, wrote);
                 }
                 wrote = true;
             }
@@ -569,33 +634,38 @@ fn drain_session(poll: &Poll, entry: &mut Entry) -> Action {
     }
 
     if wrote && flush_and_arm(poll, entry) == Action::Close {
-        return Action::Close;
+        return (Action::Close, wrote);
     }
     if close_after {
-        Action::Close
+        (Action::Close, wrote)
     } else {
-        Action::Keep
+        (Action::Keep, wrote)
     }
 }
 
 /// Drain every Open dispatch connection's mailbox once. Connections that request
 /// a close (or whose write fails) are torn down. Called once per loop iteration
 /// so a broadcast queued onto a peer's mailbox is delivered even when that peer
-/// produced no readiness event of its own.
-fn drain_all_sessions(poll: &Poll, conns: &mut slab::Slab<Entry>) {
+/// produced no readiness event of its own. Returns `true` if any connection
+/// actually wrote a queued event (used to keep the adaptive poll tight).
+fn drain_all_sessions(poll: &Poll, conns: &mut slab::Slab<Entry>) -> bool {
     let keys: Vec<usize> = conns
         .iter()
         .filter(|(_, e)| e.session.is_some() && e.conn.state == ConnState::Open)
         .map(|(k, _)| k)
         .collect();
+    let mut wrote_any = false;
     for key in keys {
         if !conns.contains(key) {
             continue;
         }
-        if drain_session(poll, &mut conns[key]) == Action::Close {
+        let (action, wrote) = drain_session(poll, &mut conns[key]);
+        wrote_any |= wrote;
+        if action == Action::Close {
             remove(poll, conns, key);
         }
     }
+    wrote_any
 }
 
 /// Handle a writable event: flush and, when drained, drop writable interest.
@@ -743,6 +813,7 @@ mod tests {
                     high_water: 1 << 20,
                     mode: Mode::Echo,
                     rest_handoff: None,
+                    worker_id: 0,
                 },
                 sd,
             )
