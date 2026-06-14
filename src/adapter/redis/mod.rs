@@ -870,11 +870,38 @@ impl Adapter for RedisAdapter {
         handle: ConnectionHandle,
         watched: Vec<String>,
     ) -> Vec<String> {
-        self.local.watch(app, handle, watched).await
+        // Record watchers locally + learn which users this node now newly watches.
+        let (_local_online, newly_watched) = self.local.watch_edges(app, handle, watched.clone());
+        // Subscribe to each newly-watched user's watch channel so this node receives
+        // their cluster online/offline transitions.
+        for u in &newly_watched {
+            if let Err(e) = self.clients.sub.subscribe(self.keys.watch(app, u)).await {
+                tracing::warn!(error = %e, app, user = %u, "failed to SUBSCRIBE watch channel");
+            }
+        }
+        // Cluster-wide initial online snapshot: is_user_online per watched user.
+        let mut online = Vec::new();
+        for u in &watched {
+            match user::is_online(&self.clients.pool, &self.keys, app, u).await {
+                Ok(true) => online.push(u.clone()),
+                Ok(false) => {}
+                Err(e) => {
+                    tracing::warn!(error = %e, app, user = %u, "redis is_online failed; using local for snapshot");
+                    if self.local.is_user_online(app, u).await {
+                        online.push(u.clone());
+                    }
+                }
+            }
+        }
+        online
     }
 
     async fn unwatch(&self, app: &str, socket_id: &SocketId) {
-        self.local.unwatch(app, socket_id).await
+        for u in self.local.unwatch_edges(app, socket_id) {
+            if let Err(e) = self.clients.sub.unsubscribe(self.keys.watch(app, &u)).await {
+                tracing::warn!(error = %e, app, user = %u, "failed to UNSUBSCRIBE watch channel");
+            }
+        }
     }
 
     async fn watchers_of(&self, app: &str, user_id: &str) -> Vec<ConnectionHandle> {

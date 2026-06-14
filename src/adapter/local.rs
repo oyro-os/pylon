@@ -34,6 +34,26 @@ impl LocalAdapter {
     pub fn local_members(&self) -> Vec<(String, String, SocketId)> {
         self.registry.local_members()
     }
+
+    /// Record watchers locally and report the per-user LOCAL watcher edges. Returns
+    /// `(online, newly_watched)` — the node-local online subset plus the users whose
+    /// LOCAL watcher set went 0→1 here. The composing `RedisAdapter` calls this (not
+    /// via the `Adapter` trait) to drive the per-user `watch` Redis-sub lifecycle.
+    pub fn watch_edges(
+        &self,
+        app: &str,
+        handle: ConnectionHandle,
+        watched: Vec<String>,
+    ) -> (Vec<String>, Vec<String>) {
+        self.users.watch(app, handle, watched)
+    }
+
+    /// Drop this connection's watch state and report the users whose LOCAL watcher set
+    /// dropped to empty here (1→0). The composing `RedisAdapter` uses these to
+    /// UNSUBSCRIBE the per-user `watch` Redis channel.
+    pub fn unwatch_edges(&self, app: &str, socket_id: &SocketId) -> Vec<String> {
+        self.users.unwatch(app, socket_id)
+    }
 }
 
 #[async_trait]
@@ -138,11 +158,12 @@ impl Adapter for LocalAdapter {
         handle: ConnectionHandle,
         watched: Vec<String>,
     ) -> Vec<String> {
-        self.users.watch(app, handle, watched)
+        // Trait contract: return only the (node-local) online subset.
+        self.users.watch(app, handle, watched).0
     }
 
     async fn unwatch(&self, app: &str, socket_id: &SocketId) {
-        self.users.unwatch(app, socket_id)
+        let _ = self.users.unwatch(app, socket_id);
     }
 
     async fn watchers_of(&self, app: &str, user_id: &str) -> Vec<ConnectionHandle> {

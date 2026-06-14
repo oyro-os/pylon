@@ -1243,3 +1243,102 @@ async fn terminate_user_closes_connection_on_another_node() {
         "expected 4009 Close on node B, got {second:?}"
     );
 }
+
+/// C1: cross-node watchlist. A node watching a user on the WATCHER side must
+/// SUBSCRIBE that user's `watch(app,user)` channel, so a WatchOnline/WatchOffline
+/// published by ANOTHER node (on the cluster online/offline edge of that user)
+/// reaches it and is delivered to its local watchers as a `WatchlistEvents` frame.
+///
+/// (RED before C1: with `watch` delegating to the local adapter, A never SUBSCRIBEs
+/// the watch channel, so B's WatchOnline publish never reaches A and `rx` gets
+/// nothing.)
+#[tokio::test]
+async fn cross_node_watchlist_online_offline() {
+    tokio::time::timeout(Duration::from_secs(6), async {
+        let prefix = random_prefix();
+        let keys = Keys::new(&prefix);
+        let adapter_a = connect_adapter_with_prefix(&prefix).await;
+        let adapter_b = connect_adapter_with_prefix(&prefix).await;
+
+        // 1. A watches u7 — not online yet, so the initial snapshot is empty. The
+        //    watcher's mailbox rx is kept so we can assert what A delivers to it.
+        let (_s, watcher, mut rx) = recording_handle();
+        let online = adapter_a.watch(TEST_APP, watcher, vec!["u7".into()]).await;
+        assert!(
+            online.is_empty(),
+            "u7 is not online yet → watch() initial snapshot must be empty (got {online:?})"
+        );
+        // Wait for A's Redis SUBSCRIBE of watch(u7) to take effect before B publishes.
+        assert!(
+            await_tracked(
+                &adapter_a,
+                &keys.watch(TEST_APP, "u7"),
+                Duration::from_secs(2)
+            )
+            .await,
+            "A must SUBSCRIBE watch(u7) on the 0→1 local watcher edge"
+        );
+
+        // 2. B signs in u7 → cluster online edge → publishes WatchOnline on watch(u7).
+        let (_sb, handle_b, _rx_b) = recording_handle();
+        let b_socket = handle_b.socket_id.clone();
+        adapter_b.signin_user(TEST_APP, "u7", handle_b).await;
+
+        // 3. A's watcher receives a WatchlistEvents "online" for u7.
+        let got = with_timeout(async { rx.recv().await }).await;
+        match got {
+            Some(ServerEvent::WatchlistEvents { events }) => {
+                assert_eq!(events.len(), 1, "exactly one watchlist change");
+                assert_eq!(events[0].name, "online", "u7 came online");
+                assert_eq!(events[0].user_ids, vec!["u7".to_string()]);
+            }
+            other => panic!("expected WatchlistEvents online on A, got {other:?}"),
+        }
+
+        // 4. B signs out u7 → cluster offline edge → publishes WatchOffline → A gets it.
+        adapter_b.signout_user(TEST_APP, "u7", &b_socket).await;
+        let got = with_timeout(async { rx.recv().await }).await;
+        match got {
+            Some(ServerEvent::WatchlistEvents { events }) => {
+                assert_eq!(events.len(), 1, "exactly one watchlist change");
+                assert_eq!(events[0].name, "offline", "u7 went offline");
+                assert_eq!(events[0].user_ids, vec!["u7".to_string()]);
+            }
+            other => panic!("expected WatchlistEvents offline on A, got {other:?}"),
+        }
+    })
+    .await
+    .expect("cross-node watchlist test must not hang (Redis up?)");
+}
+
+/// C1: the `watch` initial-online snapshot is CLUSTER-wide. If a user is already
+/// online on ANOTHER node when a connection starts watching it, that user must be in
+/// the returned online set (driven by the cluster `is_user_online`, i.e. `HLEN usr`),
+/// not just the node-local `users` map.
+///
+/// (RED before C1: with the node-local snapshot, A has no local connection of u7, so
+/// `watch` would return an empty online set even though u7 is online on B.)
+#[tokio::test]
+async fn watch_initial_snapshot_is_cluster_wide() {
+    tokio::time::timeout(Duration::from_secs(6), async {
+        let prefix = random_prefix();
+        let adapter_a = connect_adapter_with_prefix(&prefix).await;
+        let adapter_b = connect_adapter_with_prefix(&prefix).await;
+
+        // 1. B signs in u7 first → u7 is online cluster-wide (HLEN usr > 0).
+        let (_sb, handle_b, _rx_b) = recording_handle();
+        adapter_b.signin_user(TEST_APP, "u7", handle_b).await;
+
+        // 2. A starts watching u7 → its initial snapshot is the cluster online check,
+        //    so u7 must be reported online even though A holds no local connection.
+        let (_s, watcher, _rx) = recording_handle();
+        let online = adapter_a.watch(TEST_APP, watcher, vec!["u7".into()]).await;
+        assert_eq!(
+            online,
+            vec!["u7".to_string()],
+            "watch() initial snapshot must be cluster-wide (u7 online on B)"
+        );
+    })
+    .await
+    .expect("cluster watch-snapshot test must not hang (Redis up?)");
+}

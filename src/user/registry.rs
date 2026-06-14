@@ -64,16 +64,32 @@ impl UserRegistry {
             .is_some_and(|e| !e.is_empty())
     }
 
-    pub fn watch(&self, app: &str, handle: ConnectionHandle, watched: Vec<String>) -> Vec<String> {
+    /// Record `watched` for this connection. Returns `(online, newly_watched)`:
+    /// `online` is the subset of `watched` that is online NODE-LOCALLY right now;
+    /// `newly_watched` is the subset whose LOCAL watcher set went 0→1 here (this node
+    /// gained its first watcher of that user), which the cross-node adapter uses to
+    /// drive the per-user `watch` Redis-subscription lifecycle.
+    pub fn watch(
+        &self,
+        app: &str,
+        handle: ConnectionHandle,
+        watched: Vec<String>,
+    ) -> (Vec<String>, Vec<String>) {
         let sock = handle.socket_id.clone();
         // Idempotent: drop any prior watch state for this connection before
         // recording the new one, so a re-watch can't leak stale `watchers` entries.
         self.unwatch(app, &sock);
+        let mut newly_watched = Vec::new();
         for w in &watched {
-            self.watchers
+            let mut entry = self
+                .watchers
                 .entry((app.to_string(), w.clone()))
-                .or_default()
-                .insert(sock.clone(), handle.clone());
+                .or_default();
+            // 0→1 LOCAL watcher edge for this user on this node.
+            if entry.is_empty() {
+                newly_watched.push(w.clone());
+            }
+            entry.insert(sock.clone(), handle.clone());
         }
         let online = watched
             .iter()
@@ -81,15 +97,19 @@ impl UserRegistry {
             .cloned()
             .collect();
         self.watching.insert((app.to_string(), sock), watched);
-        online
+        (online, newly_watched)
     }
 
-    pub fn unwatch(&self, app: &str, socket_id: &SocketId) {
+    /// Drop this connection's watch state. Returns the users whose LOCAL watcher set
+    /// dropped to empty here (1→0 on this node) — the cross-node adapter uses these to
+    /// UNSUBSCRIBE the per-user `watch` Redis channel.
+    pub fn unwatch(&self, app: &str, socket_id: &SocketId) -> Vec<String> {
         let Some((_, watched)) = self.watching.remove(&(app.to_string(), socket_id.clone())) else {
-            return;
+            return Vec::new();
         };
+        let mut now_empty = Vec::new();
         for w in watched {
-            let key = (app.to_string(), w);
+            let key = (app.to_string(), w.clone());
             // Drop the get_mut guard before the conditional remove (deadlock avoidance),
             // and use remove_if so a concurrent watch that repopulated the set is not
             // clobbered — same pattern as signout / channel::Registry.
@@ -99,8 +119,18 @@ impl UserRegistry {
                 };
                 set.remove(socket_id);
             }
-            self.watchers.remove_if(&key, |_, set| set.is_empty());
+            // 1→0 LOCAL watcher edge: report the user only if the set is now empty AND
+            // we actually remove it (remove_if re-checks under the shard lock, so a
+            // concurrent watch that repopulated the set is not reported as emptied).
+            if self
+                .watchers
+                .remove_if(&key, |_, set| set.is_empty())
+                .is_some()
+            {
+                now_empty.push(w);
+            }
         }
+        now_empty
     }
 
     pub fn watchers_of(&self, app: &str, user_id: &str) -> Vec<ConnectionHandle> {
@@ -160,10 +190,10 @@ mod tests {
         r.signin("app", "b", online_user); // b is online; c is not
         let (watcher, _w) = handle();
         let sock = watcher.socket_id.clone();
-        let online = r.watch("app", watcher, vec!["b".into(), "c".into()]);
+        let (online, _newly) = r.watch("app", watcher, vec!["b".into(), "c".into()]);
         assert_eq!(online, vec!["b".to_string()]); // only b currently online
         assert_eq!(r.watchers_of("app", "b").len(), 1);
-        r.unwatch("app", &sock);
+        let _ = r.unwatch("app", &sock);
         assert!(r.watchers_of("app", "b").is_empty());
     }
 
@@ -188,7 +218,45 @@ mod tests {
         );
         assert_eq!(r.watchers_of("app", "c").len(), 1);
         // And a final unwatch clears everything.
-        r.unwatch("app", &sock);
+        let _ = r.unwatch("app", &sock);
         assert!(r.watchers_of("app", "c").is_empty());
+    }
+
+    #[test]
+    fn watch_unwatch_report_local_watcher_edges() {
+        let r = UserRegistry::new();
+        // First watcher of "b": its LOCAL watcher set goes 0→1, so "b" is newly_watched.
+        let (w1, _r1) = handle();
+        let sock1 = w1.socket_id.clone();
+        let (_online, newly) = r.watch("app", w1, vec!["b".into()]);
+        assert!(
+            newly.contains(&"b".to_string()),
+            "first watcher of b must report b as newly_watched"
+        );
+
+        // A SECOND, different socket watching "b": the set is already non-empty
+        // (1→2), so "b" must NOT be reported as newly_watched again.
+        let (w2, _r2) = handle();
+        let sock2 = w2.socket_id.clone();
+        let (_online2, newly2) = r.watch("app", w2, vec!["b".into()]);
+        assert!(
+            !newly2.contains(&"b".to_string()),
+            "a second watcher of b must NOT re-report b as newly_watched"
+        );
+
+        // Unwatching one of the two watchers leaves a watcher behind (2→1): no 1→0 edge.
+        let dropped1 = r.unwatch("app", &sock1);
+        assert!(
+            !dropped1.contains(&"b".to_string()),
+            "b still has a watcher → must NOT report b as emptied"
+        );
+
+        // Unwatching the LAST watcher of "b" empties the set (1→0): "b" is reported.
+        let dropped2 = r.unwatch("app", &sock2);
+        assert!(
+            dropped2.contains(&"b".to_string()),
+            "the last watcher of b leaving must report b as emptied"
+        );
+        assert!(r.watchers_of("app", "b").is_empty());
     }
 }
