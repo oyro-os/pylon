@@ -606,8 +606,8 @@ impl Adapter for RedisAdapter {
     }
 
     async fn channel(&self, app: &str, channel: &str) -> ChannelSummary {
-        // `HLEN occ` is the authoritative cluster-wide subscription count; the
-        // presence roster (`user_count`) stays node-local in SP7a.
+        // `HLEN occ` is the authoritative cluster-wide subscription count; for
+        // presence channels `user_count` is the cluster `HLEN presusers` (SP7b).
         let count: Result<i64, _> = self
             .clients
             .pool
