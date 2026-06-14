@@ -1,0 +1,31 @@
+[package]
+name = "pylon-load"
+version = "0.1.0"
+edition = "2021"
+description = "Pusher-protocol load-test harness for pylon"
+publish = false
+
+[[bin]]
+name = "pylon-load"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "time", "signal"] }
+tokio-tungstenite = "0.24"
+futures-util = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+hmac = "0.12"
+sha2 = "0.10"
+md-5 = "0.10"
+hex = "0.4"
+hdrhistogram = "7"
+clap = { version = "4", features = ["derive"] }
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+# Spawn a real pylon server in-process for the smoke test.
+pylon = { path = ".." }
