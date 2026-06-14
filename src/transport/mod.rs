@@ -6,7 +6,9 @@
 //! caller-owned [`bytes::BytesMut`] that grows lazily, and parsed payloads are
 //! cheap `Bytes` slices into that buffer.
 //!
-//! Only [`frame`] is implemented in this phase; the connection state machine
-//! that drives it is built in later SP9 phases.
+//! [`frame`] is the RFC 6455 codec; [`conn`] is the per-connection state +
+//! non-blocking read/write that the worker event loop drives. The event loop
+//! itself is built in later SP9 tasks.
 
+pub mod conn;
 pub mod frame;
