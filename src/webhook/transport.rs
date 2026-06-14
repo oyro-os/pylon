@@ -2,8 +2,11 @@
 //! `WebhookTransport` trait, and its `HttpTransport` / `RecordingTransport` impls.
 
 use crate::auth::signature::hmac_sha256_hex;
+use async_trait::async_trait;
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
+use std::sync::Arc;
+use tokio::sync::Mutex;
 
 /// One fully-prepared POST: the raw signed body bytes plus the exact header set.
 #[derive(Debug, Clone, PartialEq)]
@@ -40,6 +43,38 @@ pub fn build_signed_delivery(
         url: url.to_string(),
         body,
         headers,
+    }
+}
+
+/// The pluggable delivery boundary. `HttpTransport` POSTs; `RecordingTransport`
+/// records for tests. `deliver` owns retry/concurrency policy internally and
+/// never returns an error to the dispatcher (failures are logged-and-dropped).
+#[async_trait]
+pub trait WebhookTransport: Send + Sync {
+    async fn deliver(&self, delivery: WebhookDelivery);
+}
+
+/// Test double: records every delivery handed to it; performs no I/O.
+#[derive(Clone, Default)]
+pub struct RecordingTransport {
+    deliveries: Arc<Mutex<Vec<WebhookDelivery>>>,
+}
+
+impl RecordingTransport {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Snapshot of everything delivered so far.
+    pub async fn recorded(&self) -> Vec<WebhookDelivery> {
+        self.deliveries.lock().await.clone()
+    }
+}
+
+#[async_trait]
+impl WebhookTransport for RecordingTransport {
+    async fn deliver(&self, delivery: WebhookDelivery) {
+        self.deliveries.lock().await.push(delivery);
     }
 }
 
@@ -94,6 +129,23 @@ mod tests {
         assert_eq!(d.headers["Content-Type"], "application/json");
         assert_eq!(d.headers["X-Pusher-Key"], "the-key");
         assert!(d.headers.contains_key("X-Pusher-Signature"));
+    }
+
+    #[tokio::test]
+    async fn recording_transport_records_each_delivery() {
+        let t = RecordingTransport::new();
+        let d = build_signed_delivery(
+            "https://e.test/wh",
+            "k",
+            "s",
+            1,
+            &events(),
+            &BTreeMap::new(),
+        );
+        t.deliver(d.clone()).await;
+        let recorded = t.recorded().await;
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(recorded[0], d);
     }
 
     #[test]
