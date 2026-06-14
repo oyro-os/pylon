@@ -1,7 +1,43 @@
 use super::*;
 use crate::adapter::local::LocalAdapter;
 use crate::channel::registry::Registry;
+use pylon_dispatcher_helpers::*;
 use tokio::sync::mpsc;
+
+mod pylon_dispatcher_helpers {
+    use crate::app::{App, AppManager};
+    use crate::webhook::dispatcher::FixedClock;
+    use crate::webhook::transport::RecordingTransport;
+    use crate::webhook::{spawn, WebhookHandle};
+    use async_trait::async_trait;
+    use std::sync::Arc;
+
+    pub struct OneApp(pub App);
+    #[async_trait]
+    impl AppManager for OneApp {
+        async fn by_key(&self, key: &str) -> Option<App> {
+            (self.0.key == key).then(|| self.0.clone())
+        }
+        async fn by_id(&self, id: &str) -> Option<App> {
+            (self.0.id == id).then(|| self.0.clone())
+        }
+    }
+
+    /// Build a webhook handle whose dispatcher records deliveries, returning the
+    /// recorder so the test can assert. `batch_ms` is small for fast windows.
+    pub fn recording_webhooks(app: App, batch_ms: u64) -> (WebhookHandle, Arc<RecordingTransport>) {
+        let recorder = Arc::new(RecordingTransport::new());
+        let apps: Arc<dyn AppManager> = Arc::new(OneApp(app));
+        let handle = spawn(
+            apps,
+            recorder.clone(),
+            Arc::new(FixedClock(1700000000000)),
+            batch_ms,
+            1024,
+        );
+        (handle, recorder)
+    }
+}
 
 fn app(sub_count: bool) -> App {
     serde_json::from_value::<App>(serde_json::json!({
@@ -668,4 +704,121 @@ async fn arbitrary_hash_channel_subscribe_errors() {
         rx.try_recv(),
         Ok(ServerEvent::SubscriptionError { .. })
     ));
+}
+
+#[tokio::test]
+async fn subscribe_emits_channel_occupied_then_close_emits_vacated() {
+    // App with occupied+vacated webhooks on one endpoint.
+    let mut app = serde_json::from_value::<App>(serde_json::json!({
+        "name": "t", "id": "app", "key": "app-key", "secret": "app-secret",
+        "webhooks": [{ "url": "https://e.test/wh",
+            "event_types": ["channel_occupied","channel_vacated"] }]
+    }))
+    .unwrap();
+    app.recompute_has_flags();
+
+    let (webhooks, recorder) = recording_webhooks(app.clone(), 30);
+    let adapter: std::sync::Arc<dyn crate::adapter::Adapter> =
+        std::sync::Arc::new(crate::adapter::local::LocalAdapter::new(
+            std::sync::Arc::new(crate::channel::registry::Registry::new()),
+        ));
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut c = crate::ws::handler::ConnectionContext {
+        app,
+        socket_id: crate::protocol::socket_id::SocketId::from_raw("1.1"),
+        self_tx: tx,
+        adapter,
+        limits: crate::server::config::ServerConfig::default().limits(),
+        subscribed: std::collections::HashSet::new(),
+        user: None,
+        webhooks,
+        presence_membership: std::collections::HashMap::new(),
+    };
+
+    // Subscribe to a public channel → occupied.
+    c.dispatch(crate::protocol::command::ClientCommand::Subscribe {
+        channel: "my-channel".into(),
+        auth: None,
+        channel_data: None,
+    })
+    .await;
+    // Let the occupied window (30ms) close and flush BEFORE the vacated trigger,
+    // so the two transitions land in SEPARATE batches and don't coalesce away.
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    // Close → unsubscribes all → vacated.
+    c.on_close().await;
+
+    // Wait out the vacated window + a margin.
+    tokio::time::sleep(std::time::Duration::from_millis(120)).await;
+
+    let recorded = recorder.recorded().await;
+    // occupied (subscribe window) then vacated (close window). To assert a clean
+    // separation we collect all event names across deliveries:
+    let names: Vec<String> = recorded
+        .iter()
+        .flat_map(|d| {
+            let env: serde_json::Value = serde_json::from_str(&d.body).unwrap();
+            env["events"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|e| e["name"].as_str().unwrap().to_string())
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    assert!(
+        names.contains(&"channel_occupied".to_string()),
+        "got {names:?}"
+    );
+    assert!(
+        names.contains(&"channel_vacated".to_string()),
+        "got {names:?}"
+    );
+}
+
+#[tokio::test]
+async fn rapid_subscribe_unsubscribe_in_window_emits_nothing() {
+    let mut app = serde_json::from_value::<App>(serde_json::json!({
+        "name": "t", "id": "app", "key": "app-key", "secret": "app-secret",
+        "webhooks": [{ "url": "https://e.test/wh",
+            "event_types": ["channel_occupied","channel_vacated"] }]
+    }))
+    .unwrap();
+    app.recompute_has_flags();
+
+    // Large window so subscribe+unsubscribe land in the SAME batch → coalesce → empty.
+    let (webhooks, recorder) = recording_webhooks(app.clone(), 200);
+    let adapter: std::sync::Arc<dyn crate::adapter::Adapter> =
+        std::sync::Arc::new(crate::adapter::local::LocalAdapter::new(
+            std::sync::Arc::new(crate::channel::registry::Registry::new()),
+        ));
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut c = crate::ws::handler::ConnectionContext {
+        app,
+        socket_id: crate::protocol::socket_id::SocketId::from_raw("1.1"),
+        self_tx: tx,
+        adapter,
+        limits: crate::server::config::ServerConfig::default().limits(),
+        subscribed: std::collections::HashSet::new(),
+        user: None,
+        webhooks,
+        presence_membership: std::collections::HashMap::new(),
+    };
+
+    c.dispatch(crate::protocol::command::ClientCommand::Subscribe {
+        channel: "my-channel".into(),
+        auth: None,
+        channel_data: None,
+    })
+    .await;
+    c.dispatch(crate::protocol::command::ClientCommand::Unsubscribe {
+        channel: "my-channel".into(),
+    })
+    .await;
+
+    tokio::time::sleep(std::time::Duration::from_millis(260)).await;
+    assert!(
+        recorder.recorded().await.is_empty(),
+        "occupied+vacated in one window must coalesce to no delivery"
+    );
 }

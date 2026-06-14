@@ -51,6 +51,7 @@ impl ConnectionContext {
                 });
                 self.maybe_emit_count(&channel, out.subscription_count)
                     .await;
+                self.emit_occupied_if_edge(&channel, out.occupied);
             }
             // Encrypted channels authenticate exactly like private channels
             // (HMAC over `socket_id:channel`, no channel_data) — pure relay.
@@ -87,6 +88,7 @@ impl ConnectionContext {
                 });
                 self.maybe_emit_count(&channel, out.subscription_count)
                     .await;
+                self.emit_occupied_if_edge(&channel, out.occupied);
             }
             AuthKind::Presence => {
                 let token = match auth.as_deref() {
@@ -157,6 +159,7 @@ impl ConnectionContext {
                     .adapter
                     .subscribe(&self.app.id, &channel, self.handle(), Some(member))
                     .await;
+                let occupied = out.occupied;
                 if let Some(join) = out.presence {
                     self.subscribed.insert(channel.clone());
                     self.send_self(ServerEvent::SubscriptionSucceeded {
@@ -180,6 +183,7 @@ impl ConnectionContext {
                 }
                 self.maybe_emit_count(&channel, out.subscription_count)
                     .await;
+                self.emit_occupied_if_edge(&channel, occupied);
             }
         }
 
@@ -196,6 +200,17 @@ impl ConnectionContext {
                 None => ServerEvent::CacheMiss { channel },
             };
             self.send_self(event);
+        }
+    }
+
+    /// Emit `channel_occupied` if this subscribe was the 0→1 edge and the app
+    /// wants it. Called once per successful subscribe.
+    pub(in crate::ws) fn emit_occupied_if_edge(&self, channel: &str, occupied: bool) {
+        if occupied && self.app.has_channel_occupied_webhooks {
+            self.emit_webhook(crate::webhook::event::WebhookEvent::ChannelOccupied {
+                app: self.app.id.clone(),
+                channel: channel.to_string(),
+            });
         }
     }
 

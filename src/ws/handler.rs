@@ -35,6 +35,11 @@ impl ConnectionContext {
         let _ = self.self_tx.send(event);
     }
 
+    /// Enqueue a webhook trigger (non-blocking; dropped if the mailbox is full).
+    pub(in crate::ws) fn emit_webhook(&self, event: crate::webhook::event::WebhookEvent) {
+        self.webhooks.enqueue(event);
+    }
+
     /// Push a one-change `watchlist_events` frame to every connection watching `user_id`.
     pub(in crate::ws) async fn notify_watchers(&self, user_id: &str, name: &str) {
         let watchers = self.adapter.watchers_of(&self.app.id, user_id).await;
@@ -91,6 +96,12 @@ impl ConnectionContext {
                         )
                         .await;
                 }
+            }
+            if out.vacated && self.app.has_channel_vacated_webhooks {
+                self.emit_webhook(crate::webhook::event::WebhookEvent::ChannelVacated {
+                    app: self.app.id.clone(),
+                    channel: channel.clone(),
+                });
             }
             self.maybe_emit_count(&channel, out.subscription_count)
                 .await;
