@@ -17,8 +17,11 @@ async fn main() -> anyhow::Result<()> {
     pylon::init_tracing();
     let config = ServerConfig::from_env();
     let apps: Arc<dyn AppManager> = Arc::new(StaticFileAppManager::from_file(&config.apps_path)?);
-    let registry = Arc::new(Registry::new());
-    let adapter: Arc<dyn Adapter> = Arc::new(LocalAdapter::new(registry));
+    let adapter: Arc<dyn Adapter> = if config.adapter == "redis" {
+        Arc::new(pylon::adapter::redis::RedisAdapter::new(&config).await?)
+    } else {
+        Arc::new(LocalAdapter::new(Arc::new(Registry::new())))
+    };
 
     // Webhook dispatcher: real HTTP transport (reqwest+rustls), system clock.
     let transport: Arc<dyn WebhookTransport> = Arc::new(HttpTransport::new(
