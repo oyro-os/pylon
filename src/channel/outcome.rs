@@ -8,6 +8,8 @@ use crate::protocol::event::PresencePayload;
 pub struct SubscribeOutcome {
     pub subscription_count: usize,
     pub presence: Option<PresenceJoin>,
+    /// True iff this subscribe took the channel from 0 → 1 subscribers.
+    pub occupied: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -21,6 +23,8 @@ pub struct PresenceJoin {
 pub struct UnsubscribeOutcome {
     pub subscription_count: usize,
     pub presence: Option<PresenceLeave>,
+    /// True iff this unsubscribe took the channel from 1 → 0 subscribers.
+    pub vacated: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]

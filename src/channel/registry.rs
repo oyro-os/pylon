@@ -28,10 +28,13 @@ impl Registry {
     ) -> SubscribeOutcome {
         let key = (app.to_string(), channel.to_string());
         let mut state = self.channels.entry(key).or_default();
+        let was_empty = state.subscription_count() == 0;
         let presence = state.add(handle, member);
+        let count = state.subscription_count();
         SubscribeOutcome {
-            subscription_count: state.subscription_count(),
+            subscription_count: count,
             presence,
+            occupied: was_empty && count == 1,
         }
     }
 
@@ -55,6 +58,7 @@ impl Registry {
         UnsubscribeOutcome {
             subscription_count: count,
             presence,
+            vacated: now_empty,
         }
     }
 
@@ -158,6 +162,39 @@ mod tests {
             0,
             "empty channel entry must be pruned"
         );
+    }
+
+    #[test]
+    fn first_subscriber_sets_occupied_true_then_false() {
+        let reg = Registry::new();
+        let (h1, _r1) = handle();
+        let (h2, _r2) = handle();
+        // 0 -> 1 : occupied
+        assert!(reg.subscribe("app", "c", h1, None).occupied);
+        // 1 -> 2 : NOT an occupancy edge
+        assert!(!reg.subscribe("app", "c", h2, None).occupied);
+    }
+
+    #[test]
+    fn last_unsubscribe_sets_vacated_true_only_on_zero() {
+        let reg = Registry::new();
+        let (h1, _r1) = handle();
+        let (h2, _r2) = handle();
+        let s1 = h1.socket_id.clone();
+        let s2 = h2.socket_id.clone();
+        reg.subscribe("app", "c", h1, None);
+        reg.subscribe("app", "c", h2, None);
+        // 2 -> 1 : not vacated
+        assert!(!reg.unsubscribe("app", "c", &s1).vacated);
+        // 1 -> 0 : vacated
+        assert!(reg.unsubscribe("app", "c", &s2).vacated);
+    }
+
+    #[test]
+    fn unsubscribe_unknown_channel_is_not_vacated() {
+        let reg = Registry::new();
+        let sid = SocketId::generate();
+        assert!(!reg.unsubscribe("app", "missing", &sid).vacated);
     }
 
     #[test]
