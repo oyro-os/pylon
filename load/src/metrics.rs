@@ -17,7 +17,7 @@ impl Default for Latency {
 impl Latency {
     pub fn record_nanos(&self, nanos: u64) {
         let mut h = self.hist.lock().unwrap();
-        let _ = h.saturating_record(nanos);
+        h.saturating_record(nanos);
     }
     /// (count, p50_us, p99_us, p999_us, max_us)
     pub fn summary_us(&self) -> (u64, u64, u64, u64, u64) {
@@ -70,4 +70,69 @@ mod tests {
         Counters::inc(&c.received);
         assert_eq!(c.received.load(Ordering::Relaxed), 2);
     }
+}
+
+/// Parse VmRSS (kB) from the contents of /proc/<pid>/status.
+pub fn parse_rss_kb(status: &str) -> Option<u64> {
+    for line in status.lines() {
+        if let Some(rest) = line.strip_prefix("VmRSS:") {
+            return rest.split_whitespace().next()?.parse().ok();
+        }
+    }
+    None
+}
+
+/// Parse (utime, stime) clock ticks from the contents of /proc/<pid>/stat.
+/// The comm field is in parens and may contain spaces/parens; everything after the
+/// last ')' is space-delimited. After comm: index 0 = state; utime = index 11, stime = 12.
+pub fn parse_cpu_ticks(stat: &str) -> Option<(u64, u64)> {
+    let close = stat.rfind(')')?;
+    let rest = &stat[close + 2..];
+    let f: Vec<&str> = rest.split_whitespace().collect();
+    let utime = f.get(11)?.parse().ok()?;
+    let stime = f.get(12)?.parse().ok()?;
+    Some((utime, stime))
+}
+
+#[cfg(test)]
+mod proc_tests {
+    use super::*;
+
+    #[test]
+    fn rss_parse() {
+        let s = "Name:\tpylon\nVmRSS:\t  123456 kB\nThreads:\t8\n";
+        assert_eq!(parse_rss_kb(s), Some(123456));
+    }
+
+    #[test]
+    fn cpu_parse_handles_parens_in_comm() {
+        let stat = "1234 (py lon) S 1 1234 1234 0 -1 0 0 0 0 0 100 250 0 0 20 0 8 0 99 0";
+        assert_eq!(parse_cpu_ticks(stat), Some((100, 250)));
+    }
+}
+
+use std::time::Duration;
+
+/// Sample a server process's peak RSS (MB) and mean CPU% over `dur`, polling every 250ms.
+/// Returns (peak_rss_mb, mean_cpu_percent). Reads /proc/<pid>/{status,stat}.
+pub async fn sample_proc(pid: u32, dur: Duration) -> Option<(u64, f64)> {
+    let ticks_per_sec = 100.0; // USER_HZ on Linux x86_64
+    let read = |p: &str| std::fs::read_to_string(format!("/proc/{pid}/{p}")).ok();
+    let (mut u0, mut s0) = parse_cpu_ticks(&read("stat")?)?;
+    let mut peak_rss = 0u64;
+    let steps = (dur.as_millis() / 250).max(1);
+    let mut total_cpu = 0.0;
+    for _ in 0..steps {
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        if let Some(rss) = read("status").and_then(|s| parse_rss_kb(&s)) {
+            peak_rss = peak_rss.max(rss / 1024);
+        }
+        if let Some((u1, s1)) = read("stat").and_then(|s| parse_cpu_ticks(&s)) {
+            let dticks = (u1 + s1).saturating_sub(u0 + s0) as f64;
+            total_cpu += dticks / ticks_per_sec / 0.250 * 100.0;
+            u0 = u1;
+            s0 = s1;
+        }
+    }
+    Some((peak_rss, total_cpu / steps as f64))
 }
