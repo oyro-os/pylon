@@ -37,6 +37,17 @@ pub struct ServerConfig {
     pub max_client_events_per_second: u32,
     pub max_presence_user_id_length: usize,
     pub max_presence_user_info_bytes: usize,
+    // adapter + redis scaling tunables
+    pub adapter: String,
+    pub redis_url: String,
+    pub redis_prefix: String,
+    pub redis_pool_size: u32,
+    pub redis_membership_ttl_secs: u64,
+    pub redis_presence_heartbeat_secs: u64,
+    pub redis_node_heartbeat_secs: u64,
+    pub redis_sweep_interval_secs: u64,
+    pub webhook_vacated_grace_ms: u64,
+    pub redis_sharded_pubsub: bool,
 }
 
 impl Default for ServerConfig {
@@ -65,6 +76,16 @@ impl Default for ServerConfig {
             max_client_events_per_second: 10,
             max_presence_user_id_length: 128,
             max_presence_user_info_bytes: 1024,
+            adapter: "local".into(),
+            redis_url: "redis://127.0.0.1:6379".into(),
+            redis_prefix: "pylon".into(),
+            redis_pool_size: 6,
+            redis_membership_ttl_secs: 60,
+            redis_presence_heartbeat_secs: 25,
+            redis_node_heartbeat_secs: 5,
+            redis_sweep_interval_secs: 10,
+            webhook_vacated_grace_ms: 3000,
+            redis_sharded_pubsub: false,
         }
     }
 }
@@ -181,6 +202,48 @@ impl ServerConfig {
                 c.max_presence_user_info_bytes = p;
             }
         }
+        if let Ok(v) = std::env::var("PYLON_ADAPTER") {
+            c.adapter = v;
+        }
+        if let Ok(v) = std::env::var("PYLON_REDIS_URL") {
+            c.redis_url = v;
+        }
+        if let Ok(v) = std::env::var("PYLON_REDIS_PREFIX") {
+            c.redis_prefix = v;
+        }
+        if let Ok(v) = std::env::var("PYLON_REDIS_POOL_SIZE") {
+            if let Ok(p) = v.parse() {
+                c.redis_pool_size = p;
+            }
+        }
+        if let Ok(v) = std::env::var("PYLON_REDIS_MEMBERSHIP_TTL") {
+            if let Ok(p) = v.parse() {
+                c.redis_membership_ttl_secs = p;
+            }
+        }
+        if let Ok(v) = std::env::var("PYLON_REDIS_PRESENCE_HEARTBEAT") {
+            if let Ok(p) = v.parse() {
+                c.redis_presence_heartbeat_secs = p;
+            }
+        }
+        if let Ok(v) = std::env::var("PYLON_REDIS_NODE_HEARTBEAT") {
+            if let Ok(p) = v.parse() {
+                c.redis_node_heartbeat_secs = p;
+            }
+        }
+        if let Ok(v) = std::env::var("PYLON_REDIS_SWEEP_INTERVAL") {
+            if let Ok(p) = v.parse() {
+                c.redis_sweep_interval_secs = p;
+            }
+        }
+        if let Ok(v) = std::env::var("PYLON_WEBHOOK_VACATED_GRACE_MS") {
+            if let Ok(p) = v.parse() {
+                c.webhook_vacated_grace_ms = p;
+            }
+        }
+        if let Ok(v) = std::env::var("PYLON_REDIS_SHARDED_PUBSUB") {
+            c.redis_sharded_pubsub = v == "1" || v.eq_ignore_ascii_case("true");
+        }
         c
     }
 
@@ -227,6 +290,52 @@ mod tests {
         assert_eq!(c.webhook_max_retries, 3);
         assert_eq!(c.webhook_retry_base_ms, 100);
         assert_eq!(c.webhook_max_concurrency, 100);
+        // adapter + redis tunables
+        assert_eq!(c.adapter, "local");
+        assert_eq!(c.redis_url, "redis://127.0.0.1:6379");
+        assert_eq!(c.redis_prefix, "pylon");
+        assert_eq!(c.redis_pool_size, 6);
+        assert_eq!(c.redis_membership_ttl_secs, 60);
+        assert_eq!(c.redis_presence_heartbeat_secs, 25);
+        assert_eq!(c.redis_node_heartbeat_secs, 5);
+        assert_eq!(c.redis_sweep_interval_secs, 10);
+        assert_eq!(c.webhook_vacated_grace_ms, 3000);
+        assert!(!c.redis_sharded_pubsub);
+    }
+
+    #[test]
+    fn redis_env_overrides_apply() {
+        std::env::set_var("PYLON_ADAPTER", "redis");
+        std::env::set_var("PYLON_REDIS_URL", "redis://10.0.0.1:6379");
+        std::env::set_var("PYLON_REDIS_PREFIX", "mypylon");
+        std::env::set_var("PYLON_REDIS_POOL_SIZE", "12");
+        std::env::set_var("PYLON_REDIS_MEMBERSHIP_TTL", "120");
+        std::env::set_var("PYLON_REDIS_PRESENCE_HEARTBEAT", "50");
+        std::env::set_var("PYLON_REDIS_NODE_HEARTBEAT", "10");
+        std::env::set_var("PYLON_REDIS_SWEEP_INTERVAL", "20");
+        std::env::set_var("PYLON_WEBHOOK_VACATED_GRACE_MS", "5000");
+        std::env::set_var("PYLON_REDIS_SHARDED_PUBSUB", "true");
+        let c = ServerConfig::from_env();
+        assert_eq!(c.adapter, "redis");
+        assert_eq!(c.redis_url, "redis://10.0.0.1:6379");
+        assert_eq!(c.redis_prefix, "mypylon");
+        assert_eq!(c.redis_pool_size, 12);
+        assert_eq!(c.redis_membership_ttl_secs, 120);
+        assert_eq!(c.redis_presence_heartbeat_secs, 50);
+        assert_eq!(c.redis_node_heartbeat_secs, 10);
+        assert_eq!(c.redis_sweep_interval_secs, 20);
+        assert_eq!(c.webhook_vacated_grace_ms, 5000);
+        assert!(c.redis_sharded_pubsub);
+        std::env::remove_var("PYLON_ADAPTER");
+        std::env::remove_var("PYLON_REDIS_URL");
+        std::env::remove_var("PYLON_REDIS_PREFIX");
+        std::env::remove_var("PYLON_REDIS_POOL_SIZE");
+        std::env::remove_var("PYLON_REDIS_MEMBERSHIP_TTL");
+        std::env::remove_var("PYLON_REDIS_PRESENCE_HEARTBEAT");
+        std::env::remove_var("PYLON_REDIS_NODE_HEARTBEAT");
+        std::env::remove_var("PYLON_REDIS_SWEEP_INTERVAL");
+        std::env::remove_var("PYLON_WEBHOOK_VACATED_GRACE_MS");
+        std::env::remove_var("PYLON_REDIS_SHARDED_PUBSUB");
     }
 
     #[test]

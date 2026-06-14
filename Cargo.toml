@@ -31,6 +31,9 @@ futures-util = "0.3"
 thiserror = "1"
 # Outbound HTTP for webhook delivery. rustls (no OpenSSL system dep) to reach https endpoints.
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+# Redis client for the scaling adapter
+fred = { version = "10", default-features = false, features = ["subscriber-client", "i-pubsub", "i-scripts", "i-std", "sha-1", "enable-rustls"] }
+uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
 # Enables paused-time control (`start_paused`, `tokio::time::advance`) in tests.
