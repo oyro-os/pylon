@@ -1,14 +1,18 @@
 use super::{App, AppManager};
 
+#[derive(Debug)]
 pub struct StaticFileAppManager {
     apps: Vec<App>,
 }
 
 impl StaticFileAppManager {
     pub fn from_json(raw: &str) -> anyhow::Result<Self> {
-        Ok(Self {
-            apps: serde_json::from_str(raw)?,
-        })
+        let mut apps: Vec<App> = serde_json::from_str(raw)?;
+        for app in &mut apps {
+            app.recompute_has_flags();
+            app.validate().map_err(|e| anyhow::anyhow!(e))?;
+        }
+        Ok(Self { apps })
     }
     pub fn from_file(path: &str) -> anyhow::Result<Self> {
         Self::from_json(&std::fs::read_to_string(path)?)
@@ -43,5 +47,28 @@ mod tests {
         assert!(app.subscription_count_enabled);
         assert!(m.by_id("app-id").await.is_some());
         assert!(m.by_key("nope").await.is_none());
+    }
+
+    #[test]
+    fn rejects_app_with_unknown_webhook_event_type() {
+        let raw = r#"[
+            {"name":"X","id":"a","key":"k","secret":"s",
+             "webhooks":[{"url":"https://e.test","event_types":["nope"]}]}
+        ]"#;
+        let err = StaticFileAppManager::from_json(raw)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("unknown event_type 'nope'"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn loads_app_with_valid_webhooks_and_flags() {
+        let raw = r#"[
+            {"name":"X","id":"a","key":"k","secret":"s",
+             "webhooks":[{"url":"https://e.test","event_types":["channel_occupied"]}]}
+        ]"#;
+        let m = StaticFileAppManager::from_json(raw).unwrap();
+        let app = m.by_id("a").await.unwrap();
+        assert!(app.has_channel_occupied_webhooks);
     }
 }
