@@ -4,3 +4,4 @@
 //! `WebhookDispatcher` (actor: window + coalesce + sign) → `WebhookTransport`.
 
 pub mod event;
+pub mod transport;
