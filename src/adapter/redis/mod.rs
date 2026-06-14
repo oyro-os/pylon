@@ -831,11 +831,37 @@ impl Adapter for RedisAdapter {
     }
 
     async fn send_to_user(&self, app: &str, user_id: &str, event: ServerEvent) {
-        self.local.send_to_user(app, user_id, event).await
+        // Deliver to this node's local connections of the user, then fan the
+        // pre-encoded frame out to every other node holding a connection of the user.
+        self.local.send_to_user(app, user_id, event.clone()).await;
+        let frame = crate::protocol::v7::frames::encode(&event);
+        user::publish(
+            &self.clients.pool,
+            &self.keys.usermsg(app, user_id),
+            &self.node_id,
+            app,
+            user_id,
+            envelope::EnvelopeKind::UserSend,
+            serde_json::Value::String(frame),
+        )
+        .await;
     }
 
     async fn terminate_user(&self, app: &str, user_id: &str) -> Vec<SocketId> {
-        self.local.terminate_user(app, user_id).await
+        // Terminate this node's local connections (returns their ids), then fan a
+        // terminate control out to every other node holding a connection of the user.
+        let ids = self.local.terminate_user(app, user_id).await;
+        user::publish(
+            &self.clients.pool,
+            &self.keys.usermsg(app, user_id),
+            &self.node_id,
+            app,
+            user_id,
+            envelope::EnvelopeKind::UserTerminate,
+            serde_json::Value::Null,
+        )
+        .await;
+        ids
     }
 
     async fn watch(

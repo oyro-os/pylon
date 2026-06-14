@@ -1145,3 +1145,101 @@ async fn cross_node_user_online_offline_single_emit() {
     .await
     .expect("cross-node user online/offline test must not hang (Redis up?)");
 }
+
+/// Build a fake `ConnectionHandle` whose mailbox receiver is RETURNED so a test can
+/// assert what was delivered to it (the cross-node user-delivery tests need this).
+fn recording_handle() -> (
+    SocketId,
+    ConnectionHandle,
+    tokio::sync::mpsc::UnboundedReceiver<ServerEvent>,
+) {
+    let socket_id = SocketId::generate();
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let handle = ConnectionHandle {
+        socket_id: socket_id.clone(),
+        mailbox: tx,
+    };
+    (socket_id, handle, rx)
+}
+
+/// B1: `send_to_user` from one node reaches the user's connection on ANOTHER node.
+/// The receiving node subscribes `usermsg(user)` when the user signs in locally; the
+/// originating node has no local connection of the user, so delivery is pure cross-node.
+#[tokio::test]
+async fn send_to_user_reaches_connection_on_another_node() {
+    let prefix = random_prefix();
+    let keys = Keys::new(&prefix);
+    let node_a = connect_adapter_with_prefix(&prefix).await;
+    let node_b = connect_adapter_with_prefix(&prefix).await;
+
+    // B holds u7's connection → B subscribes usermsg(u7).
+    let (_sid, handle_b, mut rx_b) = recording_handle();
+    node_b.signin_user(TEST_APP, "u7", handle_b).await;
+    assert!(
+        await_tracked(
+            &node_b,
+            &keys.usermsg(TEST_APP, "u7"),
+            Duration::from_secs(2)
+        )
+        .await,
+        "node B must subscribe usermsg(u7)"
+    );
+
+    // A (no local u7 connection) sends to u7 → must reach B's connection.
+    node_a
+        .send_to_user(
+            TEST_APP,
+            "u7",
+            ServerEvent::ChannelEvent {
+                channel: "x".into(),
+                event: "e".into(),
+                data: serde_json::json!({"k":1}),
+                user_id: None,
+            },
+        )
+        .await;
+
+    let got = with_timeout(async { rx_b.recv().await }).await;
+    match got {
+        Some(ServerEvent::Raw(frame)) => {
+            let v: serde_json::Value = serde_json::from_str(&frame).expect("raw frame is JSON");
+            assert_eq!(v["event"], "e", "cross-node send_to_user frame");
+        }
+        other => panic!("expected Raw frame on node B, got {other:?}"),
+    }
+}
+
+/// B1: `terminate_user` from one node closes the user's connection on ANOTHER node
+/// (4009 error frame then a 4009 Close).
+#[tokio::test]
+async fn terminate_user_closes_connection_on_another_node() {
+    let prefix = random_prefix();
+    let keys = Keys::new(&prefix);
+    let node_a = connect_adapter_with_prefix(&prefix).await;
+    let node_b = connect_adapter_with_prefix(&prefix).await;
+
+    let (_sid, handle_b, mut rx_b) = recording_handle();
+    node_b.signin_user(TEST_APP, "u8", handle_b).await;
+    assert!(
+        await_tracked(
+            &node_b,
+            &keys.usermsg(TEST_APP, "u8"),
+            Duration::from_secs(2)
+        )
+        .await,
+        "node B must subscribe usermsg(u8)"
+    );
+
+    node_a.terminate_user(TEST_APP, "u8").await;
+
+    let first = with_timeout(async { rx_b.recv().await }).await;
+    assert!(
+        matches!(first, Some(ServerEvent::Error(ref e)) if e.code == 4009),
+        "expected 4009 error frame on node B, got {first:?}"
+    );
+    let second = with_timeout(async { rx_b.recv().await }).await;
+    assert!(
+        matches!(second, Some(ServerEvent::Close { code: 4009, .. })),
+        "expected 4009 Close on node B, got {second:?}"
+    );
+}
