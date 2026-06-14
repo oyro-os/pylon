@@ -2,7 +2,6 @@
 
 use super::handler::ConnectionContext;
 use crate::channel::kind::{validate_channel_name, AuthKind, ChannelInfo, SERVER_TO_USER_PREFIX};
-use crate::protocol::error::PusherError;
 use crate::protocol::event::ServerEvent;
 use serde_json::Value;
 
@@ -285,10 +284,11 @@ impl ConnectionContext {
 
     pub(in crate::ws) async fn client_event(&self, event: String, channel: String, data: Value) {
         if !self.app.client_messages_enabled {
-            self.send_self(ServerEvent::Error(PusherError::new(
-                4301,
-                "The app does not have client messaging enabled.",
-            )));
+            self.send_self(ServerEvent::ClientEventError {
+                channel,
+                code: 4301,
+                message: "The app does not have client messaging enabled.".into(),
+            });
             return;
         }
         // Client events are valid only on private/presence channels the sender joined.
@@ -307,9 +307,14 @@ impl ConnectionContext {
             );
             return;
         }
-        // Oversize client-event payloads are silently dropped.
+        // Oversize client-event payloads return pusher:error 4301 (soketi parity).
         if serde_json::to_string(&data).map_or(0, |s| s.len()) > self.limits.max_event_payload_bytes
         {
+            self.send_self(ServerEvent::ClientEventError {
+                channel,
+                code: 4301,
+                message: "Client event rejected - the data is too large".into(),
+            });
             return;
         }
         // Capture clones for the webhook before the broadcast moves `event`/`data`.

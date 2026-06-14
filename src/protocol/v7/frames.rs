@@ -92,6 +92,14 @@ pub fn encode(event: &ServerEvent) -> String {
             json!({ "event": "pusher_internal:watchlist_events", "data": { "events": events } })
                 .to_string()
         }
+        ServerEvent::ClientEventError {
+            channel,
+            code,
+            message,
+        } => {
+            json!({ "event": "pusher:error", "channel": channel, "data": { "code": code, "message": message } })
+                .to_string()
+        }
         // Control frame — the connection task intercepts `Close` before encoding,
         // so this arm is unreachable in practice; present only for exhaustiveness.
         ServerEvent::Close { .. } => String::new(),
@@ -393,6 +401,21 @@ mod tests {
         assert!(out["data"].is_object());
         assert_eq!(out["data"]["events"][0]["name"], "online");
         assert_eq!(out["data"]["events"][0]["user_ids"][0], "7");
+    }
+
+    #[test]
+    fn client_event_error_carries_channel_at_top_level() {
+        // P11: pusher:error for client-event rejections must include `channel`.
+        let out = parse(&encode(&ServerEvent::ClientEventError {
+            channel: "private-x".into(),
+            code: 4301,
+            message: "Client event rejected - the data is too large".into(),
+        }));
+        assert_eq!(out["event"], "pusher:error");
+        assert_eq!(out["channel"], "private-x", "channel must be at top level");
+        assert!(out["data"].is_object());
+        assert_eq!(out["data"]["code"], 4301);
+        assert!(!out["data"]["message"].as_str().unwrap_or("").is_empty());
     }
 
     #[test]

@@ -85,6 +85,14 @@ pub enum ServerEvent {
     WatchlistEvents {
         events: Vec<WatchlistChange>,
     },
+    /// `pusher:error` scoped to a channel (client-event rejections: 4301).
+    /// Unlike the connection-level `Error`, this carries the `channel` so the
+    /// wire frame matches soketi: `{ event, channel, data: { code, message } }`.
+    ClientEventError {
+        channel: String,
+        code: u16,
+        message: String,
+    },
     /// A control directive: write a WebSocket Close frame with this code/reason
     /// and end the connection. Intercepted by the connection task — never encoded
     /// to text. Used for fatal `4009` paths (bad signin, terminate).

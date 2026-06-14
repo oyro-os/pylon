@@ -317,8 +317,64 @@ async fn client_event_rejected_when_messaging_disabled() {
     })
     .await;
     match rx.try_recv() {
-        Ok(ServerEvent::Error(e)) => assert_eq!(e.code, 4301),
+        Ok(ServerEvent::ClientEventError { code, .. }) => assert_eq!(code, 4301),
         other => panic!("expected 4301, got {other:?}"),
+    }
+}
+
+// P11 — oversize payload → 4301 (was: silent drop) + channel on client-event errors
+
+#[tokio::test]
+async fn client_event_oversize_payload_returns_4301() {
+    // Subscribe to a private channel first (needs auth).
+    let (mut c, mut rx) = ctx(app_with_client_messages(true));
+    let sid = c.socket_id.as_str().to_string();
+    let sig = crate::auth::signature::channel_signature("s", &sid, "private-x", None);
+    c.dispatch(ClientCommand::Subscribe {
+        channel: "private-x".into(),
+        auth: Some(format!("k:{sig}")),
+        channel_data: None,
+    })
+    .await;
+    let _ = rx.try_recv(); // drain subscription_succeeded
+
+    // Build a payload that exceeds the default max_event_payload_bytes (10 KiB = 10240 bytes).
+    let big_data = serde_json::json!({ "x": "a".repeat(11_000) });
+    c.dispatch(ClientCommand::ClientEvent {
+        event: "client-x".into(),
+        channel: "private-x".into(),
+        data: big_data,
+    })
+    .await;
+    // Must receive pusher:error 4301 (was: silence)
+    match rx.try_recv() {
+        Ok(ServerEvent::ClientEventError { code, channel, .. }) => {
+            assert_eq!(code, 4301, "oversize payload must return 4301");
+            assert_eq!(channel, "private-x", "error frame must carry the channel");
+        }
+        other => panic!("expected ClientEventError 4301, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn client_event_messaging_disabled_error_carries_channel() {
+    // The 4301 for messaging-disabled must carry the `channel` field (soketi parity).
+    let (mut c, mut rx) = ctx(app_with_client_messages(false));
+    c.dispatch(ClientCommand::ClientEvent {
+        event: "client-x".into(),
+        channel: "private-x".into(),
+        data: serde_json::json!({}),
+    })
+    .await;
+    match rx.try_recv() {
+        Ok(ServerEvent::ClientEventError { code, channel, .. }) => {
+            assert_eq!(code, 4301);
+            assert_eq!(
+                channel, "private-x",
+                "messaging-disabled 4301 must carry channel"
+            );
+        }
+        other => panic!("expected ClientEventError with channel, got {other:?}"),
     }
 }
 
