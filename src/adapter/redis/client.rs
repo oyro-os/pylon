@@ -82,6 +82,30 @@ if count <= 0 then redis.call('DEL', KEYS[1]); redis.call('SREM', KEYS[2], ARGV[
 return count
 "#;
 
+/// PRESENCE_JOIN. Records this connection's member, bumps the user's cluster-wide
+/// connection refcount, and on the 0→1 user edge stores the user_info for the roster.
+/// Returns the new refcount (== 1 means first_for_user → emit member_added).
+/// KEYS[1]=presusers KEYS[2]=presinfo KEYS[3]=presmembers
+/// ARGV[1]=user_id ARGV[2]=user_info ARGV[3]=member_token
+const PRESENCE_JOIN_LUA: &str = r#"
+redis.call('HSET', KEYS[3], ARGV[3], ARGV[1])
+local conn = redis.call('HINCRBY', KEYS[1], ARGV[1], 1)
+if conn == 1 then redis.call('HSET', KEYS[2], ARGV[1], ARGV[2]) end
+return conn
+"#;
+
+/// PRESENCE_LEAVE. Drops this connection's member and decrements the user's refcount;
+/// on the →0 user edge removes the user from presusers + presinfo. Returns the
+/// remaining refcount (== 0 means last_for_user → emit member_removed).
+/// KEYS[1]=presusers KEYS[2]=presinfo KEYS[3]=presmembers
+/// ARGV[1]=user_id ARGV[2]=member_token
+const PRESENCE_LEAVE_LUA: &str = r#"
+redis.call('HDEL', KEYS[3], ARGV[2])
+local conn = redis.call('HINCRBY', KEYS[1], ARGV[1], -1)
+if conn <= 0 then redis.call('HDEL', KEYS[1], ARGV[1]); redis.call('HDEL', KEYS[2], ARGV[1]) end
+return conn
+"#;
+
 /// The membership/presence Lua scripts, compiled (SHA-1 hashed) at adapter build
 /// time. `Script::from_lua` is purely local — no Redis round-trip — and the scripts
 /// are loaded lazily on first use via `evalsha_with_reload`'s NOSCRIPT fallback.
@@ -90,6 +114,10 @@ pub struct Scripts {
     pub subscribe: Script,
     /// Removes a member and returns the remaining cluster-wide subscription count.
     pub unsubscribe: Script,
+    /// Records a presence join and returns the user's new connection refcount.
+    pub presence_join: Script,
+    /// Records a presence leave and returns the user's remaining connection refcount.
+    pub presence_leave: Script,
 }
 
 impl Scripts {
@@ -98,6 +126,8 @@ impl Scripts {
         Self {
             subscribe: Script::from_lua(SUBSCRIBE_LUA),
             unsubscribe: Script::from_lua(UNSUBSCRIBE_LUA),
+            presence_join: Script::from_lua(PRESENCE_JOIN_LUA),
+            presence_leave: Script::from_lua(PRESENCE_LEAVE_LUA),
         }
     }
 }
@@ -105,5 +135,17 @@ impl Scripts {
 impl Default for Scripts {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn scripts_compile_including_presence() {
+        let s = Scripts::new();
+        assert_ne!(s.presence_join.sha1(), s.presence_leave.sha1());
+        assert_ne!(s.subscribe.sha1(), s.presence_join.sha1());
     }
 }

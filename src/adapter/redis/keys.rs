@@ -62,6 +62,21 @@ impl Keys {
     pub fn sweeplock(&self) -> String {
         format!("{}:sweeplock", self.prefix)
     }
+
+    /// Presence: HASH user_id -> live connection count (HINCRBY; HLEN = user_count).
+    pub fn presusers(&self, app: &str, channel: &str) -> String {
+        format!("{}:presusers:{}:{{{}}}", self.prefix, app, channel)
+    }
+
+    /// Presence: HASH user_id -> user_info JSON (the roster `hash`).
+    pub fn presinfo(&self, app: &str, channel: &str) -> String {
+        format!("{}:presinfo:{}:{{{}}}", self.prefix, app, channel)
+    }
+
+    /// Presence: HASH member_token -> user_id (lets the sweeper map a crashed socket to its user).
+    pub fn presmembers(&self, app: &str, channel: &str) -> String {
+        format!("{}:presmembers:{}:{{{}}}", self.prefix, app, channel)
+    }
 }
 
 /// Composite token uniquely identifying one socket connection across the cluster.
@@ -84,6 +99,18 @@ mod tests {
         assert_eq!(k.nodes(), "pylon:nodes");
         assert_eq!(k.apps(), "pylon:apps");
         assert_eq!(k.sweeplock(), "pylon:sweeplock");
+        assert_eq!(
+            k.presusers("app1", "presence-room"),
+            "pylon:presusers:app1:{presence-room}"
+        );
+        assert_eq!(
+            k.presinfo("app1", "presence-room"),
+            "pylon:presinfo:app1:{presence-room}"
+        );
+        assert_eq!(
+            k.presmembers("app1", "presence-room"),
+            "pylon:presmembers:app1:{presence-room}"
+        );
     }
     #[test]
     fn member_token_is_node_and_socket() {
