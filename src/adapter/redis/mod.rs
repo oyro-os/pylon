@@ -10,6 +10,7 @@
 pub mod client;
 pub mod envelope;
 pub mod keys;
+pub mod presence;
 pub mod pubsub;
 pub mod sweeper;
 
@@ -404,6 +405,32 @@ impl Adapter for RedisAdapter {
             tracing::warn!(error = %e, app, "redis SADD apps failed; sweeper may miss this app");
         }
 
+        // Presence: overwrite the node-local PresenceJoin with cluster truth — the
+        // first_for_user edge (HINCRBY refcount) and the cluster-wide roster. On any
+        // Redis error keep the node-local join (graceful degradation).
+        if let Some(join) = out.presence.as_mut() {
+            match presence::join(
+                &self.scripts,
+                &self.clients.pool,
+                &self.keys,
+                &self.node_id,
+                app,
+                channel,
+                &join.member,
+                &socket_id,
+            )
+            .await
+            {
+                Ok((first_for_user, roster)) => {
+                    join.first_for_user = first_for_user;
+                    join.roster = roster;
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, app, channel, "redis presence join failed; keeping node-local roster");
+                }
+            }
+        }
+
         out
     }
 
@@ -454,6 +481,27 @@ impl Adapter for RedisAdapter {
                     app, channel,
                     "redis UNSUBSCRIBE membership script failed; keeping node-local count"
                 );
+            }
+        }
+
+        // Presence: overwrite last_for_user with the cluster refcount edge.
+        if let Some(leave) = out.presence.as_mut() {
+            match presence::leave(
+                &self.scripts,
+                &self.clients.pool,
+                &self.keys,
+                &self.node_id,
+                app,
+                channel,
+                &leave.user_id,
+                socket_id,
+            )
+            .await
+            {
+                Ok(last_for_user) => leave.last_for_user = last_for_user,
+                Err(e) => {
+                    tracing::warn!(error = %e, app, channel, "redis presence leave failed; keeping node-local last_for_user");
+                }
             }
         }
 

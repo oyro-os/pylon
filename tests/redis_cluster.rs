@@ -763,3 +763,179 @@ async fn sweeper_lease_lock_prevents_concurrent_sweep() {
     .await
     .expect("sweeper-lease test must not hang (Redis up?)");
 }
+
+/// Build a fresh fake presence `ConnectionHandle` and a `PresenceMember` for
+/// `user_id`/`user_info`. Returns `(socket_id, handle, member)` ready to pass to
+/// `adapter.subscribe(app, channel, handle, Some(member))`.
+fn presence_handle(
+    user_id: &str,
+    user_info: serde_json::Value,
+) -> (
+    SocketId,
+    ConnectionHandle,
+    pylon::presence::member::PresenceMember,
+) {
+    let socket_id = SocketId::generate();
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+    let handle = ConnectionHandle {
+        socket_id: socket_id.clone(),
+        mailbox: tx,
+    };
+    let member = pylon::presence::member::PresenceMember {
+        user_id: user_id.into(),
+        user_info,
+    };
+    (socket_id, handle, member)
+}
+
+/// B1 (SP7b): `member_added` fires exactly once per cluster-wide user transition.
+/// `first_for_user` is the cluster refcount 0→1 edge — NOT the node-local one. A
+/// second connection of the SAME user on a DIFFERENT node must report
+/// `first_for_user == false`; a new distinct user reports `true`.
+///
+/// (RED before B1: with `subscribe` delegating to the local adapter, B's first
+/// connection of u1 has no node-local refcount and would report `true` — a duplicate
+/// `member_added`.)
+#[tokio::test]
+async fn cross_node_presence_member_added_single_emit() {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let prefix = random_prefix();
+        let adapter_a = connect_adapter_with_prefix(&prefix).await;
+        let adapter_b = connect_adapter_with_prefix(&prefix).await;
+
+        // u1's first connection on A → first_for_user (cluster 0→1 for u1).
+        let (_s1, h1, m1) = presence_handle("u1", serde_json::json!({"name":"Ann"}));
+        let out1 = adapter_a
+            .subscribe(TEST_APP, "presence-room", h1, Some(m1))
+            .await;
+        let j1 = out1.presence.expect("presence join on A must be Some");
+        assert!(
+            j1.first_for_user,
+            "u1's first cluster connection must be first_for_user"
+        );
+
+        // u1's SECOND connection (new socket) on B → NOT first_for_user.
+        let (_s2, h2, m2) = presence_handle("u1", serde_json::json!({"name":"Ann"}));
+        let out2 = adapter_b
+            .subscribe(TEST_APP, "presence-room", h2, Some(m2))
+            .await;
+        let j2 = out2.presence.expect("presence join on B must be Some");
+        assert!(
+            !j2.first_for_user,
+            "u1's second cluster connection (on another node) must NOT be first_for_user"
+        );
+
+        // u2's first connection on B → first_for_user (distinct user).
+        let (_s3, h3, m3) = presence_handle("u2", serde_json::json!({"name":"Bob"}));
+        let out3 = adapter_b
+            .subscribe(TEST_APP, "presence-room", h3, Some(m3))
+            .await;
+        let j3 = out3.presence.expect("presence join for u2 must be Some");
+        assert!(
+            j3.first_for_user,
+            "u2 (a distinct user) must be first_for_user"
+        );
+    })
+    .await
+    .expect("presence member_added test must not hang (Redis up?)");
+}
+
+/// B1 (SP7b): the roster a subscribing connection sees is the CLUSTER-wide presence
+/// set, not the node-local one. With u1 on A and u2 on B, a third connection (u3) on A
+/// must see all three users in its roster — ids sorted, distinct count, each with its
+/// own `user_info`.
+#[tokio::test]
+async fn cross_node_presence_roster_is_cluster_wide() {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let prefix = random_prefix();
+        let adapter_a = connect_adapter_with_prefix(&prefix).await;
+        let adapter_b = connect_adapter_with_prefix(&prefix).await;
+
+        let (_s1, h1, m1) = presence_handle("u1", serde_json::json!({"name":"Ann"}));
+        adapter_a
+            .subscribe(TEST_APP, "presence-room", h1, Some(m1))
+            .await;
+
+        let (_s2, h2, m2) = presence_handle("u2", serde_json::json!({"name":"Bob"}));
+        adapter_b
+            .subscribe(TEST_APP, "presence-room", h2, Some(m2))
+            .await;
+
+        // u3 subscribes on A — its roster must reflect the whole cluster.
+        let (_s3, h3, m3) = presence_handle("u3", serde_json::json!({"name":"Cleo"}));
+        let out3 = adapter_a
+            .subscribe(TEST_APP, "presence-room", h3, Some(m3))
+            .await;
+        let roster = out3
+            .presence
+            .expect("presence join for u3 must be Some")
+            .roster;
+
+        assert_eq!(roster.count, 3, "cluster roster must count all 3 users");
+        assert_eq!(
+            roster.ids,
+            vec!["u1".to_string(), "u2".to_string(), "u3".to_string()],
+            "cluster roster ids must be sorted and contain u1,u2,u3"
+        );
+        assert_eq!(
+            roster.hash.get("u1"),
+            Some(&serde_json::json!({"name":"Ann"})),
+            "roster hash must carry u1's user_info"
+        );
+        assert_eq!(
+            roster.hash.get("u2"),
+            Some(&serde_json::json!({"name":"Bob"})),
+            "roster hash must carry u2's user_info"
+        );
+        assert_eq!(
+            roster.hash.get("u3"),
+            Some(&serde_json::json!({"name":"Cleo"})),
+            "roster hash must carry u3's user_info"
+        );
+    })
+    .await
+    .expect("presence roster test must not hang (Redis up?)");
+}
+
+/// B1 (SP7b): `member_removed` fires exactly once per cluster-wide user transition.
+/// `last_for_user` is the cluster refcount →0 edge. u1 has a connection on A (socket
+/// sA) and on B (socket sB). Removing sA must NOT be last_for_user (u1 still has sB);
+/// removing sB must be last_for_user, with the right `user_id`.
+#[tokio::test]
+async fn cross_node_presence_member_removed_single_emit() {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let prefix = random_prefix();
+        let adapter_a = connect_adapter_with_prefix(&prefix).await;
+        let adapter_b = connect_adapter_with_prefix(&prefix).await;
+
+        // u1 on A (sA) and on B (sB).
+        let (s_a, h_a, m_a) = presence_handle("u1", serde_json::json!({"name":"Ann"}));
+        adapter_a
+            .subscribe(TEST_APP, "presence-room", h_a, Some(m_a))
+            .await;
+        let (s_b, h_b, m_b) = presence_handle("u1", serde_json::json!({"name":"Ann"}));
+        adapter_b
+            .subscribe(TEST_APP, "presence-room", h_b, Some(m_b))
+            .await;
+
+        // Remove A's connection → NOT last_for_user (u1 still on B).
+        let un_a = adapter_a.unsubscribe(TEST_APP, "presence-room", &s_a).await;
+        let leave_a = un_a.presence.expect("presence leave on A must be Some");
+        assert!(
+            !leave_a.last_for_user,
+            "u1 still has a connection on B → NOT last_for_user"
+        );
+        assert_eq!(leave_a.user_id, "u1");
+
+        // Remove B's connection → last_for_user (u1's final cluster connection).
+        let un_b = adapter_b.unsubscribe(TEST_APP, "presence-room", &s_b).await;
+        let leave_b = un_b.presence.expect("presence leave on B must be Some");
+        assert!(
+            leave_b.last_for_user,
+            "u1's final cluster connection gone → last_for_user"
+        );
+        assert_eq!(leave_b.user_id, "u1");
+    })
+    .await
+    .expect("presence member_removed test must not hang (Redis up?)");
+}
