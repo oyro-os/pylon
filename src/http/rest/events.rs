@@ -157,6 +157,10 @@ pub async fn post_events(
     if t.data.len() > state.config.max_event_payload_bytes {
         return Err(RestError::payload_too_large("Event message over 10k"));
     }
+    // P9: enforce event-name length cap.
+    if t.name.len() > state.config.max_event_name_length {
+        return Err(RestError::bad_request("Event name too long"));
+    }
     let channels = match (&t.channels, &t.channel) {
         (Some(list), _) => list.clone(),
         (None, Some(c)) => vec![c.clone()],
@@ -235,6 +239,12 @@ pub async fn post_batch(
     for item in &b.batch {
         if item.data.len() > state.config.max_event_payload_bytes {
             return Err(RestError::payload_too_large("Event message over 10k"));
+        }
+    }
+    // P9: enforce event-name length cap for every batch item.
+    for item in &b.batch {
+        if item.name.len() > state.config.max_event_name_length {
+            return Err(RestError::bad_request("Event name too long"));
         }
     }
     // P8: validate every channel name (length + charset).

@@ -779,3 +779,61 @@ async fn rest_body_too_large_is_413() {
         .unwrap();
     assert_eq!(resp.status(), 413);
 }
+
+// ── P9 parity tests — event-name length (max 200 chars) ─────────────────────
+
+/// P9: POST /events with an event name exceeding 200 chars → 400.
+#[tokio::test]
+async fn rest_trigger_event_name_over_200_is_400() {
+    let addr = spawn().await;
+    let long_name = "a".repeat(201);
+    let body = json!({"name": long_name, "data": "{}", "channels": ["room"]}).to_string();
+    let q = signed_query("POST", "/apps/app1/events", body.as_bytes(), &[]);
+    let resp = reqwest::Client::new()
+        .post(format!("http://{addr}/apps/app1/events?{q}"))
+        .body(body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400, "event name over 200 chars must be 400");
+}
+
+/// P9: POST /events with an event name of exactly 200 chars → 200.
+#[tokio::test]
+async fn rest_trigger_event_name_exactly_200_is_200() {
+    let addr = spawn().await;
+    let name_200 = "a".repeat(200);
+    let body = json!({"name": name_200, "data": "{}", "channels": ["room"]}).to_string();
+    let q = signed_query("POST", "/apps/app1/events", body.as_bytes(), &[]);
+    let resp = reqwest::Client::new()
+        .post(format!("http://{addr}/apps/app1/events?{q}"))
+        .body(body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        200,
+        "event name of exactly 200 chars must be 200"
+    );
+}
+
+/// P9: POST /batch_events with an event name exceeding 200 chars → 400.
+#[tokio::test]
+async fn rest_batch_event_name_over_200_is_400() {
+    let addr = spawn().await;
+    let long_name = "a".repeat(201);
+    let body = json!({"batch": [{"name": long_name, "data": "{}", "channel": "room"}]}).to_string();
+    let q = signed_query("POST", "/apps/app1/batch_events", body.as_bytes(), &[]);
+    let resp = reqwest::Client::new()
+        .post(format!("http://{addr}/apps/app1/batch_events?{q}"))
+        .body(body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        400,
+        "batch event name over 200 chars must be 400"
+    );
+}

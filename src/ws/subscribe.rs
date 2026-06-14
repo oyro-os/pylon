@@ -276,6 +276,15 @@ impl ConnectionContext {
         if !allowed || !self.subscribed.contains(&channel) {
             return; // silently dropped, matching Soketi/Pusher
         }
+        // P9: client-events with an oversized name are silently dropped.
+        if event.len() > self.limits.max_event_name_length {
+            tracing::debug!(
+                app = %self.app.id,
+                event_len = event.len(),
+                "client-event dropped: event name exceeds max_event_name_length"
+            );
+            return;
+        }
         // Oversize client-event payloads are silently dropped.
         if serde_json::to_string(&data).map_or(0, |s| s.len()) > self.limits.max_event_payload_bytes
         {

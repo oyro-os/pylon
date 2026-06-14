@@ -432,3 +432,97 @@ async fn malformed_frame_silently_dropped_connection_stays_alive() {
         "connection should remain alive after malformed frame"
     );
 }
+
+// ── P9 parity tests — client-event name length (max 200 chars) ──────────────
+
+/// P9: a client-event with an event name over 200 chars must be dropped — the
+/// other subscriber receives nothing (the connection stays alive).
+#[tokio::test]
+async fn ws_client_event_name_over_200_is_dropped() {
+    let addr = spawn(ServerConfig::default()).await;
+    let mut a = connect(addr, "?protocol=7").await;
+    let sid_a = established_socket_id(&mut a).await;
+    let mut b = connect(addr, "?protocol=7").await;
+    let sid_b = established_socket_id(&mut b).await;
+
+    // Both join the same private channel.
+    for (ws, sid) in [(&mut a, &sid_a), (&mut b, &sid_b)] {
+        send_json(
+            ws,
+            json!({
+                "event": "pusher:subscribe",
+                "data": { "channel": "private-x", "auth": auth_token(sid, "private-x", None) }
+            }),
+        )
+        .await;
+        // Drain: subscription_succeeded + possible subscription_count frame.
+        let _ = next_event_named(ws, "pusher_internal:subscription_succeeded").await;
+    }
+    // Drain any lingering subscription_count frames from b's queue before the test.
+    while tokio::time::timeout(std::time::Duration::from_millis(50), b.next())
+        .await
+        .is_ok()
+    {}
+
+    // a sends a client-event whose name is 201 chars (over the 200-char limit).
+    let long_event = format!("client-{}", "a".repeat(194)); // "client-" (7) + 194 = 201
+    send_json(
+        &mut a,
+        json!({ "event": long_event, "channel": "private-x", "data": {} }),
+    )
+    .await;
+
+    // b must NOT receive anything within a short window.
+    let got = tokio::time::timeout(std::time::Duration::from_millis(300), next_json(&mut b)).await;
+    assert!(
+        got.is_err(),
+        "subscriber b must not receive a client-event with an oversized name"
+    );
+
+    // a's connection must still be alive.
+    send_json(&mut a, json!({ "event": "pusher:ping", "data": {} })).await;
+    assert_eq!(
+        next_event_named(&mut a, "pusher:pong").await["event"],
+        "pusher:pong",
+        "connection must remain alive after oversized client-event name"
+    );
+}
+
+/// P9: a client-event with an event name of exactly 200 chars IS broadcast.
+#[tokio::test]
+async fn ws_client_event_name_exactly_200_is_broadcast() {
+    let addr = spawn(ServerConfig::default()).await;
+    let mut a = connect(addr, "?protocol=7").await;
+    let sid_a = established_socket_id(&mut a).await;
+    let mut b = connect(addr, "?protocol=7").await;
+    let sid_b = established_socket_id(&mut b).await;
+
+    for (ws, sid) in [(&mut a, &sid_a), (&mut b, &sid_b)] {
+        send_json(
+            ws,
+            json!({
+                "event": "pusher:subscribe",
+                "data": { "channel": "private-y", "auth": auth_token(sid, "private-y", None) }
+            }),
+        )
+        .await;
+        let _ = next_json(ws).await; // subscription_succeeded
+    }
+
+    // "client-" (7) + 193 'a' chars = 200 total
+    let exact_event = format!("client-{}", "a".repeat(193));
+    send_json(
+        &mut a,
+        json!({ "event": exact_event.clone(), "channel": "private-y", "data": {} }),
+    )
+    .await;
+
+    let got = tokio::time::timeout(
+        std::time::Duration::from_millis(500),
+        next_event_named(&mut b, &exact_event),
+    )
+    .await
+    .expect("b must receive a client-event with a 200-char name");
+    assert_eq!(got["event"], exact_event);
+    assert_eq!(got["channel"], "private-y");
+}
