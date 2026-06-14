@@ -282,7 +282,12 @@ impl ConnectionContext {
         });
     }
 
-    pub(in crate::ws) async fn client_event(&mut self, event: String, channel: String, data: Value) {
+    pub(in crate::ws) async fn client_event(
+        &mut self,
+        event: String,
+        channel: String,
+        data: Value,
+    ) {
         if !self.app.client_messages_enabled {
             self.send_self(ServerEvent::ClientEventError {
                 channel,

@@ -14,7 +14,11 @@ pub struct RateWindow {
 
 impl RateWindow {
     pub fn new(limit: u32) -> Self {
-        Self { limit, window_start: None, count: 0 }
+        Self {
+            limit,
+            window_start: None,
+            count: 0,
+        }
     }
 
     /// Record one event observed at `now`. Returns true if ALLOWED, false if it
@@ -52,8 +56,14 @@ mod tests {
         assert!(w.check_at(base));
         assert!(w.check_at(base));
         assert!(w.check_at(base));
-        assert!(!w.check_at(base), "4th event in the same window is rejected");
-        assert!(!w.check_at(base + Duration::from_millis(999)), "still same window");
+        assert!(
+            !w.check_at(base),
+            "4th event in the same window is rejected"
+        );
+        assert!(
+            !w.check_at(base + Duration::from_millis(999)),
+            "still same window"
+        );
     }
 
     #[test]

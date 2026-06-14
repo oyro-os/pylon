@@ -1601,11 +1601,17 @@ async fn client_event_rate_limit_returns_4301_and_drops() {
     // Sender must have received exactly one 4301 ClientEventError.
     let mut rate_errors = 0;
     while let Ok(ev) = rx_sender.try_recv() {
-        if let ServerEvent::ClientEventError { code, channel: ch, .. } = ev {
+        if let ServerEvent::ClientEventError {
+            code, channel: ch, ..
+        } = ev
+        {
             assert_eq!(code, 4301, "rate-limit error must be code 4301");
             assert_eq!(ch, channel, "error must carry the channel name");
             rate_errors += 1;
         }
     }
-    assert_eq!(rate_errors, 1, "sender must receive exactly one 4301 rate-limit error");
+    assert_eq!(
+        rate_errors, 1,
+        "sender must receive exactly one 4301 rate-limit error"
+    );
 }
