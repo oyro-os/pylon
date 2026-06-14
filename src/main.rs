@@ -12,6 +12,9 @@ use pylon::webhook::dispatcher::SystemClock;
 use pylon::webhook::transport::{HttpTransport, WebhookTransport};
 use std::sync::Arc;
 
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     pylon::init_tracing();

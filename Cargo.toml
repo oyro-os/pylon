@@ -34,6 +34,8 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 # Redis client for the scaling adapter
 fred = { version = "10", default-features = false, features = ["subscriber-client", "i-pubsub", "i-scripts", "i-std", "sha-1", "enable-rustls"] }
 uuid = { version = "1", features = ["v4"] }
+# Global allocator: faster + better cross-thread alloc/free for the cross-core fan-out pattern.
+mimalloc = { version = "0.1", default-features = false }
 
 [dev-dependencies]
 # Enables paused-time control (`start_paused`, `tokio::time::advance`) in tests.
