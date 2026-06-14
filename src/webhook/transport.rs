@@ -6,7 +6,8 @@ use async_trait::async_trait;
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use std::sync::Arc;
-use tokio::sync::Mutex;
+use std::time::Duration;
+use tokio::sync::{Mutex, Semaphore};
 
 /// One fully-prepared POST: the raw signed body bytes plus the exact header set.
 #[derive(Debug, Clone, PartialEq)]
@@ -78,12 +79,179 @@ impl WebhookTransport for RecordingTransport {
     }
 }
 
+/// Production transport: reqwest POST with per-attempt timeout, bounded
+/// retry/backoff, and a global concurrency semaphore (spec §6). `deliver`
+/// spawns the attempt loop and returns immediately — it never blocks the caller.
+pub struct HttpTransport {
+    client: reqwest::Client,
+    max_retries: u32,
+    retry_base_ms: u64,
+    semaphore: Arc<Semaphore>,
+}
+
+impl HttpTransport {
+    /// `timeout_ms` is the per-attempt request timeout; `max_concurrency` caps
+    /// simultaneous in-flight deliveries.
+    pub fn new(
+        max_retries: u32,
+        retry_base_ms: u64,
+        timeout_ms: u64,
+        max_concurrency: usize,
+    ) -> Self {
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_millis(timeout_ms))
+            .build()
+            .expect("reqwest client builds");
+        Self {
+            client,
+            max_retries,
+            retry_base_ms,
+            semaphore: Arc::new(Semaphore::new(max_concurrency)),
+        }
+    }
+
+    /// True if `status` should be retried: 5xx and 429 retry; other 4xx are
+    /// permanent (transport errors are retried separately in the attempt loop).
+    fn retryable(status: reqwest::StatusCode) -> bool {
+        status.is_server_error() || status == reqwest::StatusCode::TOO_MANY_REQUESTS
+    }
+}
+
+#[async_trait]
+impl WebhookTransport for HttpTransport {
+    async fn deliver(&self, delivery: WebhookDelivery) {
+        let client = self.client.clone();
+        let max_retries = self.max_retries;
+        let base = self.retry_base_ms;
+        let sem = self.semaphore.clone();
+
+        tokio::spawn(async move {
+            // Concurrency cap: if the broker is saturated this awaits a permit.
+            let _permit = match sem.acquire().await {
+                Ok(p) => p,
+                Err(_) => return, // semaphore closed (shutdown)
+            };
+
+            // attempt 0 is the first try; up to `max_retries` extra attempts.
+            for attempt in 0..=max_retries {
+                let mut req = client.post(&delivery.url).body(delivery.body.clone());
+                for (k, v) in &delivery.headers {
+                    req = req.header(k, v);
+                }
+                match req.send().await {
+                    Ok(resp) => {
+                        let status = resp.status();
+                        if status.is_success() {
+                            return;
+                        }
+                        if !HttpTransport::retryable(status) {
+                            tracing::warn!(url = %delivery.url, %status, "webhook rejected (permanent)");
+                            return; // 4xx (non-429): permanent
+                        }
+                        // retryable status: fall through to backoff
+                        tracing::debug!(url = %delivery.url, %status, attempt, "webhook retryable status");
+                    }
+                    Err(e) => {
+                        // transport error (timeout, connection refused): retry
+                        tracing::debug!(url = %delivery.url, error = %e, attempt, "webhook transport error");
+                    }
+                }
+                if attempt == max_retries {
+                    tracing::warn!(url = %delivery.url, "webhook delivery exhausted retries; dropping");
+                    return;
+                }
+                // exponential backoff: base * 2^attempt.
+                let delay = base.saturating_mul(1u64 << attempt);
+                tokio::time::sleep(Duration::from_millis(delay)).await;
+            }
+        });
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::extract::State;
+    use axum::http::StatusCode;
+    use axum::routing::post;
+    use axum::Router;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     fn events() -> Vec<Value> {
         vec![json!({ "name": "channel_occupied", "channel": "ch" })]
+    }
+
+    /// 503 for the first two hits, then 200 — counts every hit in the shared counter.
+    async fn flaky_handler(State(calls): State<Arc<AtomicUsize>>) -> StatusCode {
+        let n = calls.fetch_add(1, Ordering::SeqCst);
+        if n < 2 {
+            StatusCode::SERVICE_UNAVAILABLE
+        } else {
+            StatusCode::OK
+        }
+    }
+
+    /// Always 400 (permanent) — counts every hit so we can assert "no retry".
+    async fn reject_handler(State(calls): State<Arc<AtomicUsize>>) -> StatusCode {
+        calls.fetch_add(1, Ordering::SeqCst);
+        StatusCode::BAD_REQUEST
+    }
+
+    /// Bind a throwaway server on a random port; the handler still carries the
+    /// shared counter as its `State`, which `with_state` then injects.
+    async fn spawn_mock(
+        handler: axum::routing::MethodRouter<Arc<AtomicUsize>>,
+        calls: Arc<AtomicUsize>,
+    ) -> std::net::SocketAddr {
+        let app = Router::new().route("/wh", handler).with_state(calls);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        addr
+    }
+
+    #[tokio::test]
+    async fn http_transport_retries_on_503_then_succeeds() {
+        // 503, 503, 200 → exactly 3 attempts.
+        let calls = Arc::new(AtomicUsize::new(0));
+        let addr = spawn_mock(post(flaky_handler), calls.clone()).await;
+        let t = HttpTransport::new(3, 1, 5000, 10); // base 1ms so the test is fast
+        let d = build_signed_delivery(
+            &format!("http://{addr}/wh"),
+            "k",
+            "s",
+            1,
+            &events(),
+            &BTreeMap::new(),
+        );
+        t.deliver(d).await;
+        // small settle for the spawned delivery task
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(calls.load(Ordering::SeqCst), 3, "two retries then success");
+    }
+
+    #[tokio::test]
+    async fn http_transport_does_not_retry_on_400() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let addr = spawn_mock(post(reject_handler), calls.clone()).await;
+        let t = HttpTransport::new(3, 1, 5000, 10);
+        let d = build_signed_delivery(
+            &format!("http://{addr}/wh"),
+            "k",
+            "s",
+            1,
+            &events(),
+            &BTreeMap::new(),
+        );
+        t.deliver(d).await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "4xx is permanent: single attempt"
+        );
     }
 
     #[test]
