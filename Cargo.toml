@@ -15,6 +15,11 @@ axum = { version = "0.8", features = ["ws"] }
 bytes = "1"
 # Hand-written epoll event loop for the SP9 per-core transport (non-blocking sockets).
 mio = { version = "1", features = ["os-poll", "net"] }
+# HTTP request-head parsing for the per-core WS handshake / REST routing (SP9).
+httparse = "1"
+# RFC 6455 Sec-WebSocket-Accept = base64(sha1(key + GUID)).
+sha1 = "0.10"
+base64 = "0.22"
 # JSON
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
