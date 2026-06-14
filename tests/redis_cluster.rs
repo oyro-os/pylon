@@ -313,3 +313,114 @@ async fn cross_node_broadcast_fans_out_with_dedup_and_exclusion() {
         "sender_a was excepted and must receive nothing"
     );
 }
+
+/// Build a fresh fake `ConnectionHandle` (its fields are `pub`) and return it with
+/// its `SocketId`. The mailbox rx is dropped — these tests only assert membership
+/// counts, not delivery.
+fn fake_handle() -> (SocketId, ConnectionHandle) {
+    let socket_id = SocketId::generate();
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+    let handle = ConnectionHandle {
+        socket_id: socket_id.clone(),
+        mailbox: tx,
+    };
+    (socket_id, handle)
+}
+
+/// Short timeout wrapper so a wedged Redis fails loud instead of hanging the suite.
+async fn with_timeout<F, T>(fut: F) -> T
+where
+    F: std::future::Future<Output = T>,
+{
+    tokio::time::timeout(Duration::from_secs(2), fut)
+        .await
+        .expect("redis op must not hang (Redis up?)")
+}
+
+/// C1: membership (`HLEN` of the occ hash) is the AUTHORITATIVE, cluster-wide
+/// `subscription_count`, and its 0→1 / 1→0 transitions are the exactly-once cluster
+/// occupied/vacated edges — across nodes, for ALL channel kinds. `channel` and
+/// `channels` report that same cluster count, not the node-local one.
+#[tokio::test]
+async fn cluster_membership_count_and_occupancy() {
+    let prefix = random_prefix();
+    let adapter_a = connect_adapter_with_prefix(&prefix).await;
+    let adapter_b = connect_adapter_with_prefix(&prefix).await;
+
+    // 1. First subscriber (on A): cluster count 1, this is the cluster occupied edge.
+    let (sock_a, handle_a) = fake_handle();
+    let out_a = with_timeout(adapter_a.subscribe(TEST_APP, "public-room", handle_a, None)).await;
+    assert_eq!(
+        out_a.subscription_count, 1,
+        "first cluster subscriber → cluster count 1"
+    );
+    assert!(out_a.occupied, "0→1 cluster edge must report occupied");
+
+    // 2. Second subscriber on a DIFFERENT node (B): cluster count 2, NOT occupied
+    //    (this is the assertion that fails while `subscribe` delegates to local — A
+    //    and B would each see their own node-local count of 1).
+    let (sock_b, handle_b) = fake_handle();
+    let out_b = with_timeout(adapter_b.subscribe(TEST_APP, "public-room", handle_b, None)).await;
+    assert_eq!(
+        out_b.subscription_count, 2,
+        "second cluster subscriber on another node → cluster count 2"
+    );
+    assert!(
+        !out_b.occupied,
+        "a non-0→1 subscribe must NOT report occupied"
+    );
+
+    // 3. `channel` on A reports the cluster count (2), occupied true.
+    let summary = with_timeout(adapter_a.channel(TEST_APP, "public-room")).await;
+    assert_eq!(
+        summary.subscription_count, 2,
+        "channel() must report the cluster-wide count"
+    );
+    assert!(
+        summary.occupied,
+        "channel() must report occupied while members exist"
+    );
+
+    // 4. `channels` on A lists public-room with the cluster count.
+    let all = with_timeout(adapter_a.channels(TEST_APP, None)).await;
+    let pr = all
+        .iter()
+        .find(|c| c.name == "public-room")
+        .expect("channels() must list public-room while it is occupied");
+    assert_eq!(
+        pr.subscription_count, 2,
+        "channels() must report the cluster-wide count"
+    );
+
+    // 5. Unsubscribe B's socket → cluster count 1, NOT vacated; then A's → 0, vacated.
+    let un_b = with_timeout(adapter_b.unsubscribe(TEST_APP, "public-room", &sock_b)).await;
+    assert_eq!(
+        un_b.subscription_count, 1,
+        "one cluster member remains → count 1"
+    );
+    assert!(
+        !un_b.vacated,
+        "a non-1→0 unsubscribe must NOT report vacated"
+    );
+
+    let un_a = with_timeout(adapter_a.unsubscribe(TEST_APP, "public-room", &sock_a)).await;
+    assert_eq!(
+        un_a.subscription_count, 0,
+        "last cluster member gone → count 0"
+    );
+    assert!(un_a.vacated, "1→0 cluster edge must report vacated");
+
+    // 6. After both leave: channel reports 0/!occupied and channels no longer lists it.
+    let summary = with_timeout(adapter_a.channel(TEST_APP, "public-room")).await;
+    assert_eq!(
+        summary.subscription_count, 0,
+        "empty channel → cluster count 0"
+    );
+    assert!(!summary.occupied, "empty channel must not be occupied");
+
+    let all = with_timeout(adapter_a.channels(TEST_APP, None)).await;
+    assert!(
+        !all.iter().any(|c| c.name == "public-room"),
+        "channels() must not list a vacated channel"
+    );
+}

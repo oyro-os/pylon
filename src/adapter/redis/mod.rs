@@ -24,9 +24,18 @@ use crate::protocol::socket_id::SocketId;
 use crate::server::config::ServerConfig;
 use crate::user::{UserJoinOutcome, UserLeaveOutcome};
 use async_trait::async_trait;
-use fred::interfaces::{EventInterface, PubsubInterface};
+use fred::interfaces::{EventInterface, HashesInterface, PubsubInterface, SetsInterface};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+/// Current wall-clock time as milliseconds since the Unix epoch. Used to stamp the
+/// per-member `expireAt` in the occupancy hash (the sweeper reaps stale members).
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
 
 /// The few `ServerConfig` knobs the Redis adapter needs to keep around for the
 /// later phases (TTLs, heartbeat cadence, grace window). Cheap `Copy` struct so
@@ -63,8 +72,10 @@ pub struct RedisAdapter {
     clients: client::RedisClients,
     keys: keys::Keys,
     node_id: String,
-    #[allow(dead_code)] // wired in C/D/E
     cfg: RedisConfig,
+    /// Pre-compiled (SHA-1 hashed) membership Lua scripts. Loaded into Redis lazily
+    /// on first use via `evalsha_with_reload`'s NOSCRIPT fallback.
+    scripts: client::Scripts,
     /// The pub/sub receive loop. Kept alive for the adapter's lifetime — dropping
     /// it would abort cross-node delivery on this node.
     #[allow(dead_code)]
@@ -95,6 +106,8 @@ impl RedisAdapter {
             keys,
             node_id,
             cfg: RedisConfig::from_server_config(cfg),
+            // `from_lua` is local (SHA-1 only) — no Redis round-trip here.
+            scripts: client::Scripts::new(),
             recv_handle,
         })
     }
@@ -122,12 +135,16 @@ impl Adapter for RedisAdapter {
         handle: ConnectionHandle,
         member: Option<PresenceMember>,
     ) -> SubscribeOutcome {
-        let out = self.local.subscribe(app, channel, handle, member).await;
+        // Capture the socket id BEFORE `handle` is moved into the local adapter —
+        // we need it below to form this connection's member token for Redis.
+        let socket_id = handle.socket_id.clone();
+
+        let mut out = self.local.subscribe(app, channel, handle, member).await;
 
         // The Redis-subscription lifecycle is keyed on the node-LOCAL subscriber
         // edge: subscribe to the msg channel when this node goes 0 → 1. We capture
-        // the local count now because C1 will overwrite `out.subscription_count`
-        // with the *cluster*-wide count — the lifecycle must stay on the local edge.
+        // the local count now because the cluster count (below) overwrites
+        // `out.subscription_count` — the lifecycle must stay on the local edge.
         let local_count = out.subscription_count;
         if local_count == 1 {
             let msg_key = self.keys.msg(app, channel);
@@ -143,6 +160,39 @@ impl Adapter for RedisAdapter {
             }
         }
 
+        // Record cluster-wide membership and read back the AUTHORITATIVE count.
+        // Atomic Lua: HSET member, refresh whole-key TTL, HLEN, index on the 0→1
+        // cluster edge. On any Redis error, keep the node-local outcome (graceful
+        // degradation — a membership write failure must never fail the subscribe).
+        let ttl_secs = self.cfg.membership_ttl_secs;
+        let occ = self.keys.occ(app, channel);
+        let chans = self.keys.chans(app);
+        let token = keys::member_token(&self.node_id, socket_id.as_str());
+        let argv = vec![
+            token,
+            (now_ms() + ttl_secs * 1000).to_string(),
+            ttl_secs.to_string(),
+            channel.to_string(),
+        ];
+        match self
+            .scripts
+            .subscribe
+            .evalsha_with_reload::<i64, _, _>(self.clients.pool.next(), vec![occ, chans], argv)
+            .await
+        {
+            Ok(count) => {
+                out.subscription_count = count as usize;
+                out.occupied = count == 1;
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    app, channel,
+                    "redis SUBSCRIBE membership script failed; keeping node-local count"
+                );
+            }
+        }
+
         out
     }
 
@@ -152,12 +202,12 @@ impl Adapter for RedisAdapter {
         channel: &str,
         socket_id: &SocketId,
     ) -> UnsubscribeOutcome {
-        let out = self.local.unsubscribe(app, channel, socket_id).await;
+        let mut out = self.local.unsubscribe(app, channel, socket_id).await;
 
         // Mirror of `subscribe`: tear down the Redis subscription on the node-LOCAL
-        // 1 → 0 edge. Keyed on the local count (see note in `subscribe`): C1 will
-        // overwrite `out.subscription_count` with the cluster count, so the
-        // lifecycle decision must read the node-local count captured here.
+        // 1 → 0 edge. Keyed on the local count (see note in `subscribe`): the cluster
+        // count below overwrites `out.subscription_count`, so the lifecycle decision
+        // must read the node-local count captured here.
         let local_count = out.subscription_count;
         if local_count == 0 {
             let msg_key = self.keys.msg(app, channel);
@@ -166,6 +216,32 @@ impl Adapter for RedisAdapter {
                     error = %e,
                     channel = %msg_key,
                     "failed to UNSUBSCRIBE from Redis msg channel on 1→0 edge"
+                );
+            }
+        }
+
+        // Remove cluster-wide membership and read back the AUTHORITATIVE remaining
+        // count. Atomic Lua: HDEL member, HLEN, and on the 1→0 cluster edge DEL the
+        // now-empty hash + de-index. On Redis error, keep the node-local outcome.
+        let occ = self.keys.occ(app, channel);
+        let chans = self.keys.chans(app);
+        let token = keys::member_token(&self.node_id, socket_id.as_str());
+        let argv = vec![token, channel.to_string()];
+        match self
+            .scripts
+            .unsubscribe
+            .evalsha_with_reload::<i64, _, _>(self.clients.pool.next(), vec![occ, chans], argv)
+            .await
+        {
+            Ok(count) => {
+                out.subscription_count = count as usize;
+                out.vacated = count == 0;
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    app, channel,
+                    "redis UNSUBSCRIBE membership script failed; keeping node-local count"
                 );
             }
         }
@@ -219,11 +295,74 @@ impl Adapter for RedisAdapter {
     }
 
     async fn channels(&self, app: &str, prefix: Option<&str>) -> Vec<ChannelSummary> {
-        self.local.channels(app, prefix).await
+        // Cluster-wide view: the app's active-channels set is the source of truth
+        // for which channels are occupied; `HLEN occ` is each one's cluster count.
+        let client = self.clients.pool.next();
+        let members: Result<Vec<String>, _> = client.smembers(self.keys.chans(app)).await;
+        let members = match members {
+            Ok(m) => m,
+            Err(e) => {
+                tracing::warn!(error = %e, app, "redis SMEMBERS chans failed; falling back to local channels");
+                return self.local.channels(app, prefix).await;
+            }
+        };
+
+        let mut out = Vec::new();
+        for name in members {
+            if let Some(p) = prefix {
+                if !name.starts_with(p) {
+                    continue;
+                }
+            }
+            let count: Result<i64, _> = client.hlen(self.keys.occ(app, &name)).await;
+            let count = match count {
+                Ok(c) => c,
+                Err(e) => {
+                    tracing::warn!(error = %e, app, channel = %name, "redis HLEN occ failed; falling back to local channels");
+                    return self.local.channels(app, prefix).await;
+                }
+            };
+            // A channel indexed in the set but with HLEN 0 is mid-vacate; skip it so
+            // callers never see a phantom occupied channel.
+            if count <= 0 {
+                continue;
+            }
+            // `user_count` (the presence roster) stays node-local in SP7a.
+            let user_count = self.local.channel(app, &name).await.user_count;
+            out.push(ChannelSummary {
+                name,
+                occupied: true,
+                subscription_count: count as usize,
+                user_count,
+            });
+        }
+        out
     }
 
     async fn channel(&self, app: &str, channel: &str) -> ChannelSummary {
-        self.local.channel(app, channel).await
+        // `HLEN occ` is the authoritative cluster-wide subscription count; the
+        // presence roster (`user_count`) stays node-local in SP7a.
+        let count: Result<i64, _> = self
+            .clients
+            .pool
+            .next()
+            .hlen(self.keys.occ(app, channel))
+            .await;
+        match count {
+            Ok(count) => {
+                let user_count = self.local.channel(app, channel).await.user_count;
+                ChannelSummary {
+                    name: channel.to_string(),
+                    occupied: count > 0,
+                    subscription_count: count as usize,
+                    user_count,
+                }
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, app, channel, "redis HLEN occ failed; falling back to local channel");
+                self.local.channel(app, channel).await
+            }
+        }
     }
 
     async fn presence_members(&self, app: &str, channel: &str) -> Vec<PresenceMember> {

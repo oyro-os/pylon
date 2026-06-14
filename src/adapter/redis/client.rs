@@ -8,6 +8,7 @@
 
 use fred::clients::SubscriberClient;
 use fred::prelude::*;
+use fred::types::scripts::Script;
 use tokio::task::JoinHandle;
 
 /// The connected fred clients for one Redis adapter instance.
@@ -52,13 +53,57 @@ impl RedisClients {
     }
 }
 
-/// Placeholder for the membership/presence Lua scripts loaded in Phase C.
-/// Empty for now; the SHA-cached scripts are registered here later.
-#[derive(Default)]
-pub struct Scripts {}
+/// SUBSCRIBE membership script. Records this member in the channel's occupancy
+/// hash, refreshes the whole-key TTL backstop, and — on the cluster 0→1 edge —
+/// indexes the channel in the app's active-channels set. Returns the new `HLEN`
+/// (the authoritative cluster-wide subscription count).
+///
+/// `KEYS[1]` = occ hash, `KEYS[2]` = chans set.
+/// `ARGV[1]` = member_token, `ARGV[2]` = expire_at_ms, `ARGV[3]` = ttl_secs,
+/// `ARGV[4]` = channel.
+const SUBSCRIBE_LUA: &str = r#"
+redis.call('HSET', KEYS[1], ARGV[1], ARGV[2])
+redis.call('EXPIRE', KEYS[1], ARGV[3])
+local count = redis.call('HLEN', KEYS[1])
+if count == 1 then redis.call('SADD', KEYS[2], ARGV[4]) end
+return count
+"#;
+
+/// UNSUBSCRIBE membership script. Removes this member from the occupancy hash and
+/// — on the cluster 1→0 edge — deletes the now-empty hash and de-indexes the
+/// channel. Returns the remaining `HLEN` (authoritative cluster-wide count).
+///
+/// `KEYS[1]` = occ hash, `KEYS[2]` = chans set.
+/// `ARGV[1]` = member_token, `ARGV[2]` = channel.
+const UNSUBSCRIBE_LUA: &str = r#"
+redis.call('HDEL', KEYS[1], ARGV[1])
+local count = redis.call('HLEN', KEYS[1])
+if count <= 0 then redis.call('DEL', KEYS[1]); redis.call('SREM', KEYS[2], ARGV[2]) end
+return count
+"#;
+
+/// The membership/presence Lua scripts, compiled (SHA-1 hashed) at adapter build
+/// time. `Script::from_lua` is purely local — no Redis round-trip — and the scripts
+/// are loaded lazily on first use via `evalsha_with_reload`'s NOSCRIPT fallback.
+pub struct Scripts {
+    /// Records a member and returns the new cluster-wide subscription count.
+    pub subscribe: Script,
+    /// Removes a member and returns the remaining cluster-wide subscription count.
+    pub unsubscribe: Script,
+}
 
 impl Scripts {
+    /// Compile the membership scripts. No Redis access — just SHA-1 hashing.
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            subscribe: Script::from_lua(SUBSCRIBE_LUA),
+            unsubscribe: Script::from_lua(UNSUBSCRIBE_LUA),
+        }
+    }
+}
+
+impl Default for Scripts {
+    fn default() -> Self {
+        Self::new()
     }
 }
