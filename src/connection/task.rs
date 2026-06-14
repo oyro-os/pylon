@@ -110,8 +110,13 @@ pub async fn run(socket: WebSocket, codec: Box<dyn Codec>, params: ConnectionPar
                 let now = Instant::now();
                 match ping_sent_at {
                     Some(sent) if now.duration_since(sent) >= pong => {
-                        let frame = codec.encode(&ServerEvent::Error(PusherError::pong_not_received()));
-                        let _ = sink.send(Message::Text(frame.into())).await;
+                        use axum::extract::ws::CloseFrame;
+                        let _ = sink
+                            .send(Message::Close(Some(CloseFrame {
+                                code: 4201,
+                                reason: "Pong reply not received".into(),
+                            })))
+                            .await;
                         break;
                     }
                     None if now.duration_since(last_activity) >= activity => {

@@ -201,11 +201,12 @@ async fn idle_connection_closed_4201() {
     let est = next_json(&mut ws).await;
     assert_eq!(est["event"], "pusher:connection_established");
 
-    // Stay silent. Server pings after ~1s, then closes ~1s later with 4201.
+    // Stay silent. Server pings after ~1s, then closes ~1s later with a real
+    // WebSocket Close frame carrying code 4201.
     // (tokio-tungstenite auto-replies to protocol-level Pings, but pusher:ping is
     //  an application Text frame, so the server gets no pong and must close.)
     let mut saw_ping = false;
-    let mut saw_4201 = false;
+    let mut saw_close_4201 = false;
     for _ in 0..6 {
         match tokio::time::timeout(std::time::Duration::from_secs(3), ws.next()).await {
             Ok(Some(Ok(Message::Text(t)))) => {
@@ -213,20 +214,33 @@ async fn idle_connection_closed_4201() {
                 if v["event"] == "pusher:ping" {
                     saw_ping = true;
                 }
+                // After the fix, the server must NOT emit a pusher:error 4201 text
+                // frame — it must send a WebSocket Close frame instead.
                 if v["event"] == "pusher:error" {
-                    assert_eq!(v["data"]["code"], 4201);
-                    saw_4201 = true;
-                    break;
+                    panic!("server sent pusher:error text frame instead of a WS Close frame");
                 }
             }
-            Ok(Some(Ok(Message::Close(_)))) | Ok(None) => break,
+            Ok(Some(Ok(Message::Close(Some(cf))))) => {
+                assert_eq!(
+                    u16::from(cf.code),
+                    4201,
+                    "expected WS close code 4201, got {}",
+                    cf.code
+                );
+                saw_close_4201 = true;
+                break;
+            }
+            Ok(Some(Ok(Message::Close(None)))) | Ok(None) => break,
             Ok(Some(Ok(_))) => {}
             Ok(Some(Err(_))) => break,
             Err(_) => break, // timed out
         }
     }
     assert!(saw_ping, "server should have sent a pusher:ping");
-    assert!(saw_4201, "server should have closed with 4201");
+    assert!(
+        saw_close_4201,
+        "server should have closed with WS close code 4201"
+    );
 }
 
 #[tokio::test]
