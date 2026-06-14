@@ -593,6 +593,119 @@ async fn private_cache_subscribe_replays_after_auth() {
     assert_eq!(replay["channel"], "private-cache-x");
 }
 
+// ── P7 parity tests ─────────────────────────────────────────────────────────
+
+/// P7(a): event `data` exceeding per-event cap → 413, not 400.
+#[tokio::test]
+async fn rest_event_data_too_large_is_413() {
+    let addr = spawn().await;
+    // max_event_payload_bytes default = 10 240; craft a data string just over it.
+    let big_data = "x".repeat(10_241);
+    let body = json!({"name":"e","data": big_data,"channels":["c"]}).to_string();
+    let q = signed_query("POST", "/apps/app1/events", body.as_bytes(), &[]);
+    let resp = reqwest::Client::new()
+        .post(format!("http://{addr}/apps/app1/events?{q}"))
+        .body(body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 413, "oversized event data must be 413");
+}
+
+/// P7(a) batch: any item's `data` exceeding per-event cap → 413.
+#[tokio::test]
+async fn rest_batch_event_data_too_large_is_413() {
+    let addr = spawn().await;
+    let big_data = "x".repeat(10_241);
+    let body = json!({"batch":[{"name":"e","data": big_data,"channel":"c"}]}).to_string();
+    let q = signed_query("POST", "/apps/app1/batch_events", body.as_bytes(), &[]);
+    let resp = reqwest::Client::new()
+        .post(format!("http://{addr}/apps/app1/batch_events?{q}"))
+        .body(body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 413, "oversized batch item data must be 413");
+}
+
+/// P7(b): GET /channels?info=user_count without a presence filter → 400.
+#[tokio::test]
+async fn rest_channels_user_count_without_presence_filter_is_400() {
+    let addr = spawn().await;
+    let q = signed_query("GET", "/apps/app1/channels", b"", &[("info", "user_count")]);
+    let resp = reqwest::Client::new()
+        .get(format!("http://{addr}/apps/app1/channels?{q}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        400,
+        "user_count without presence filter must be 400"
+    );
+}
+
+/// P7(b): GET /channels?info=user_count&filter_by_prefix=presence- → 200.
+#[tokio::test]
+async fn rest_channels_user_count_with_presence_filter_is_200() {
+    let addr = spawn().await;
+    let q = signed_query(
+        "GET",
+        "/apps/app1/channels",
+        b"",
+        &[("info", "user_count"), ("filter_by_prefix", "presence-")],
+    );
+    let resp = reqwest::Client::new()
+        .get(format!("http://{addr}/apps/app1/channels?{q}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        200,
+        "user_count with presence filter must be 200"
+    );
+}
+
+/// P7(c): GET /channels/{channel}/users on a non-presence channel → 400.
+#[tokio::test]
+async fn rest_users_on_non_presence_channel_is_400() {
+    let addr = spawn().await;
+    let q = signed_query("GET", "/apps/app1/channels/public-room/users", b"", &[]);
+    let resp = reqwest::Client::new()
+        .get(format!(
+            "http://{addr}/apps/app1/channels/public-room/users?{q}"
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        400,
+        "users endpoint on non-presence channel must be 400"
+    );
+}
+
+/// P7(c): GET /channels/{channel}/users on a presence- channel → 200.
+#[tokio::test]
+async fn rest_users_on_presence_channel_is_200() {
+    let addr = spawn().await;
+    // No members — but the channel name is valid so it must return 200 + empty list.
+    let q = signed_query("GET", "/apps/app1/channels/presence-empty/users", b"", &[]);
+    let resp = reqwest::Client::new()
+        .get(format!(
+            "http://{addr}/apps/app1/channels/presence-empty/users?{q}"
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        200,
+        "users endpoint on presence channel must be 200"
+    );
+}
+
 #[tokio::test]
 async fn rest_body_too_large_is_413() {
     let addr = spawn().await;

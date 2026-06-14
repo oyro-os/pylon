@@ -23,6 +23,13 @@ pub async fn get_channels(
     let app = authenticate(&state, &app_id, "GET", uri.path(), &params, &[]).await?;
     let prefix = params.get("filter_by_prefix").map(String::as_str);
     let want_user_count = wants(&params, "user_count");
+    // Pusher: "If user_count is requested and the request is not limited to
+    // presence channels, the API returns 400."
+    if want_user_count && !prefix.is_some_and(|p| p.starts_with("presence-")) {
+        return Err(RestError::bad_request(
+            "user_count is only allowed when filtering by presence channels",
+        ));
+    }
     let summaries = state.adapter.channels(&app.id, prefix).await;
     let mut chans = Map::new();
     for s in summaries {

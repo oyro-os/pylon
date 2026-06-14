@@ -1,6 +1,8 @@
 //! GET /apps/{app_id}/channels/{name}/users — presence channel user ids.
 //! POST /apps/{app_id}/users/{user_id}/terminate_connections — terminate all user connections.
 
+use crate::channel::kind::AuthKind;
+use crate::channel::kind::ChannelInfo;
 use crate::http::error::RestError;
 use crate::http::rest::auth::authenticate;
 use crate::server::router::AppState;
@@ -17,6 +19,12 @@ pub async fn get_users(
     Query(params): Query<HashMap<String, String>>,
 ) -> Result<Json<Value>, RestError> {
     let app = authenticate(&state, &app_id, "GET", uri.path(), &params, &[]).await?;
+    // Pusher: "Only presence channels allow this functionality."
+    if ChannelInfo::of(&channel).auth != AuthKind::Presence {
+        return Err(RestError::bad_request(
+            "Only presence channels allow this functionality",
+        ));
+    }
     let users: Vec<Value> = state
         .adapter
         .presence_members(&app.id, &channel)

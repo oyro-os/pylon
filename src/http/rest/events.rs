@@ -155,7 +155,7 @@ pub async fn post_events(
     let t: TriggerBody = serde_json::from_slice(&body)
         .map_err(|_| RestError::bad_request("invalid request body"))?;
     if t.data.len() > state.config.max_event_payload_bytes {
-        return Err(RestError::bad_request("event data too large"));
+        return Err(RestError::payload_too_large("Event message over 10k"));
     }
     let channels = match (&t.channels, &t.channel) {
         (Some(list), _) => list.clone(),
@@ -224,7 +224,7 @@ pub async fn post_batch(
     }
     for item in &b.batch {
         if item.data.len() > state.config.max_event_payload_bytes {
-            return Err(RestError::bad_request("event data too large"));
+            return Err(RestError::payload_too_large("Event message over 10k"));
         }
     }
     for item in &b.batch {

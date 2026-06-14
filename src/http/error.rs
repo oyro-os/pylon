@@ -23,6 +23,12 @@ impl RestError {
             message: message.into(),
         }
     }
+    pub fn payload_too_large(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::PAYLOAD_TOO_LARGE,
+            message: message.into(),
+        }
+    }
 }
 
 impl IntoResponse for RestError {
@@ -41,6 +47,10 @@ mod tests {
         assert_eq!(
             RestError::unauthorized("x").status,
             StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            RestError::payload_too_large("x").status,
+            StatusCode::PAYLOAD_TOO_LARGE
         );
     }
 }
