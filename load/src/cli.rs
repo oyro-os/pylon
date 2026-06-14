@@ -29,6 +29,10 @@ pub struct Cli {
     /// Publish rate (events/sec)
     #[arg(long, default_value_t = 10)]
     pub rate: u64,
+    /// Number of concurrent publishers (fanout scenario); each runs the publish loop
+    /// at `rate` events/sec, all fanning out to the same channel.
+    #[arg(long, default_value_t = 1)]
+    pub publishers: usize,
     /// Measured duration (seconds)
     #[arg(long, default_value_t = 10)]
     pub secs: u64,
