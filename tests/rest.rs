@@ -356,6 +356,66 @@ async fn rest_get_channels_lists_occupied_channel() {
     assert!(v["channels"]["public-room"].is_object());
 }
 
+// P15 — GET /channels list must emit per-channel subscription_count
+
+/// GET /channels?info=subscription_count with flag ON → each channel carries subscription_count.
+#[tokio::test]
+async fn rest_get_channels_list_subscription_count_enabled() {
+    let addr = spawn().await;
+    // Connect on app2 which has subscription_count_enabled=true.
+    let mut ws = connect_ws2(addr).await;
+    let _ = next_json(&mut ws).await; // established
+    subscribe_public(&mut ws, "public-room").await;
+
+    let q = signed_query2(
+        "GET",
+        "/apps/app2/channels",
+        b"",
+        &[("info", "subscription_count")],
+    );
+    let resp = reqwest::Client::new()
+        .get(format!("http://{addr}/apps/app2/channels?{q}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let v: Value = resp.json().await.unwrap();
+    assert_eq!(
+        v["channels"]["public-room"]["subscription_count"], 1,
+        "GET /channels with flag ON must emit subscription_count per channel (P15), got: {v}"
+    );
+}
+
+/// GET /channels?info=subscription_count with flag OFF → attribute absent.
+#[tokio::test]
+async fn rest_get_channels_list_subscription_count_disabled() {
+    let addr = spawn().await;
+    // app1 has subscription_count_enabled=false.
+    let mut ws = connect_ws(addr).await;
+    let _ = next_json(&mut ws).await;
+    subscribe_public(&mut ws, "public-room").await;
+
+    let q = signed_query(
+        "GET",
+        "/apps/app1/channels",
+        b"",
+        &[("info", "subscription_count")],
+    );
+    let resp = reqwest::Client::new()
+        .get(format!("http://{addr}/apps/app1/channels?{q}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let v: Value = resp.json().await.unwrap();
+    assert!(
+        v["channels"]["public-room"]
+            .get("subscription_count")
+            .is_none(),
+        "GET /channels with flag OFF must NOT emit subscription_count (P15), got: {v}"
+    );
+}
+
 #[tokio::test]
 async fn rest_get_users_lists_presence_members() {
     let addr = spawn().await;
@@ -457,6 +517,26 @@ async fn rest_trigger_encrypted_plus_public_is_400() {
         "name": "secret",
         "data": "x",
         "channels": ["private-encrypted-a", "public-b"]
+    })
+    .to_string();
+    let q = signed_query("POST", "/apps/app1/events", body.as_bytes(), &[]);
+    let resp = reqwest::Client::new()
+        .post(format!("http://{addr}/apps/app1/events?{q}"))
+        .body(body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400);
+}
+
+/// An empty channel name must be rejected on the REST trigger path (400) — parity P14.
+#[tokio::test]
+async fn rest_trigger_empty_channel_name_is_400() {
+    let addr = spawn().await;
+    let body = json!({
+        "name": "e",
+        "data": "x",
+        "channels": [""]
     })
     .to_string();
     let q = signed_query("POST", "/apps/app1/events", body.as_bytes(), &[]);
@@ -835,5 +915,34 @@ async fn rest_batch_event_name_over_200_is_400() {
         resp.status(),
         400,
         "batch event name over 200 chars must be 400"
+    );
+}
+
+// ── P13 parity tests — pre-handshake reject must carry Pusher 4xxx close code ─
+
+/// Connecting to an unknown app key triggers a 4001 rejection.  The WebSocket Close
+/// frame must carry code 4001 (not 1005 / no-status-received), so pusher-js
+/// resolves `getCloseAction` → `"refused"` rather than `null → backoff`.
+#[tokio::test]
+async fn ws_unknown_app_key_close_frame_carries_4001() {
+    use tokio_tungstenite::tungstenite::Message;
+    let addr = spawn().await;
+    let (mut ws, _) =
+        tokio_tungstenite::connect_async(format!("ws://{addr}/app/no-such-key?protocol=7"))
+            .await
+            .unwrap();
+
+    // Drain frames until we see a Close.
+    let mut close_code: Option<u16> = None;
+    while let Some(Ok(msg)) = ws.next().await {
+        if let Message::Close(frame) = msg {
+            close_code = frame.map(|f| u16::from(f.code));
+            break;
+        }
+    }
+    assert_eq!(
+        close_code,
+        Some(4001),
+        "unknown-app-key reject must close with code 4001 (P13), got: {close_code:?}"
     );
 }

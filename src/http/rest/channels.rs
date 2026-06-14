@@ -23,6 +23,7 @@ pub async fn get_channels(
     let app = authenticate(&state, &app_id, "GET", uri.path(), &params, &[]).await?;
     let prefix = params.get("filter_by_prefix").map(String::as_str);
     let want_user_count = wants(&params, "user_count");
+    let want_subscription_count = wants(&params, "subscription_count");
     // Pusher: "If user_count is requested and the request is not limited to
     // presence channels, the API returns 400."
     if want_user_count && !prefix.is_some_and(|p| p.starts_with("presence-")) {
@@ -38,6 +39,9 @@ pub async fn get_channels(
             if let Some(uc) = s.user_count {
                 attrs.insert("user_count".into(), uc.into());
             }
+        }
+        if want_subscription_count && app.subscription_count_enabled {
+            attrs.insert("subscription_count".into(), s.subscription_count.into());
         }
         chans.insert(s.name, Value::Object(attrs));
     }
