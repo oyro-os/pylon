@@ -47,7 +47,7 @@ pub async fn get_channel(
     let s = state.adapter.channel(&app.id, &channel).await;
     let mut out = Map::new();
     out.insert("occupied".into(), Value::Bool(s.occupied));
-    if wants(&params, "subscription_count") {
+    if wants(&params, "subscription_count") && app.subscription_count_enabled {
         out.insert("subscription_count".into(), s.subscription_count.into());
     }
     if wants(&params, "user_count") {

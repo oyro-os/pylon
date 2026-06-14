@@ -17,9 +17,12 @@ use tokio_tungstenite::tungstenite::Message;
 
 const APPS: &str = r#"[
     {"name":"Test","id":"app1","key":"app-key","secret":"app-secret",
-     "client_messages_enabled":true,"subscription_count_enabled":false}
+     "client_messages_enabled":true,"subscription_count_enabled":false},
+    {"name":"Test2","id":"app2","key":"app2-key","secret":"app2-secret",
+     "client_messages_enabled":true,"subscription_count_enabled":true}
 ]"#;
 const SECRET: &str = "app-secret";
+const SECRET2: &str = "app2-secret";
 
 type Ws =
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
@@ -73,6 +76,40 @@ async fn connect_ws(addr: SocketAddr) -> Ws {
         .await
         .unwrap();
     ws
+}
+
+async fn connect_ws2(addr: SocketAddr) -> Ws {
+    let (ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/app/app2-key?protocol=7"))
+        .await
+        .unwrap();
+    ws
+}
+
+fn signed_query2(method: &str, path: &str, body: &[u8], extra: &[(&str, &str)]) -> String {
+    use pylon::auth::signature::hmac_sha256_hex;
+    use pylon::auth::signature::md5_hex;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let mut p: BTreeMap<String, String> = BTreeMap::new();
+    p.insert("auth_key".into(), "app2-key".into());
+    p.insert("auth_timestamp".into(), now.to_string());
+    p.insert("auth_version".into(), "1.0".into());
+    if !body.is_empty() {
+        p.insert("body_md5".into(), md5_hex(body));
+    }
+    for (k, v) in extra {
+        p.insert((*k).to_string(), (*v).to_string());
+    }
+    let canon = p
+        .iter()
+        .map(|(k, v)| format!("{k}={v}"))
+        .collect::<Vec<_>>()
+        .join("&");
+    let signed = format!("{}\n{}\n{}", method.to_uppercase(), path, canon);
+    let sig = hmac_sha256_hex(SECRET2, &signed);
+    format!("{canon}&auth_signature={sig}")
 }
 
 async fn next_json(ws: &mut Ws) -> Value {
@@ -173,7 +210,97 @@ async fn rest_get_channel_reports_occupancy() {
     assert_eq!(resp.status(), 200);
     let v: Value = resp.json().await.unwrap();
     assert_eq!(v["occupied"], true);
-    assert_eq!(v["subscription_count"], 1);
+    // app1 has subscription_count_enabled:false → attribute must be omitted
+    assert!(
+        v.get("subscription_count").is_none(),
+        "subscription_count must be absent when flag is off, got: {v}"
+    );
+}
+
+/// GET /channels/:name with subscription_count_enabled=true → attribute present.
+#[tokio::test]
+async fn rest_get_channel_subscription_count_enabled() {
+    let addr = spawn().await;
+    let mut ws = connect_ws2(addr).await;
+    let _ = next_json(&mut ws).await;
+    ws.send(Message::Text(
+        json!({"event":"pusher:subscribe","data":{"channel":"public-room"}}).to_string(),
+    ))
+    .await
+    .unwrap();
+    let _ = next_json(&mut ws).await;
+
+    let q = signed_query2(
+        "GET",
+        "/apps/app2/channels/public-room",
+        b"",
+        &[("info", "subscription_count")],
+    );
+    let resp = reqwest::Client::new()
+        .get(format!("http://{addr}/apps/app2/channels/public-room?{q}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let v: Value = resp.json().await.unwrap();
+    assert_eq!(v["occupied"], true);
+    // app2 has subscription_count_enabled:true → attribute must be present
+    assert_eq!(
+        v["subscription_count"], 1,
+        "subscription_count must be 1 when flag is on, got: {v}"
+    );
+}
+
+/// POST /events with info=subscription_count and flag OFF → attribute omitted.
+#[tokio::test]
+async fn rest_trigger_info_subscription_count_disabled() {
+    let addr = spawn().await;
+    let body =
+        json!({"name":"ev","data":"{}","channels":["public-room"],"info":"subscription_count"})
+            .to_string();
+    let q = signed_query("POST", "/apps/app1/events", body.as_bytes(), &[]);
+    let resp = reqwest::Client::new()
+        .post(format!("http://{addr}/apps/app1/events?{q}"))
+        .body(body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let v: Value = resp.json().await.unwrap();
+    // channels key present but subscription_count must be absent per-channel
+    let ch = &v["channels"]["public-room"];
+    assert!(
+        ch.get("subscription_count").is_none(),
+        "subscription_count must be absent when flag is off, got: {v}"
+    );
+}
+
+/// POST /events with info=subscription_count and flag ON → attribute present.
+#[tokio::test]
+async fn rest_trigger_info_subscription_count_enabled() {
+    let addr = spawn().await;
+    // Subscribe a client to the channel so subscription_count > 0.
+    let mut ws = connect_ws2(addr).await;
+    let _ = next_json(&mut ws).await;
+    subscribe_public(&mut ws, "public-room").await;
+
+    let body =
+        json!({"name":"ev","data":"{}","channels":["public-room"],"info":"subscription_count"})
+            .to_string();
+    let q = signed_query2("POST", "/apps/app2/events", body.as_bytes(), &[]);
+    let resp = reqwest::Client::new()
+        .post(format!("http://{addr}/apps/app2/events?{q}"))
+        .body(body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let v: Value = resp.json().await.unwrap();
+    let ch = &v["channels"]["public-room"];
+    assert_eq!(
+        ch["subscription_count"], 1,
+        "subscription_count must be present when flag is on, got: {v}"
+    );
 }
 
 #[tokio::test]

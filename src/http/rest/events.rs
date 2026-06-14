@@ -125,14 +125,17 @@ async fn channel_attrs(
     app_id: &str,
     channel: &str,
     info: Option<&str>,
+    subscription_count_enabled: bool,
 ) -> Map<String, Value> {
     let mut attrs = Map::new();
-    if wants(info, "subscription_count") || wants(info, "user_count") {
+    let want_sub = wants(info, "subscription_count") && subscription_count_enabled;
+    let want_uc = wants(info, "user_count");
+    if want_sub || want_uc {
         let s = state.adapter.channel(app_id, channel).await;
-        if wants(info, "subscription_count") {
+        if want_sub {
             attrs.insert("subscription_count".into(), s.subscription_count.into());
         }
-        if wants(info, "user_count") {
+        if want_uc {
             if let Some(uc) = s.user_count {
                 attrs.insert("user_count".into(), uc.into());
             }
@@ -189,7 +192,16 @@ pub async fn post_events(
         for ch in &channels {
             chans.insert(
                 ch.clone(),
-                Value::Object(channel_attrs(&state, &app.id, ch, t.info.as_deref()).await),
+                Value::Object(
+                    channel_attrs(
+                        &state,
+                        &app.id,
+                        ch,
+                        t.info.as_deref(),
+                        app.subscription_count_enabled,
+                    )
+                    .await,
+                ),
             );
         }
         out.insert("channels".into(), Value::Object(chans));
@@ -232,7 +244,14 @@ pub async fn post_batch(
         let mut arr = Vec::new();
         for item in &b.batch {
             arr.push(Value::Object(
-                channel_attrs(&state, &app.id, &item.channel, item.info.as_deref()).await,
+                channel_attrs(
+                    &state,
+                    &app.id,
+                    &item.channel,
+                    item.info.as_deref(),
+                    app.subscription_count_enabled,
+                )
+                .await,
             ));
         }
         out.insert("batch".into(), Value::Array(arr));
