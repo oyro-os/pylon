@@ -34,6 +34,8 @@ mod pylon_dispatcher_helpers {
             Arc::new(FixedClock(1700000000000)),
             batch_ms,
             1024,
+            0,    // local path: vacated fires immediately (no grace)
+            None, // no cluster occupancy source
         );
         (handle, recorder)
     }

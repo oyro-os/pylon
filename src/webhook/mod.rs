@@ -6,6 +6,7 @@
 pub mod batch;
 pub mod dispatcher;
 pub mod event;
+pub mod occupancy;
 pub mod transport;
 
 use crate::app::AppManager;
@@ -14,6 +15,8 @@ use event::WebhookEvent;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use transport::WebhookTransport;
+
+pub use occupancy::{AdapterOccupancy, OccupancySource};
 
 /// Cheap-clone enqueue handle held in `AppState` and `ConnectionContext`. The
 /// WS path NEVER blocks on it: `enqueue` is a non-awaiting `try_send` that drops
@@ -53,15 +56,32 @@ impl WebhookHandle {
 
 /// Spawn the dispatcher actor and return the enqueue handle. `mailbox_capacity`
 /// sizes the bounded channel (the §8 backpressure safety valve).
+///
+/// `vacated_grace_ms` + `occupancy` enable the cluster-aware `channel_vacated`
+/// grace window (Task D1): when both are active (grace > 0 and `occupancy` is
+/// `Some`), a surviving `channel_vacated` is debounced by the grace window and
+/// re-checked against the cluster subscription_count before firing — suppressed
+/// if the channel is occupied again anywhere in the cluster. With `0` / `None`
+/// (the local-adapter path) vacated fires immediately, as before.
 pub fn spawn(
     apps: Arc<dyn AppManager>,
     transport: Arc<dyn WebhookTransport>,
     clock: Arc<dyn Clock>,
     batch_ms: u64,
     mailbox_capacity: usize,
+    vacated_grace_ms: u64,
+    occupancy: Option<Arc<dyn OccupancySource>>,
 ) -> WebhookHandle {
     let (tx, rx) = mpsc::channel(mailbox_capacity);
-    let dispatcher = WebhookDispatcher::new(rx, apps, transport, clock, batch_ms);
+    let dispatcher = WebhookDispatcher::new(
+        rx,
+        apps,
+        transport,
+        clock,
+        batch_ms,
+        vacated_grace_ms,
+        occupancy,
+    );
     tokio::spawn(dispatcher.run());
     WebhookHandle { tx }
 }

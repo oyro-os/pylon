@@ -17,7 +17,8 @@ async fn main() -> anyhow::Result<()> {
     pylon::init_tracing();
     let config = ServerConfig::from_env();
     let apps: Arc<dyn AppManager> = Arc::new(StaticFileAppManager::from_file(&config.apps_path)?);
-    let adapter: Arc<dyn Adapter> = if config.adapter == "redis" {
+    let is_redis = config.adapter == "redis";
+    let adapter: Arc<dyn Adapter> = if is_redis {
         Arc::new(pylon::adapter::redis::RedisAdapter::new(&config).await?)
     } else {
         Arc::new(LocalAdapter::new(Arc::new(Registry::new())))
@@ -30,6 +31,18 @@ async fn main() -> anyhow::Result<()> {
         config.webhook_timeout_ms,
         config.webhook_max_concurrency,
     ));
+    // Cluster-aware `channel_vacated` grace window (Task D1): only the Redis
+    // (multi-node) path debounces+rechecks vacated. The local path fires
+    // immediately (grace = 0, no occupancy source).
+    let (vacated_grace_ms, occupancy): (u64, Option<Arc<dyn pylon::webhook::OccupancySource>>) =
+        if is_redis {
+            (
+                config.webhook_vacated_grace_ms,
+                Some(Arc::new(pylon::webhook::AdapterOccupancy(adapter.clone()))),
+            )
+        } else {
+            (0, None)
+        };
     let webhooks = pylon::webhook::spawn(
         apps.clone(),
         transport,
@@ -37,6 +50,8 @@ async fn main() -> anyhow::Result<()> {
         config.webhook_batch_ms,
         // Generously sized mailbox (the §8 backpressure safety valve).
         config.webhook_max_concurrency.saturating_mul(100).max(1024),
+        vacated_grace_ms,
+        occupancy,
     );
 
     let state = AppState {

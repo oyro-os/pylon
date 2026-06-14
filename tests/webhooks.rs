@@ -88,6 +88,8 @@ async fn spawn_pylon(receiver: SocketAddr) -> SocketAddr {
         Arc::new(SystemClock),
         30, // 30ms batch window
         1024,
+        0,    // local path: vacated fires immediately (no grace)
+        None, // no cluster occupancy source
     );
     let config = ServerConfig {
         webhook_batch_ms: 30,
