@@ -586,8 +586,15 @@ impl Adapter for RedisAdapter {
             if count <= 0 {
                 continue;
             }
-            // `user_count` (the presence roster) stays node-local in SP7a.
-            let user_count = self.local.channel(app, &name).await.user_count;
+            // Presence `user_count` (distinct-user roster) is cluster-wide via Redis;
+            // non-presence channels have none.
+            let user_count = if presence::is_presence(&name) {
+                presence::user_count(&self.clients.pool, &self.keys, app, &name)
+                    .await
+                    .ok()
+            } else {
+                None
+            };
             out.push(ChannelSummary {
                 name,
                 occupied: true,
@@ -609,7 +616,17 @@ impl Adapter for RedisAdapter {
             .await;
         match count {
             Ok(count) => {
-                let user_count = self.local.channel(app, channel).await.user_count;
+                let user_count = if presence::is_presence(channel) {
+                    match presence::user_count(&self.clients.pool, &self.keys, app, channel).await {
+                        Ok(n) => Some(n),
+                        Err(e) => {
+                            tracing::warn!(error = %e, app, channel, "redis presence user_count failed; using local");
+                            self.local.channel(app, channel).await.user_count
+                        }
+                    }
+                } else {
+                    None
+                };
                 ChannelSummary {
                     name: channel.to_string(),
                     occupied: count > 0,
@@ -625,7 +642,13 @@ impl Adapter for RedisAdapter {
     }
 
     async fn presence_members(&self, app: &str, channel: &str) -> Vec<PresenceMember> {
-        self.local.presence_members(app, channel).await
+        match presence::members(&self.clients.pool, &self.keys, app, channel).await {
+            Ok(m) => m,
+            Err(e) => {
+                tracing::warn!(error = %e, app, channel, "redis presence_members failed; falling back to local");
+                self.local.presence_members(app, channel).await
+            }
+        }
     }
 
     async fn cache_set(&self, app: &str, channel: &str, event: CachedEvent, ttl: Duration) {

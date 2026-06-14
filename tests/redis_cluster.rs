@@ -939,3 +939,64 @@ async fn cross_node_presence_member_removed_single_emit() {
     .await
     .expect("presence member_removed test must not hang (Redis up?)");
 }
+
+/// B2 (SP7b): `presence_members` and the presence `user_count` are CLUSTER-wide.
+/// With u1 on A and u2 on B, A's `channel().user_count`, `presence_members`, and the
+/// matching `channels()` entry must all reflect both users — not just A's local one.
+///
+/// (RED before B2: `channel().user_count` was node-local, so A would see `Some(1)` and
+/// `presence_members` would list only u1.)
+#[tokio::test]
+async fn cross_node_presence_user_count_and_members() {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let prefix = random_prefix();
+        let adapter_a = connect_adapter_with_prefix(&prefix).await;
+        let adapter_b = connect_adapter_with_prefix(&prefix).await;
+
+        // u1 on A, u2 on B → cluster presence of 2 distinct users.
+        let (_s1, h1, m1) = presence_handle("u1", serde_json::json!({"name":"Ann"}));
+        adapter_a
+            .subscribe(TEST_APP, "presence-room", h1, Some(m1))
+            .await;
+        let (_s2, h2, m2) = presence_handle("u2", serde_json::json!({"name":"Bob"}));
+        adapter_b
+            .subscribe(TEST_APP, "presence-room", h2, Some(m2))
+            .await;
+
+        // A's channel() user_count is the cluster distinct-user count (2).
+        let summary = adapter_a.channel(TEST_APP, "presence-room").await;
+        assert_eq!(
+            summary.user_count,
+            Some(2),
+            "channel().user_count must be the cluster-wide distinct-user count"
+        );
+
+        // A's presence_members lists BOTH users, sorted by user_id.
+        let members = adapter_a.presence_members(TEST_APP, "presence-room").await;
+        assert_eq!(
+            members.len(),
+            2,
+            "presence_members must list the whole cluster roster"
+        );
+        let ids: Vec<String> = members.iter().map(|m| m.user_id.clone()).collect();
+        assert_eq!(
+            ids,
+            vec!["u1".to_string(), "u2".to_string()],
+            "presence_members ids must be sorted and contain u1,u2"
+        );
+
+        // channels(presence-) lists presence-room with the cluster user_count.
+        let all = adapter_a.channels(TEST_APP, Some("presence-")).await;
+        let pr = all
+            .iter()
+            .find(|c| c.name == "presence-room")
+            .expect("channels() must list presence-room while it is occupied");
+        assert_eq!(
+            pr.user_count,
+            Some(2),
+            "channels() entry must carry the cluster-wide user_count"
+        );
+    })
+    .await
+    .expect("presence user_count/members test must not hang (Redis up?)");
+}

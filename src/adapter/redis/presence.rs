@@ -70,6 +70,41 @@ pub(super) async fn leave(
     Ok(conn == 0)
 }
 
+/// Presence channels are exactly `presence-*` (cache or not).
+pub(super) fn is_presence(channel: &str) -> bool {
+    channel.starts_with("presence-")
+}
+
+/// Cluster roster as `Vec<PresenceMember>` (sorted by user_id) — for `presence_members`.
+pub(super) async fn members(
+    pool: &Pool,
+    keys: &Keys,
+    app: &str,
+    channel: &str,
+) -> anyhow::Result<Vec<PresenceMember>> {
+    let entries: Vec<(String, String)> = pool.next().hgetall(keys.presinfo(app, channel)).await?;
+    let mut members: Vec<PresenceMember> = entries
+        .into_iter()
+        .map(|(user_id, info)| PresenceMember {
+            user_info: serde_json::from_str(&info).unwrap_or(Value::Null),
+            user_id,
+        })
+        .collect();
+    members.sort_by(|a, b| a.user_id.cmp(&b.user_id));
+    Ok(members)
+}
+
+/// Cluster distinct-user count = `HLEN presusers`.
+pub(super) async fn user_count(
+    pool: &Pool,
+    keys: &Keys,
+    app: &str,
+    channel: &str,
+) -> anyhow::Result<usize> {
+    let n: i64 = pool.next().hlen(keys.presusers(app, channel)).await?;
+    Ok(n.max(0) as usize)
+}
+
 /// Cluster roster from `presinfo`: sorted ids, id→user_info hash, distinct count.
 pub(super) async fn roster(
     pool: &Pool,
