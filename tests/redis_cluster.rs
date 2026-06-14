@@ -58,6 +58,20 @@ fn redis_test_config_with_ttl(prefix: &str, ttl_secs: u64, heartbeat_secs: u64) 
     }
 }
 
+/// Build a connected `RedisAdapter` sharing a `prefix` with a short membership TTL +
+/// heartbeat cadence — used by the sweeper tests to make crashed-node members go stale
+/// fast while a live node keeps its own members fresh.
+async fn connect_adapter_with_prefix_ttl(
+    prefix: &str,
+    ttl_secs: u64,
+    heartbeat_secs: u64,
+) -> RedisAdapter {
+    let cfg = redis_test_config_with_ttl(prefix, ttl_secs, heartbeat_secs);
+    RedisAdapter::new(&cfg)
+        .await
+        .expect("RedisAdapter::new must connect to the test Redis")
+}
+
 /// Build a connected `RedisAdapter` against the test Redis. Fails loud if Redis
 /// is down.
 async fn connect_adapter() -> RedisAdapter {
@@ -477,4 +491,185 @@ async fn membership_heartbeat_keeps_member_alive_past_ttl() {
     })
     .await
     .expect("heartbeat test must not hang (Redis up?)");
+}
+
+/// Current wall-clock millis since the Unix epoch (mirrors the adapter's internal
+/// `now_ms`; the sweeper test seam takes `now` so the test drives time deterministically).
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// D2: the lease-locked sweeper reaps members whose `expireAt` is in the past (a
+/// crashed node's members go stale once its heartbeat stops re-stamping them) but must
+/// NOT vacate a channel that a LIVE node still holds. Two nodes A and B both subscribe
+/// to `public-room`; A "crashes" (drop aborts its heartbeat) while B keeps its member
+/// fresh. After the TTL elapses, B's sweep reaps A's stale member but leaves the channel
+/// occupied (B's member is still live).
+#[tokio::test]
+async fn sweeper_reaps_dead_node_members_without_vacating_live_channel() {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let prefix = random_prefix();
+        // ttl=2s, heartbeat=1s. The 2s TTL keeps A's `expireAt` (last stamped at most
+        // ~one heartbeat after the drop) reapable on a comfortable margin, while B's 1s
+        // heartbeat keeps B's member fresh AND keeps the occ key's whole-key TTL alive.
+        let adapter_a = connect_adapter_with_prefix_ttl(&prefix, 2, 1).await;
+        let adapter_b = connect_adapter_with_prefix_ttl(&prefix, 2, 1).await;
+
+        // A subscribes (cluster count 1, occupied), then B subscribes (cluster count 2).
+        let (_sock_a, handle_a) = fake_handle();
+        let out_a = adapter_a
+            .subscribe(TEST_APP, "public-room", handle_a, None)
+            .await;
+        assert_eq!(out_a.subscription_count, 1, "A first subscriber → count 1");
+
+        let (_sock_b, handle_b) = fake_handle();
+        let out_b = adapter_b
+            .subscribe(TEST_APP, "public-room", handle_b, None)
+            .await;
+        assert_eq!(out_b.subscription_count, 2, "B second subscriber → count 2");
+
+        // Crash A: dropping the adapter aborts its heartbeat task, so A's member's
+        // `expireAt` stops being re-stamped and will fall into the past after the TTL.
+        drop(adapter_a);
+
+        // Sleep past A's worst-case `expireAt` (≤ ~2s after its last stamp) so A is
+        // reliably stale, while B's 1s heartbeat keeps B fresh and the occ key alive.
+        tokio::time::sleep(Duration::from_millis(2600)).await;
+
+        // B sweeps. It holds the lease (nobody else does), reaps A's stale member, but
+        // must NOT vacate the channel because B's member is still live.
+        let webhooks = pylon::webhook::WebhookHandle::null();
+        let (acquired, reaped, vacated) = adapter_b.sweep_now(&webhooks, now_ms()).await;
+        assert!(acquired, "B must acquire the sweep lease (no other holder)");
+        assert!(
+            reaped >= 1,
+            "B must reap A's stale member (reaped={reaped})"
+        );
+        assert!(
+            !vacated.contains(&(TEST_APP.to_string(), "public-room".to_string())),
+            "public-room must NOT be vacated — B still holds a live member: {vacated:?}"
+        );
+
+        let summary = adapter_b.channel(TEST_APP, "public-room").await;
+        assert_eq!(
+            summary.subscription_count, 1,
+            "after the sweep only B's live member remains → count 1 (got {})",
+            summary.subscription_count
+        );
+    })
+    .await
+    .expect("sweeper-no-vacate test must not hang (Redis up?)");
+}
+
+/// D2: a channel whose only member lived on a crashed node is fully vacated by the
+/// sweep — HDEL'd, DEL'd, de-indexed — and the `(app, channel)` pair shows up in the
+/// returned vacated list (which drives the `ChannelVacated` webhook enqueue).
+#[tokio::test]
+async fn sweeper_vacates_channel_orphaned_by_dead_node() {
+    tokio::time::timeout(Duration::from_secs(8), async {
+        let prefix = random_prefix();
+        let adapter_a = connect_adapter_with_prefix_ttl(&prefix, 1, 1).await;
+        let adapter_b = connect_adapter_with_prefix_ttl(&prefix, 1, 1).await;
+
+        // The only subscriber to `lonely-room` lives on A.
+        let (_sock_a, handle_a) = fake_handle();
+        let out_a = adapter_a
+            .subscribe(TEST_APP, "lonely-room", handle_a, None)
+            .await;
+        assert_eq!(
+            out_a.subscription_count, 1,
+            "A is the only member → count 1"
+        );
+
+        // Crash A so its member goes stale.
+        drop(adapter_a);
+        tokio::time::sleep(Duration::from_millis(1300)).await;
+
+        // B sweeps: A's member is the last one and is stale → vacate. (With a short TTL
+        // the occ hash's whole-key backstop may already have removed A's member by the
+        // time B sweeps; either way the channel is orphaned in `chans` and the sweep
+        // must vacate it — so we assert on the vacate, not on a non-zero `reaped`.)
+        let webhooks = pylon::webhook::WebhookHandle::null();
+        let (acquired, _reaped, vacated) = adapter_b.sweep_now(&webhooks, now_ms()).await;
+        assert!(acquired, "B must acquire the sweep lease");
+        assert!(
+            vacated.contains(&(TEST_APP.to_string(), "lonely-room".to_string())),
+            "lonely-room must be in the vacated list: {vacated:?}"
+        );
+
+        // The occ/chans state is gone.
+        let summary = adapter_b.channel(TEST_APP, "lonely-room").await;
+        assert_eq!(
+            summary.subscription_count, 0,
+            "vacated channel → cluster count 0 (got {})",
+            summary.subscription_count
+        );
+        let all = adapter_b.channels(TEST_APP, None).await;
+        assert!(
+            !all.iter().any(|c| c.name == "lonely-room"),
+            "channels() must not list a vacated channel"
+        );
+    })
+    .await
+    .expect("sweeper-vacate test must not hang (Redis up?)");
+}
+
+/// D2: the sweep is lease-locked. If another node already holds `{prefix}:sweeplock`,
+/// this node must yield — `acquired == false`, no reaping — so exactly one node sweeps
+/// at a time. After the lock is released, the node can acquire it.
+#[tokio::test]
+async fn sweeper_lease_lock_prevents_concurrent_sweep() {
+    tokio::time::timeout(Duration::from_secs(8), async {
+        let prefix = random_prefix();
+        let adapter_b = connect_adapter_with_prefix_ttl(&prefix, 1, 1).await;
+
+        // A raw client grabs the sweeplock as a DIFFERENT node, with a long PX so it
+        // is still held when B tries to sweep.
+        let clients = RedisClients::connect(&test_redis_url(), 2)
+            .await
+            .expect("fred clients must connect to the test Redis");
+        let keys = Keys::new(&prefix);
+        let _: () = clients
+            .pool
+            .next()
+            .set(
+                keys.sweeplock(),
+                "other-node",
+                Some(Expiration::PX(60_000)),
+                None,
+                false,
+            )
+            .await
+            .expect("raw SET sweeplock must succeed");
+
+        // B must yield: it neither holds nor can steal the lease.
+        let webhooks = pylon::webhook::WebhookHandle::null();
+        let (acquired, reaped, vacated) = adapter_b.sweep_now(&webhooks, now_ms()).await;
+        assert!(
+            !acquired,
+            "B must NOT sweep while another node holds the lease"
+        );
+        assert_eq!(reaped, 0, "a yielded sweep must reap nothing");
+        assert!(vacated.is_empty(), "a yielded sweep must vacate nothing");
+
+        // Release the lock; now B can acquire it.
+        let _: () = clients
+            .pool
+            .next()
+            .del(keys.sweeplock())
+            .await
+            .expect("raw DEL sweeplock must succeed");
+        let (acquired2, _r2, _v2) = adapter_b.sweep_now(&webhooks, now_ms()).await;
+        assert!(
+            acquired2,
+            "B must acquire the lease once the other node releases it"
+        );
+
+        let _ = clients.pool.quit().await;
+    })
+    .await
+    .expect("sweeper-lease test must not hang (Redis up?)");
 }

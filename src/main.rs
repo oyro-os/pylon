@@ -18,10 +18,19 @@ async fn main() -> anyhow::Result<()> {
     let config = ServerConfig::from_env();
     let apps: Arc<dyn AppManager> = Arc::new(StaticFileAppManager::from_file(&config.apps_path)?);
     let is_redis = config.adapter == "redis";
-    let adapter: Arc<dyn Adapter> = if is_redis {
-        Arc::new(pylon::adapter::redis::RedisAdapter::new(&config).await?)
+    // Keep the concrete `Arc<RedisAdapter>` so we can start the sweeper AFTER the
+    // webhook dispatcher exists (the sweeper needs the `WebhookHandle`; the dispatcher
+    // needs the adapter-backed occupancy source — start_sweeper breaks that cycle).
+    let redis: Option<Arc<pylon::adapter::redis::RedisAdapter>> = if is_redis {
+        Some(Arc::new(
+            pylon::adapter::redis::RedisAdapter::new(&config).await?,
+        ))
     } else {
-        Arc::new(LocalAdapter::new(Arc::new(Registry::new())))
+        None
+    };
+    let adapter: Arc<dyn Adapter> = match &redis {
+        Some(r) => r.clone(),
+        None => Arc::new(LocalAdapter::new(Arc::new(Registry::new()))),
     };
 
     // Webhook dispatcher: real HTTP transport (reqwest+rustls), system clock.
@@ -53,6 +62,13 @@ async fn main() -> anyhow::Result<()> {
         vacated_grace_ms,
         occupancy,
     );
+
+    // Now that the webhook handle exists, start the Redis sweeper with the SAME
+    // handle AppState uses, so vacated webhooks from sweeps and from WS-driven
+    // unsubscribes share one dispatcher (grace + cluster re-check).
+    if let Some(r) = &redis {
+        r.start_sweeper(webhooks.clone());
+    }
 
     let state = AppState {
         config: config.clone(),

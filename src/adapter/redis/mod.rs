@@ -11,6 +11,7 @@ pub mod client;
 pub mod envelope;
 pub mod keys;
 pub mod pubsub;
+pub mod sweeper;
 
 use super::Adapter;
 use crate::adapter::local::LocalAdapter;
@@ -84,6 +85,43 @@ async fn heartbeat_loop(
     }
 }
 
+/// Node-liveness heartbeat loop. Every `interval_secs`, advertise this node as alive:
+/// `SET node(node_id) "1" EX (3 * interval_secs)` (so a missed beat still leaves slack)
+/// and `SADD nodes node_id`. A dead node simply stops ticking — its `node` key TTL-
+/// expires, and the sweeper's dead-node prune removes it from the `nodes` set.
+///
+/// One Redis error is logged and skipped, never fatal — the loop runs for the
+/// adapter's lifetime.
+async fn node_heartbeat_loop(pool: Pool, keys: keys::Keys, node_id: String, interval_secs: u64) {
+    let interval = interval_secs.max(1);
+    let ttl_secs = (3 * interval) as i64;
+    let mut ticker = tokio::time::interval(Duration::from_secs(interval));
+    loop {
+        ticker.tick().await;
+        let node_key = keys.node(&node_id);
+        if let Err(e) = pool
+            .next()
+            .set::<(), _, _>(
+                &node_key,
+                "1",
+                Some(fred::types::Expiration::EX(ttl_secs)),
+                None,
+                false,
+            )
+            .await
+        {
+            tracing::warn!(error = %e, node_id, "redis node heartbeat SET failed; skipping this tick");
+        }
+        if let Err(e) = pool
+            .next()
+            .sadd::<i64, _, _>(keys.nodes(), node_id.clone())
+            .await
+        {
+            tracing::warn!(error = %e, node_id, "redis node heartbeat SADD nodes failed; skipping this tick");
+        }
+    }
+}
+
 /// The few `ServerConfig` knobs the Redis adapter needs to keep around for the
 /// later phases (TTLs, heartbeat cadence, grace window). Cheap `Copy` struct so
 /// it can be read on any task without locking.
@@ -132,6 +170,16 @@ pub struct RedisAdapter {
     /// dropping it stops the refresh and this node's members would expire.
     #[allow(dead_code)]
     heartbeat_handle: JoinHandle<()>,
+    /// The node-liveness heartbeat. Re-stamps `node(node_id)` (with a TTL) and SADDs
+    /// `node_id` to the `nodes` set each tick. Kept alive for the adapter's lifetime —
+    /// dropping it stops the heartbeat and this node's `node` key TTL-expires.
+    #[allow(dead_code)]
+    node_heartbeat_handle: JoinHandle<()>,
+    /// The lease-locked occupancy sweeper. Started LATER via [`RedisAdapter::start_sweeper`]
+    /// once the `WebhookHandle` exists (it can't start in `new()` because the webhook
+    /// dispatcher needs the adapter-backed occupancy source — a construction cycle the
+    /// deferred start breaks). Stored so the task is not dropped.
+    sweeper_handle: std::sync::Mutex<Option<JoinHandle<()>>>,
 }
 
 impl RedisAdapter {
@@ -168,6 +216,17 @@ impl RedisAdapter {
             heartbeat_loop(hb_local, hb_pool, hb_keys, hb_node, hb_ttl, hb_interval).await
         });
 
+        // Spawn the node-liveness heartbeat. It advertises this node as alive every
+        // `node_heartbeat_secs` (re-stamping the `node` key with a TTL and SADDing to
+        // the `nodes` set), so a dead node's `node` key simply TTL-expires.
+        let nh_pool = clients.pool.clone();
+        let nh_keys = keys.clone();
+        let nh_node = node_id.clone();
+        let nh_interval = redis_cfg.node_heartbeat_secs;
+        let node_heartbeat_handle = tokio::spawn(async move {
+            node_heartbeat_loop(nh_pool, nh_keys, nh_node, nh_interval).await
+        });
+
         Ok(Self {
             local,
             clients,
@@ -178,7 +237,57 @@ impl RedisAdapter {
             scripts: client::Scripts::new(),
             recv_handle,
             heartbeat_handle,
+            node_heartbeat_handle,
+            // The sweeper is started later via `start_sweeper` once the webhook
+            // handle exists (see the doc on the field).
+            sweeper_handle: std::sync::Mutex::new(None),
         })
+    }
+
+    /// Start the lease-locked occupancy sweeper. Called from `main.rs` AFTER the
+    /// webhook dispatcher is spawned (the sweeper needs the `WebhookHandle`, and the
+    /// dispatcher needs the adapter-backed occupancy source — starting the sweeper
+    /// here, rather than in `new()`, breaks that construction cycle).
+    ///
+    /// The sweep interval comes from config; the lease is sized to outlive a tick
+    /// (`max(interval*3s, 5s)`) so the holder keeps the lease across ticks but it
+    /// auto-frees (PX expiry) if the holder dies. The spawned handle is stored so the
+    /// task is not dropped.
+    pub fn start_sweeper(&self, webhooks: crate::webhook::WebhookHandle) {
+        let interval_secs = self.cfg.sweep_interval_secs.max(1);
+        let lease_ms = (interval_secs * 1000 * 3).max(5000);
+        let pool = self.clients.pool.clone();
+        let keys = self.keys.clone();
+        let node_id = self.node_id.clone();
+        let handle = tokio::spawn(async move {
+            sweeper::sweeper_loop(pool, keys, node_id, lease_ms, interval_secs, webhooks).await
+        });
+        if let Ok(mut guard) = self.sweeper_handle.lock() {
+            *guard = Some(handle);
+        }
+    }
+
+    /// Test-support hook: run one deterministic sweep pass with the adapter's own
+    /// pool/keys/node_id and the given `now` millis, returning `(acquired, reaped,
+    /// vacated)`. The integration tests live in an external crate and cannot see the
+    /// `pub(crate)` `sweep_once`, so this thin `#[doc(hidden)] pub` seam exposes it.
+    #[doc(hidden)]
+    pub async fn sweep_now(
+        &self,
+        webhooks: &crate::webhook::WebhookHandle,
+        now_ms: u64,
+    ) -> (bool, usize, Vec<(String, String)>) {
+        let lease_ms = (self.cfg.sweep_interval_secs.max(1) * 1000 * 3).max(5000);
+        let report = sweeper::sweep_once(
+            &self.clients.pool,
+            &self.keys,
+            &self.node_id,
+            lease_ms,
+            webhooks,
+            now_ms,
+        )
+        .await;
+        (report.acquired, report.reaped, report.vacated)
     }
 
     /// Test-support accessor: the set of Redis pub/sub channels this node's
@@ -192,6 +301,25 @@ impl RedisAdapter {
             .into_iter()
             .map(|c| c.to_string())
             .collect()
+    }
+}
+
+impl Drop for RedisAdapter {
+    /// Dropping the adapter "crashes" this node: abort every background task so it
+    /// stops re-stamping its members' `expireAt` (membership heartbeat) and stops
+    /// advertising liveness (node heartbeat). A `tokio::JoinHandle` detaches on drop
+    /// rather than aborting, so without this the heartbeats would outlive the adapter
+    /// and the node's members would never go stale — defeating the sweeper. Aborting
+    /// here makes a dropped adapter behave exactly like a crashed node.
+    fn drop(&mut self) {
+        self.recv_handle.abort();
+        self.heartbeat_handle.abort();
+        self.node_heartbeat_handle.abort();
+        if let Ok(guard) = self.sweeper_handle.lock() {
+            if let Some(h) = guard.as_ref() {
+                h.abort();
+            }
+        }
     }
 }
 
@@ -260,6 +388,19 @@ impl Adapter for RedisAdapter {
                     "redis SUBSCRIBE membership script failed; keeping node-local count"
                 );
             }
+        }
+
+        // Index the app so the sweeper can enumerate it (SMEMBERS apps → SMEMBERS
+        // chans(app)). Idempotent and cheap; the apps set is bounded by configured
+        // apps so it needs no cleanup. Log + ignore errors — this is best-effort.
+        if let Err(e) = self
+            .clients
+            .pool
+            .next()
+            .sadd::<i64, _, _>(self.keys.apps(), app.to_string())
+            .await
+        {
+            tracing::warn!(error = %e, app, "redis SADD apps failed; sweeper may miss this app");
         }
 
         out

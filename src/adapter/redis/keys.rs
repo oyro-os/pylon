@@ -51,6 +51,13 @@ impl Keys {
         format!("{}:nodes", self.prefix)
     }
 
+    /// Set key indexing every app that has ever had an occupied channel. The sweeper
+    /// enumerates this set to find each app's `chans` index. Bounded by the configured
+    /// apps, so it needs no cleanup.
+    pub fn apps(&self) -> String {
+        format!("{}:apps", self.prefix)
+    }
+
     /// Distributed lock key for the sweep (expiry cleanup) job.
     pub fn sweeplock(&self) -> String {
         format!("{}:sweeplock", self.prefix)
@@ -75,6 +82,7 @@ mod tests {
         assert_eq!(k.chans("app1"), "pylon:chans:app1");
         assert_eq!(k.node("n1"), "pylon:node:n1");
         assert_eq!(k.nodes(), "pylon:nodes");
+        assert_eq!(k.apps(), "pylon:apps");
         assert_eq!(k.sweeplock(), "pylon:sweeplock");
     }
     #[test]
