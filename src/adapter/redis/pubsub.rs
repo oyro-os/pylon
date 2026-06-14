@@ -5,10 +5,10 @@
 //! drops envelopes this node published itself (self-dedup via `node_id`), and
 //! re-delivers the pre-encoded frame to local sockets honouring any `except`.
 
-use super::envelope::Envelope;
+use super::envelope::{Envelope, EnvelopeKind};
 use crate::adapter::local::LocalAdapter;
 use crate::adapter::Adapter;
-use crate::protocol::event::ServerEvent;
+use crate::protocol::event::{ServerEvent, WatchlistChange};
 use crate::protocol::socket_id::SocketId;
 use fred::types::Message;
 use std::sync::Arc;
@@ -46,17 +46,51 @@ pub async fn receive_loop(
                 if env.is_from(&node_id) {
                     continue;
                 }
-                // The envelope carries the finished v7 frame as a JSON string.
-                let frame = match env.event.as_str() {
-                    Some(s) => s.to_string(),
-                    None => continue,
-                };
-                // Honour `except` even on the relaying node (usually a no-op: the
-                // excepted socket lives on the originating node).
-                let except = env.except.as_deref().map(SocketId::from_raw);
-                local
-                    .broadcast(&env.app, &env.channel, ServerEvent::Raw(frame), except)
-                    .await;
+                // Route by kind. For user-directed kinds, `env.channel` carries
+                // the target `user_id` rather than a channel name.
+                match env.kind {
+                    EnvelopeKind::Broadcast => {
+                        // The envelope carries the finished v7 frame as a JSON string.
+                        let frame = match env.event.as_str() {
+                            Some(s) => s.to_string(),
+                            None => continue,
+                        };
+                        // Honour `except` even on the relaying node (usually a no-op:
+                        // the excepted socket lives on the originating node).
+                        let except = env.except.as_deref().map(SocketId::from_raw);
+                        local
+                            .broadcast(&env.app, &env.channel, ServerEvent::Raw(frame), except)
+                            .await;
+                    }
+                    EnvelopeKind::UserSend => {
+                        let frame = match env.event.as_str() {
+                            Some(s) => s.to_string(),
+                            None => continue,
+                        };
+                        local
+                            .send_to_user(&env.app, &env.channel, ServerEvent::Raw(frame))
+                            .await;
+                    }
+                    EnvelopeKind::UserTerminate => {
+                        local.terminate_user(&env.app, &env.channel).await;
+                    }
+                    EnvelopeKind::WatchOnline | EnvelopeKind::WatchOffline => {
+                        let name = if env.kind == EnvelopeKind::WatchOnline {
+                            "online"
+                        } else {
+                            "offline"
+                        };
+                        let ev = ServerEvent::WatchlistEvents {
+                            events: vec![WatchlistChange {
+                                name: name.to_string(),
+                                user_ids: vec![env.channel.clone()],
+                            }],
+                        };
+                        for h in local.watchers_of(&env.app, &env.channel).await {
+                            let _ = h.mailbox.send(ev.clone());
+                        }
+                    }
+                }
             }
             Err(broadcast::error::RecvError::Lagged(n)) => {
                 tracing::warn!(skipped = n, "redis sub stream lagged; dropped messages");

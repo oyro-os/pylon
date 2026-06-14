@@ -3,7 +3,7 @@
 //! adapter on error. (members/user_count/reap land in later SP7b tasks.)
 
 use super::client::Scripts;
-use super::envelope::Envelope;
+use super::envelope::{Envelope, EnvelopeKind};
 use super::keys::{member_token, Keys};
 use crate::presence::member::PresenceMember;
 use crate::protocol::event::{PresencePayload, ServerEvent};
@@ -168,6 +168,7 @@ pub(super) async fn reap_member(
         let env = Envelope {
             node_id: dead_node,
             app: app.to_string(),
+            kind: EnvelopeKind::Broadcast,
             channel: channel.to_string(),
             event: Value::String(frame),
             except: None,

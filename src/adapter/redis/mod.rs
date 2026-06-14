@@ -528,6 +528,7 @@ impl Adapter for RedisAdapter {
         let env = envelope::Envelope {
             node_id: self.node_id.clone(),
             app: app.to_string(),
+            kind: envelope::EnvelopeKind::Broadcast,
             channel: channel.to_string(),
             event: serde_json::Value::String(frame),
             except: except.as_ref().map(|s| s.as_str().to_string()),
