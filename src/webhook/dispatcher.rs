@@ -38,13 +38,6 @@ impl Clock for FixedClock {
     }
 }
 
-/// Tunables the dispatcher needs (mirrors `ServerConfig`'s webhook fields).
-#[derive(Clone, Copy, Debug)]
-pub struct DispatcherConfig {
-    pub batch_ms: u64,
-    pub mailbox_capacity: usize,
-}
-
 /// The actor. Owns the mailbox, the window, the apps source, the clock, and the
 /// transport. `run` consumes it.
 pub struct WebhookDispatcher {

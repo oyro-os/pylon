@@ -15,7 +15,7 @@ pub struct WebhookDelivery {
     pub url: String,
     /// The exact bytes that were signed and must be sent verbatim.
     pub body: String,
-    /// Lowercased? No — header names exactly as Pusher sends them.
+    /// Header names exactly as sent (the three Pusher headers always win over custom).
     pub headers: BTreeMap<String, String>,
 }
 
