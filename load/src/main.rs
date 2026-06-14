@@ -5,6 +5,7 @@
 // wired into `main` in subsequent tasks, so allow the not-yet-used API.
 #![allow(dead_code)]
 
+mod metrics;
 mod pusher;
 
 fn main() {
