@@ -17,6 +17,8 @@ bytes = "1"
 mio = { version = "1", features = ["os-poll", "net"] }
 # HTTP request-head parsing for the per-core WS handshake / REST routing (SP9).
 httparse = "1"
+# O(1) connection table keyed by the mio Token value for the per-core worker (SP9).
+slab = "0.4"
 # RFC 6455 Sec-WebSocket-Accept = base64(sha1(key + GUID)).
 sha1 = "0.10"
 base64 = "0.22"
