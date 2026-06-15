@@ -79,6 +79,48 @@ pub fn per_conn_cap(per_worker_budget: u64, expected_conns: u64) -> u64 {
     (per_worker_budget / expected_conns.max(1)).clamp(256 << 10, 8 << 20)
 }
 
+/// Parse the `full avg10` value out of a Linux PSI memory-pressure block (cgroup
+/// v2 `memory.pressure` or `/proc/pressure/memory`) — SP10 §8.
+///
+/// A pressure block has two lines, e.g.
+/// ```text
+/// some avg10=0.00 avg60=0.00 avg300=0.00 total=0
+/// full avg10=12.34 avg60=5.00 avg300=1.00 total=123456
+/// ```
+/// This returns the `full` line's `avg10` (`12.34`) — the fraction of wall time
+/// in which **every** runnable task was stalled on memory, the signal the
+/// backstop reacts to. `None` if the block has no `full` line or it is malformed.
+pub fn psi_full_avg10(s: &str) -> Option<f64> {
+    for line in s.lines() {
+        let line = line.trim_start();
+        if let Some(rest) = line.strip_prefix("full ") {
+            for field in rest.split_whitespace() {
+                if let Some(v) = field.strip_prefix("avg10=") {
+                    return v.parse().ok();
+                }
+            }
+        }
+    }
+    None
+}
+
+/// The kernel PSI memory-pressure file to read (SP10 §8): cgroup v2
+/// `/sys/fs/cgroup/memory.pressure` when present, else the host
+/// `/proc/pressure/memory`. Returns the first path that exists, or `None` if PSI
+/// is unavailable on this host (kernel < 4.20 or `CONFIG_PSI` off) — the backstop
+/// then no-ops, leaving the budget factor pinned at full.
+pub fn psi_pressure_path() -> Option<&'static str> {
+    const CGROUP_V2: &str = "/sys/fs/cgroup/memory.pressure";
+    const HOST: &str = "/proc/pressure/memory";
+    if std::path::Path::new(CGROUP_V2).exists() {
+        Some(CGROUP_V2)
+    } else if std::path::Path::new(HOST).exists() {
+        Some(HOST)
+    } else {
+        None
+    }
+}
+
 // ---- impure detectors (read real sysfs/procfs) -------------------------------
 
 /// Number of worker reactors to spawn: `available_parallelism()`, which is
@@ -191,5 +233,31 @@ mod tests {
         // These read real files; only assert the sane-floor invariants.
         assert!(detect_workers() >= 1);
         assert!(detect_effective_mem() >= 1u64 << 30);
+    }
+
+    #[test]
+    fn psi_parses_full_avg10() {
+        // A real two-line PSI block: pick the `full` line's avg10, NOT `some`.
+        let block = "some avg10=1.23 avg60=4.56 avg300=7.89 total=111\n\
+                     full avg10=12.34 avg60=5.00 avg300=1.00 total=222\n";
+        assert_eq!(psi_full_avg10(block), Some(12.34));
+
+        // `some` first but its avg10 must not be returned.
+        let some_first = "some avg10=99.99 avg60=0 avg300=0 total=0\n\
+                          full avg10=0.00 avg60=0 avg300=0 total=0\n";
+        assert_eq!(psi_full_avg10(some_first), Some(0.0));
+
+        // Only a `some` line (e.g. `/proc/pressure/cpu` has no `full`): None.
+        assert_eq!(psi_full_avg10("some avg10=3.21 avg60=0 avg300=0 total=0\n"), None);
+
+        // Leading whitespace tolerated; integer avg10 parses as float.
+        assert_eq!(
+            psi_full_avg10("  full avg10=42 avg60=1 avg300=1 total=9\n"),
+            Some(42.0)
+        );
+
+        // Empty / malformed input yields None.
+        assert_eq!(psi_full_avg10(""), None);
+        assert_eq!(psi_full_avg10("full avg60=1.0 total=5\n"), None);
     }
 }

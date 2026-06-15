@@ -223,11 +223,34 @@ pub fn run_percore(
     // worker (config-derived; `target_ms == 0` disables → pure drop-head).
     let codel = config.codel_params();
 
-    // SP10 §8: shared PSI budget factor (×1000 fixed-point, 1000 = full). The
-    // control-plane loop that shrinks it under real memory pressure is wired in
-    // the PSI-backstop task; here it is created (and pinned at full) so the
-    // workers read a precomputed value off the hot path.
+    // SP10 §8: PSI memory-pressure backstop. A single control-plane task (NOT a
+    // worker) polls the kernel pressure file ~1 Hz and shrinks a shared
+    // `budget_factor` (×1000 fixed-point, 1000 = full) when the machine is
+    // genuinely thrashing; the workers read this factor when sizing their shed
+    // budget — the hot path NEVER reads PSI inline. Enabled when the config gate
+    // is on (default: on iff the pressure file is readable at startup) AND a tokio
+    // runtime handle is available to host the task; otherwise the factor stays
+    // pinned at 1000 (a no-op backstop).
     let budget_factor = Arc::new(AtomicU32::new(1000));
+    let psi_path = resources::psi_pressure_path();
+    let psi_enabled = config.psi_backstop.unwrap_or(psi_path.is_some());
+    if psi_enabled {
+        if let (Some(path), Ok(handle)) = (psi_path, tokio::runtime::Handle::try_current()) {
+            handle.spawn(psi_backstop_loop(
+                path,
+                config.psi_threshold,
+                budget_factor.clone(),
+                shutdown.clone(),
+            ));
+            tracing::info!(
+                psi_path = path,
+                threshold = config.psi_threshold,
+                "pylon percore: PSI memory-pressure backstop enabled"
+            );
+        } else {
+            tracing::debug!("PSI backstop requested but unavailable; budget factor pinned");
+        }
+    }
 
     let mut handles = Vec::with_capacity(worker_count);
     for (i, wiring) in wirings.into_iter().enumerate() {
@@ -282,5 +305,99 @@ pub fn run_percore(
     match first_err {
         Some(e) => Err(e),
         None => Ok(()),
+    }
+}
+
+/// SP10 §8 PSI memory-pressure backstop control loop.
+///
+/// Polls `path` (a kernel PSI pressure file) once a second and adjusts the shared
+/// `budget_factor` (×1000 fixed-point; `1000` = full per-worker budget). When the
+/// `full avg10` pressure exceeds `threshold` the machine is genuinely thrashing —
+/// our byte estimate was too optimistic for this host — so the factor is
+/// multiplied down toward a `0.8×` floor (`800`); when pressure clears (drops
+/// below `threshold / 2`) the factor ramps back up toward `1000`. The workers
+/// read the factor (relaxed) when sizing their shed budget; this loop is the only
+/// place PSI is ever read, keeping it entirely off the hot path. Exits when
+/// `shutdown` is set.
+///
+/// `compute_factor` (below) is the pure step function so the policy is unit-tested
+/// without touching `/proc`.
+async fn psi_backstop_loop(
+    path: &'static str,
+    threshold: f64,
+    budget_factor: Arc<AtomicU32>,
+    shutdown: Arc<AtomicBool>,
+) {
+    use std::sync::atomic::Ordering;
+    let mut tick = tokio::time::interval(std::time::Duration::from_secs(1));
+    loop {
+        tick.tick().await;
+        if shutdown.load(Ordering::SeqCst) {
+            return;
+        }
+        // Read the pressure file off the hot path; a transient read failure leaves
+        // the factor unchanged (treated as "no new pressure signal").
+        let pressure = std::fs::read_to_string(path)
+            .ok()
+            .and_then(|s| resources::psi_full_avg10(&s));
+        if let Some(p) = pressure {
+            let cur = budget_factor.load(Ordering::Relaxed);
+            let next = compute_factor(cur, p, threshold);
+            if next != cur {
+                budget_factor.store(next, Ordering::Relaxed);
+                tracing::debug!(
+                    full_avg10 = p,
+                    factor = next,
+                    "PSI backstop adjusted budget factor"
+                );
+            }
+        }
+    }
+}
+
+/// Pure step for the PSI budget factor (×1000 fixed-point). Above `threshold`,
+/// multiply down toward the `0.8×` (800) floor; below `threshold / 2`, ramp back
+/// up toward full (1000); in the hysteresis band, hold. Each step moves ~10%.
+fn compute_factor(current: u32, full_avg10: f64, threshold: f64) -> u32 {
+    const FLOOR: u32 = 800; // 0.8×
+    const CEIL: u32 = 1000; // 1.0×
+    if full_avg10 > threshold {
+        // Thrashing: shrink toward the floor (factor * 9/10, clamped).
+        (current * 9 / 10).max(FLOOR)
+    } else if full_avg10 < threshold / 2.0 {
+        // Recovered: grow back toward full (+~10% of full, clamped).
+        (current + CEIL / 10).min(CEIL)
+    } else {
+        // Hysteresis band: hold steady to avoid oscillation.
+        current.clamp(FLOOR, CEIL)
+    }
+}
+
+#[cfg(test)]
+mod psi_tests {
+    use super::compute_factor;
+
+    #[test]
+    fn factor_shrinks_under_pressure_and_recovers() {
+        let threshold = 15.0;
+        // Under heavy pressure the factor steps down toward the 0.8 floor.
+        let f1 = compute_factor(1000, 40.0, threshold);
+        assert!((800..1000).contains(&f1), "stepped down but not below floor: {f1}");
+        // Repeated pressure keeps shrinking but never past 800.
+        let mut f = 1000;
+        for _ in 0..20 {
+            f = compute_factor(f, 40.0, threshold);
+        }
+        assert_eq!(f, 800, "clamps at the 0.8x floor");
+        // In the hysteresis band (between threshold/2 and threshold) it holds.
+        assert_eq!(compute_factor(900, 10.0, threshold), 900);
+        // Once pressure clears (< threshold/2) it ramps back toward full.
+        let up = compute_factor(800, 1.0, threshold);
+        assert!(up > 800 && up <= 1000, "ramped up: {up}");
+        let mut g = 800;
+        for _ in 0..20 {
+            g = compute_factor(g, 0.0, threshold);
+        }
+        assert_eq!(g, 1000, "recovers to full budget");
     }
 }

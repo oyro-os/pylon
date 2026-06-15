@@ -97,6 +97,13 @@ pub struct ServerConfig {
     /// CoDel interval in milliseconds (§7): the window over which the minimum
     /// sojourn is tracked. `PYLON_CODEL_INTERVAL_MS` (default 100).
     pub codel_interval_ms: u64,
+    /// PSI memory-pressure backstop (§8). `None` = auto (enabled if the kernel
+    /// pressure file is readable at startup, else a no-op); `Some(true)`/
+    /// `Some(false)` force on/off. `PYLON_PSI_BACKSTOP` (`1`/`true` / `0`/`false`).
+    pub psi_backstop: Option<bool>,
+    /// PSI `full avg10` threshold (percent) above which the budget factor is
+    /// shrunk. `PYLON_PSI_THRESHOLD` (default 15.0).
+    pub psi_threshold: f64,
 }
 
 impl Default for ServerConfig {
@@ -145,6 +152,8 @@ impl Default for ServerConfig {
             broadcast_handoff_cap: crate::transport::fanout::DEFAULT_BROADCAST_HANDOFF_CAP,
             codel_target_ms: 5,
             codel_interval_ms: 100,
+            psi_backstop: None,
+            psi_threshold: 15.0,
         }
     }
 }
@@ -353,6 +362,14 @@ impl ServerConfig {
                 c.codel_interval_ms = p;
             }
         }
+        if let Ok(v) = std::env::var("PYLON_PSI_BACKSTOP") {
+            c.psi_backstop = Some(v == "1" || v.eq_ignore_ascii_case("true"));
+        }
+        if let Ok(v) = std::env::var("PYLON_PSI_THRESHOLD") {
+            if let Ok(p) = v.parse() {
+                c.psi_threshold = p;
+            }
+        }
         c
     }
 
@@ -454,9 +471,11 @@ mod tests {
         assert_eq!(c.perconn_queue_min_bytes, 256 << 10);
         assert_eq!(c.perconn_queue_max_bytes, 8 << 20);
         assert_eq!(c.broadcast_handoff_cap, 1024);
-        // SP10 §7 CoDel defaults.
+        // SP10 §7/§8 CoDel + PSI defaults.
         assert_eq!(c.codel_target_ms, 5);
         assert_eq!(c.codel_interval_ms, 100);
+        assert_eq!(c.psi_backstop, None); // auto
+        assert_eq!(c.psi_threshold, 15.0);
         // codel_params() folds ms → ns with the folly defaults.
         let p = c.codel_params();
         assert_eq!(p.target_ns, 5_000_000);
@@ -490,18 +509,24 @@ mod tests {
     }
 
     #[test]
-    fn sp10_codel_env_overrides_apply() {
+    fn sp10_codel_psi_env_overrides_apply() {
         std::env::set_var("PYLON_CODEL_TARGET_MS", "0"); // disables CoDel
         std::env::set_var("PYLON_CODEL_INTERVAL_MS", "250");
+        std::env::set_var("PYLON_PSI_BACKSTOP", "false");
+        std::env::set_var("PYLON_PSI_THRESHOLD", "30");
         let c = ServerConfig::from_env();
         assert_eq!(c.codel_target_ms, 0);
         assert_eq!(c.codel_interval_ms, 250);
+        assert_eq!(c.psi_backstop, Some(false));
+        assert_eq!(c.psi_threshold, 30.0);
         // target_ms 0 ⇒ disabled overlay; interval still folds to ns.
         let p = c.codel_params();
         assert_eq!(p.target_ns, 0);
         assert_eq!(p.interval_ns, 250_000_000);
         std::env::remove_var("PYLON_CODEL_TARGET_MS");
         std::env::remove_var("PYLON_CODEL_INTERVAL_MS");
+        std::env::remove_var("PYLON_PSI_BACKSTOP");
+        std::env::remove_var("PYLON_PSI_THRESHOLD");
     }
 
     #[test]
