@@ -48,6 +48,7 @@ use crate::protocol::{codec::Codec, negotiate};
 use crate::transport::conn::{ConnError, ConnState, Connection, WriteStatus};
 use crate::transport::frame::{self, OpCode};
 use crate::transport::handshake::{self, HeadResult};
+use crate::transport::timer::{Due, TimerWheel};
 use crate::ws::handler::ConnectionContext;
 use bytes::BytesMut;
 use dashmap::DashMap;
@@ -77,6 +78,10 @@ pub struct DispatchEnv {
     pub adapter: Arc<dyn Adapter>,
     pub limits: crate::server::config::Limits,
     pub activity_timeout: u32,
+    /// SP11 §4: seconds to wait for a `pusher:pong` after an idle `pusher:ping`
+    /// before closing the connection with code `4201` (legacy parity:
+    /// `connection/task.rs`). Drives this worker's [`TimerWheel`].
+    pub pong_timeout: u32,
     pub strict_protocol: bool,
     /// Per-app live connection counters (shared with the rest of the server),
     /// mirroring `AppState::conn_counts`.
@@ -265,6 +270,20 @@ pub fn run(mut cfg: WorkerConfig, shutdown: Arc<AtomicBool>) -> std::io::Result<
     // delivery can find the connection in O(1) without scanning the slab.
     let mut sid_to_token: HashMap<SocketId, usize> = HashMap::new();
 
+    // SP11 §4: per-worker liveness timer wheel. Idle-pings a silent connection
+    // after `activity_timeout` and closes it `4201` if a pong doesn't follow
+    // within `pong_timeout` — the legacy `connection/task.rs` semantics without a
+    // per-connection tokio timer. Keyed by the slab token. Only meaningful for
+    // dispatch workers (echo workers / pre-handshake conns never enter it); the
+    // timeouts come from the dispatch env (config-derived).
+    let (mut wheel, liveness) = match &cfg.mode {
+        Mode::Dispatch(env) => (
+            TimerWheel::with_timeouts(env.activity_timeout, env.pong_timeout),
+            true,
+        ),
+        Mode::Echo => (TimerWheel::with_timeouts(0, 0), false),
+    };
+
     let mut events = Events::with_capacity(1024);
     let mut conns: slab::Slab<Entry> = slab::Slab::new();
 
@@ -322,6 +341,8 @@ pub fn run(mut cfg: WorkerConfig, shutdown: Arc<AtomicBool>) -> std::io::Result<
         // time-in-queue across iterations. Computed once per iteration (cheap;
         // off the per-frame inner loop).
         let now_ns = worker_epoch.elapsed().as_nanos() as u64;
+        // SP11 §4: same monotonic clock in milliseconds for the liveness wheel.
+        let now_ms = now_ns / 1_000_000;
 
         // SP10 §8: this worker's effective byte budget = per_worker_budget scaled
         // by the shared PSI factor (×1000 fixed-point; 1000 = full). Read once per
@@ -357,17 +378,29 @@ pub fn run(mut cfg: WorkerConfig, shutdown: Arc<AtomicBool>) -> std::io::Result<
 
                     // A peer hangup / error: tear down regardless of r/w intent.
                     if event.is_error() || event.is_read_closed() || event.is_write_closed() {
-                        remove(&poll, &mut conns, key, &mut local_subs, &mut sid_to_token);
+                        remove(&poll, &mut conns, key, &mut local_subs, &mut sid_to_token, &mut wheel);
                         continue;
                     }
 
                     if event.is_readable() {
+                        // SP11 §4: inbound bytes are activity — reset this
+                        // connection's idle deadline (and cancel any pending
+                        // pong-timeout close: a `pusher:pong`, like any other
+                        // inbound frame, is just activity). Mirrors legacy
+                        // `last_activity = now; ping_sent_at = None`. Only
+                        // dispatch (`liveness`) workers run the wheel.
+                        if liveness {
+                            wheel.touch(key, now_ms);
+                        }
                         match handle_readable(&poll, &mut conns, key, &cfg, now_ns) {
                             Action::Close => {
-                                remove(&poll, &mut conns, key, &mut local_subs, &mut sid_to_token);
+                                remove(&poll, &mut conns, key, &mut local_subs, &mut sid_to_token, &mut wheel);
                                 continue;
                             }
                             Action::Handoff(prefix) => {
+                                // A REST handoff is not a WS session; drop its
+                                // (spurious) wheel entry so it can't fire later.
+                                wheel.remove(key);
                                 handoff_rest(&poll, &mut conns, key, &cfg, prefix);
                                 continue;
                             }
@@ -394,7 +427,7 @@ pub fn run(mut cfg: WorkerConfig, shutdown: Arc<AtomicBool>) -> std::io::Result<
                         && conns.contains(key)
                         && handle_writable(&poll, &mut conns, key, now_ns) == Action::Close
                     {
-                        remove(&poll, &mut conns, key, &mut local_subs, &mut sid_to_token);
+                        remove(&poll, &mut conns, key, &mut local_subs, &mut sid_to_token, &mut wheel);
                     }
                 }
             }
@@ -413,6 +446,7 @@ pub fn run(mut cfg: WorkerConfig, shutdown: Arc<AtomicBool>) -> std::io::Result<
                 rx,
                 &mut local_subs,
                 &mut sid_to_token,
+                &mut wheel,
                 effective_budget,
                 &mut inflight_bytes,
                 saturated.as_ref(),
@@ -445,13 +479,99 @@ pub fn run(mut cfg: WorkerConfig, shutdown: Arc<AtomicBool>) -> std::io::Result<
         // `drain_all_sessions` reports whether it actually wrote anything so the
         // adaptive timeout stays tight under load.
         if dispatch
-            && drain_all_sessions(&poll, &mut conns, &mut local_subs, &mut sid_to_token, now_ns)
+            && drain_all_sessions(
+                &poll,
+                &mut conns,
+                &mut local_subs,
+                &mut sid_to_token,
+                &mut wheel,
+                now_ns,
+            )
         {
             work = true;
         }
 
+        // SP11 §4: fire any liveness timers that have come due this iteration.
+        // For an idle-expired connection queue a `pusher:ping` and arm its pong
+        // deadline; for a pong-timed-out connection send the `4201` close and
+        // tear it down (running the normal `remove` close path: on_close hook,
+        // counter decrement, deregister). The wheel only visits expired tokens,
+        // so this is O(due-count), not O(N-connections). The adaptive poll may
+        // sleep up to 50ms, so a timer fires within ~50ms of its deadline —
+        // negligible against the 120s/30s timeouts.
+        if liveness {
+            for due in wheel.due(now_ms) {
+                match due {
+                    Due::Ping(key) => {
+                        if queue_ping(&poll, &mut conns, key, now_ns) {
+                            // Ping queued: arm the pong-timeout close deadline.
+                            wheel.mark_ping_sent(key, now_ms);
+                            work = true;
+                        } else {
+                            // The connection vanished (or had no session): drop it
+                            // from the wheel so the entry doesn't linger.
+                            wheel.remove(key);
+                        }
+                    }
+                    Due::Close4201(key) => {
+                        send_close_4201(&poll, &mut conns, key, now_ns);
+                        remove(&poll, &mut conns, key, &mut local_subs, &mut sid_to_token, &mut wheel);
+                        work = true;
+                    }
+                }
+            }
+        }
+
         did_work = work;
     }
+}
+
+/// SP11 §4: queue a `pusher:ping` (v7 `{"event":"pusher:ping","data":{}}`) onto
+/// `key`'s out-queue and flush, mirroring how the legacy task and
+/// [`drain_session`] emit a server frame. Returns `true` if the frame was queued
+/// (the connection exists, is Open, and has a session); `false` otherwise (caller
+/// drops the wheel entry). A flush that backpressures arms writable interest; a
+/// flush that fails closes the connection on the next event.
+fn queue_ping(poll: &Poll, conns: &mut slab::Slab<Entry>, key: usize, now_ns: u64) -> bool {
+    let Some(entry) = conns.get_mut(key) else {
+        return false;
+    };
+    let Some(session) = entry.session.as_mut() else {
+        return false;
+    };
+    if entry.conn.state != ConnState::Open {
+        return false;
+    }
+    let text = session.codec.encode(&ServerEvent::Ping);
+    let mut out = BytesMut::new();
+    frame::encode_text(&mut out, text.as_bytes());
+    let _ = entry
+        .conn
+        .queue(Arc::from(out.to_vec().into_boxed_slice()), now_ns);
+    // Best-effort flush; interest re-arming / close is handled by the caller's
+    // subsequent `remove` only on a hard write failure (rare for a tiny frame).
+    let _ = flush_and_arm(poll, entry, now_ns);
+    true
+}
+
+/// SP11 §4: send a WebSocket Close frame with code `4201` (pong-timeout) — the
+/// exact legacy `connection/task.rs` payload — then let the caller `remove` the
+/// connection. Mirrors the `ServerEvent::Close` arm of [`drain_session`].
+fn send_close_4201(poll: &Poll, conns: &mut slab::Slab<Entry>, key: usize, now_ns: u64) {
+    let Some(entry) = conns.get_mut(key) else {
+        return;
+    };
+    let reason = "Pong reply not received: ping was sent to the client, but no reply was received";
+    let mut frame_body = Vec::with_capacity(2 + reason.len());
+    frame_body.extend_from_slice(&4201u16.to_be_bytes());
+    frame_body.extend_from_slice(reason.as_bytes());
+    let mut out = BytesMut::new();
+    frame::encode(&mut out, true, OpCode::Close, &frame_body);
+    let _ = entry
+        .conn
+        .queue(Arc::from(out.to_vec().into_boxed_slice()), now_ns);
+    // Flush so the Close frame actually reaches the peer before we deregister.
+    let _ = flush_and_arm(poll, entry, now_ns);
 }
 
 /// Outcome of handling a connection event: keep it, close it, or hand it off to
@@ -821,11 +941,13 @@ fn drain_session(poll: &Poll, entry: &mut Entry, now_ns: u64) -> (Action, bool) 
 /// so a broadcast queued onto a peer's mailbox is delivered even when that peer
 /// produced no readiness event of its own. Returns `true` if any connection
 /// actually wrote a queued event (used to keep the adaptive poll tight).
+#[allow(clippy::too_many_arguments)]
 fn drain_all_sessions(
     poll: &Poll,
     conns: &mut slab::Slab<Entry>,
     local_subs: &mut HashMap<(String, String), HashSet<SocketId>>,
     sid_to_token: &mut HashMap<SocketId, usize>,
+    wheel: &mut TimerWheel,
     now_ns: u64,
 ) -> bool {
     let keys: Vec<usize> = conns
@@ -841,7 +963,7 @@ fn drain_all_sessions(
         let (action, wrote) = drain_session(poll, &mut conns[key], now_ns);
         wrote_any |= wrote;
         if action == Action::Close {
-            remove(poll, conns, key, local_subs, sid_to_token);
+            remove(poll, conns, key, local_subs, sid_to_token, wheel);
         }
     }
     wrote_any
@@ -965,7 +1087,12 @@ fn remove(
     key: usize,
     local_subs: &mut HashMap<(String, String), HashSet<SocketId>>,
     sid_to_token: &mut HashMap<SocketId, usize>,
+    wheel: &mut TimerWheel,
 ) {
+    // SP11 §4: drop the connection from the liveness wheel BEFORE the slab slot
+    // (and thus its token) can be recycled by a future accept, so a new
+    // connection on the same token never inherits a stale timer.
+    wheel.remove(key);
     if let Some(mut entry) = conns.try_remove(key) {
         if let Some(mut session) = entry.session.take() {
             deindex_connection(&session, local_subs, sid_to_token);
@@ -1113,6 +1240,7 @@ fn drain_broadcasts(
     rx: &std::sync::mpsc::Receiver<crate::transport::fanout::BroadcastMsg>,
     local_subs: &mut HashMap<(String, String), HashSet<SocketId>>,
     sid_to_token: &mut HashMap<SocketId, usize>,
+    wheel: &mut TimerWheel,
     effective_budget: u64,
     inflight_bytes: &mut u64,
     saturated: Option<&Arc<AtomicBool>>,
@@ -1193,7 +1321,7 @@ fn drain_broadcasts(
         }
     }
     for token in to_close {
-        remove(poll, conns, token, local_subs, sid_to_token);
+        remove(poll, conns, token, local_subs, sid_to_token, wheel);
     }
     wrote
 }

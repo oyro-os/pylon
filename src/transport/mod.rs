@@ -15,6 +15,7 @@ pub mod fanout;
 pub mod frame;
 pub mod handshake;
 pub mod rest;
+pub mod timer;
 pub mod worker;
 
 use crate::adapter::local::LocalAdapter;
@@ -110,6 +111,7 @@ pub fn run_percore(
         adapter,
         limits: config.limits(),
         activity_timeout: config.activity_timeout,
+        pong_timeout: config.pong_timeout,
         strict_protocol: config.strict_protocol,
         conn_counts,
         webhooks,

@@ -71,6 +71,7 @@ async fn spawn(config: ServerConfig) -> Harness {
         adapter: adapter.clone(),
         limits: config.limits(),
         activity_timeout: config.activity_timeout,
+        pong_timeout: config.pong_timeout,
         strict_protocol: config.strict_protocol,
         conn_counts: Arc::new(Default::default()),
         webhooks: pylon::webhook::WebhookHandle::null(),
