@@ -1,87 +1,26 @@
 //! End-to-end `pusher:signin` handshake over a real WebSocket.
 //!
-//! Mirrors the in-process harness in `tests/integration.rs` (each `tests/*.rs`
-//! is its own crate, so the spawn/connect helpers are replicated here). Drives
-//! the already-implemented signin handler: happy path acks `signin_success`,
-//! a bad signature yields 4009 + a server-initiated close.
+//! The spawn/connect helpers live in `tests/common/mod.rs` and dispatch between
+//! the legacy axum transport and the percore worker fleet on
+//! `PYLON_TEST_TRANSPORT`. Drives the signin handler: happy path acks
+//! `signin_success`, a bad signature yields 4009 + a server-initiated close; the
+//! REST-driven server-to-user / terminate paths exercise the percore REST plane.
 
-use futures_util::{SinkExt, StreamExt};
-use pylon::adapter::local::LocalAdapter;
-use pylon::adapter::Adapter;
-use pylon::app::static_file::StaticFileAppManager;
-use pylon::app::AppManager;
+mod common;
+use common::*;
+
 use pylon::auth::signature::{hmac_sha256_hex, md5_hex, user_signature};
-use pylon::channel::registry::Registry;
 use pylon::server::config::ServerConfig;
-use pylon::server::router::{build_router, AppState};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
-use std::sync::Arc;
 use std::time::Duration;
 use tokio_tungstenite::tungstenite::Message;
+use futures_util::StreamExt;
 
-const SECRET: &str = "app-secret";
-const KEY: &str = "app-key";
-
-const APPS: &str = r#"[
-    {"name":"Test","id":"app","key":"app-key","secret":"app-secret",
-     "capacity":2,"client_messages_enabled":true,"subscription_count_enabled":true}
-]"#;
-
-type Ws =
-    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
-
+/// Spawn the standard capacity-2 app on the selected transport.
 async fn spawn(config: ServerConfig) -> SocketAddr {
-    let apps: Arc<dyn AppManager> = Arc::new(StaticFileAppManager::from_json(APPS).unwrap());
-    let registry = Arc::new(Registry::new());
-    let adapter: Arc<dyn Adapter> = Arc::new(LocalAdapter::new(registry));
-    let state = AppState {
-        config,
-        apps,
-        adapter,
-        conn_counts: Arc::new(Default::default()),
-        webhooks: pylon::webhook::WebhookHandle::null(),
-        saturated: None,
-    };
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move {
-        axum::serve(listener, build_router(state)).await.unwrap();
-    });
-    addr
-}
-
-async fn connect(addr: SocketAddr, query: &str) -> Ws {
-    let url = format!("ws://{addr}/app/app-key{query}");
-    let (ws, _) = tokio_tungstenite::connect_async(url).await.unwrap();
-    ws
-}
-
-/// Read the next text frame as JSON, failing fast on a hang or unexpected close.
-async fn next_json(ws: &mut Ws) -> Value {
-    loop {
-        match tokio::time::timeout(Duration::from_secs(5), ws.next()).await {
-            Ok(Some(Ok(Message::Text(t)))) => return serde_json::from_str(&t).unwrap(),
-            Ok(Some(Ok(Message::Close(_)))) => panic!("unexpected close while awaiting a frame"),
-            Ok(Some(Ok(_))) => continue,
-            Ok(Some(Err(e))) => panic!("ws error while awaiting a frame: {e}"),
-            Ok(None) => panic!("stream ended while awaiting a frame"),
-            Err(_) => panic!("timed out awaiting a frame"),
-        }
-    }
-}
-
-async fn send_json(ws: &mut Ws, v: Value) {
-    ws.send(Message::Text(v.to_string())).await.unwrap();
-}
-
-/// connection_established's `data` is a JSON-encoded STRING; extract socket_id.
-async fn established_socket_id(ws: &mut Ws) -> String {
-    let frame = next_json(ws).await;
-    assert_eq!(frame["event"], "pusher:connection_established");
-    let data: Value = serde_json::from_str(frame["data"].as_str().unwrap()).unwrap();
-    data["socket_id"].as_str().unwrap().to_string()
+    spawn_default(config).await
 }
 
 #[tokio::test]

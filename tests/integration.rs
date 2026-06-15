@@ -1,93 +1,22 @@
 //! In-process integration tests driving the server with a real WS client.
+//!
+//! The spawn/connect/helper plumbing lives in `tests/common/mod.rs`; the
+//! `spawn_default` helper dispatches between the legacy axum transport and the
+//! percore worker fleet on `PYLON_TEST_TRANSPORT` (default legacy), so this exact
+//! suite is the SP11 single-node parity proof on both transports.
 
-use futures_util::{SinkExt, StreamExt};
-use pylon::adapter::local::LocalAdapter;
-use pylon::adapter::Adapter;
-use pylon::app::static_file::StaticFileAppManager;
-use pylon::app::AppManager;
-use pylon::auth::signature::channel_signature;
-use pylon::channel::registry::Registry;
+mod common;
+use common::*;
+
+use futures_util::SinkExt;
+use futures_util::StreamExt;
 use pylon::server::config::ServerConfig;
-use pylon::server::router::{build_router, AppState};
 use serde_json::{json, Value};
-use std::net::SocketAddr;
-use std::sync::Arc;
 use tokio_tungstenite::tungstenite::Message;
 
-const SECRET: &str = "app-secret";
-const KEY: &str = "app-key";
-
-fn auth_token(socket_id: &str, channel: &str, channel_data: Option<&str>) -> String {
-    format!(
-        "{KEY}:{}",
-        channel_signature(SECRET, socket_id, channel, channel_data)
-    )
-}
-
-async fn established_socket_id(ws: &mut Ws) -> String {
-    let frame = next_json(ws).await; // connection_established
-    let data: Value = serde_json::from_str(frame["data"].as_str().unwrap()).unwrap();
-    data["socket_id"].as_str().unwrap().to_string()
-}
-
-/// Read frames until one with the given event name arrives, skipping others
-/// (e.g. the interleaved pusher_internal:subscription_count frames emitted
-/// because the test app has subscription_count_enabled = true).
-async fn next_event_named(ws: &mut Ws, event: &str) -> Value {
-    loop {
-        let f = next_json(ws).await;
-        if f["event"] == event {
-            return f;
-        }
-    }
-}
-
-const APPS: &str = r#"[
-    {"name":"Test","id":"app","key":"app-key","secret":"app-secret",
-     "capacity":2,"client_messages_enabled":true,"subscription_count_enabled":true}
-]"#;
-
-type Ws =
-    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
-
-async fn spawn(config: ServerConfig) -> SocketAddr {
-    let apps: Arc<dyn AppManager> = Arc::new(StaticFileAppManager::from_json(APPS).unwrap());
-    let registry = Arc::new(Registry::new());
-    let adapter: Arc<dyn Adapter> = Arc::new(LocalAdapter::new(registry));
-    let state = AppState {
-        config,
-        apps,
-        adapter,
-        conn_counts: Arc::new(Default::default()),
-        webhooks: pylon::webhook::WebhookHandle::null(),
-        saturated: None,
-    };
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move {
-        axum::serve(listener, build_router(state)).await.unwrap();
-    });
-    addr
-}
-
-async fn connect(addr: SocketAddr, query: &str) -> Ws {
-    let url = format!("ws://{addr}/app/app-key{query}");
-    let (ws, _) = tokio_tungstenite::connect_async(url).await.unwrap();
-    ws
-}
-
-async fn next_json(ws: &mut Ws) -> Value {
-    loop {
-        match ws.next().await.unwrap().unwrap() {
-            Message::Text(t) => return serde_json::from_str(&t).unwrap(),
-            Message::Close(_) => panic!("unexpected close while awaiting a frame"),
-            _ => continue,
-        }
-    }
-}
-
-async fn send_json(ws: &mut Ws, v: Value) {
-    ws.send(Message::Text(v.to_string())).await.unwrap();
+/// Spawn the standard capacity-2 app on the selected transport.
+async fn spawn(config: ServerConfig) -> std::net::SocketAddr {
+    spawn_default(config).await
 }
 
 #[tokio::test]

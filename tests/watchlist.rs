@@ -1,76 +1,32 @@
 //! End-to-end watchlist lifecycle over real WebSockets.
 //!
-//! Mirrors the in-process harness in `tests/signin.rs` (each `tests/*.rs` is its
-//! own crate, so the spawn/connect helpers are replicated here). Exercises the
-//! signed-in watchlist flow against the live server:
+//! The spawn/connect helpers live in `tests/common/mod.rs` and dispatch between
+//! the legacy axum transport and the percore worker fleet on
+//! `PYLON_TEST_TRANSPORT`. Exercises the signed-in watchlist flow against the
+//! live server:
 //!   1. online/offline events cross between two signed-in users; and
 //!   2. an oversized watchlist yields a non-fatal 4302 (connection survives).
 
-use futures_util::{SinkExt, StreamExt};
-use pylon::adapter::local::LocalAdapter;
-use pylon::adapter::Adapter;
-use pylon::app::static_file::StaticFileAppManager;
-use pylon::app::AppManager;
+mod common;
+use common::*;
+
 use pylon::auth::signature::user_signature;
-use pylon::channel::registry::Registry;
 use pylon::server::config::ServerConfig;
-use pylon::server::router::{build_router, AppState};
 use serde_json::{json, Value};
 use std::net::SocketAddr;
-use std::sync::Arc;
 use std::time::Duration;
 use tokio_tungstenite::tungstenite::Message;
-
-const SECRET: &str = "app-secret";
-const KEY: &str = "app-key";
+use futures_util::StreamExt;
 
 // capacity 10: this suite runs several simultaneous clients
-const APPS: &str = r#"[
+const APPS_C10: &str = r#"[
     {"name":"Test","id":"app","key":"app-key","secret":"app-secret",
      "capacity":10,"client_messages_enabled":true,"subscription_count_enabled":true}
 ]"#;
 
-type Ws =
-    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
-
+/// Spawn the capacity-10 app on the selected transport.
 async fn spawn(config: ServerConfig) -> SocketAddr {
-    let apps: Arc<dyn AppManager> = Arc::new(StaticFileAppManager::from_json(APPS).unwrap());
-    let registry = Arc::new(Registry::new());
-    let adapter: Arc<dyn Adapter> = Arc::new(LocalAdapter::new(registry));
-    let state = AppState {
-        config,
-        apps,
-        adapter,
-        conn_counts: Arc::new(Default::default()),
-        webhooks: pylon::webhook::WebhookHandle::null(),
-        saturated: None,
-    };
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move {
-        axum::serve(listener, build_router(state)).await.unwrap();
-    });
-    addr
-}
-
-async fn connect(addr: SocketAddr, query: &str) -> Ws {
-    let url = format!("ws://{addr}/app/app-key{query}");
-    let (ws, _) = tokio_tungstenite::connect_async(url).await.unwrap();
-    ws
-}
-
-/// Read the next text frame as JSON, failing fast on a hang or unexpected close.
-async fn next_json(ws: &mut Ws) -> Value {
-    loop {
-        match tokio::time::timeout(Duration::from_secs(5), ws.next()).await {
-            Ok(Some(Ok(Message::Text(t)))) => return serde_json::from_str(&t).unwrap(),
-            Ok(Some(Ok(Message::Close(_)))) => panic!("unexpected close while awaiting a frame"),
-            Ok(Some(Ok(_))) => continue,
-            Ok(Some(Err(e))) => panic!("ws error while awaiting a frame: {e}"),
-            Ok(None) => panic!("stream ended while awaiting a frame"),
-            Err(_) => panic!("timed out awaiting a frame"),
-        }
-    }
+    common::spawn(SpawnSpec::with_apps(config, APPS_C10)).await
 }
 
 /// Read frames for a short window, skipping non-text frames; returns the first
@@ -86,18 +42,6 @@ async fn try_next_json_short(ws: &mut Ws) -> Option<Value> {
             Err(_) => return None,       // deadline elapsed: nothing arrived
         }
     }
-}
-
-async fn send_json(ws: &mut Ws, v: Value) {
-    ws.send(Message::Text(v.to_string())).await.unwrap();
-}
-
-/// connection_established's `data` is a JSON-encoded STRING; extract socket_id.
-async fn established_socket_id(ws: &mut Ws) -> String {
-    let frame = next_json(ws).await;
-    assert_eq!(frame["event"], "pusher:connection_established");
-    let data: Value = serde_json::from_str(frame["data"].as_str().unwrap()).unwrap();
-    data["socket_id"].as_str().unwrap().to_string()
 }
 
 /// Sign and send a `pusher:signin` for the EXACT `user_data` string, then read

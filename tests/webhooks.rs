@@ -3,21 +3,22 @@
 //! captures the signed POST. Verifies the envelope shape AND the
 //! `X-Pusher-Signature` exactly as pusher-http-node's WebHook validator would.
 //!
-//! Mirrors the in-process harness in `tests/integration.rs` / `tests/signin.rs`
-//! (each `tests/*.rs` is its own crate, so the spawn/connect helpers are
-//! replicated here), but wires a REAL `webhook::spawn` dispatcher with a live
-//! `HttpTransport` instead of the `WebhookHandle::null()` sink.
+//! The pylon spawn dispatches between legacy and percore via `tests/common`'s
+//! [`common::spawn`] on `PYLON_TEST_TRANSPORT`, but wires a REAL `webhook::spawn`
+//! dispatcher with a live `HttpTransport` instead of the null sink — so the
+//! occupied/vacated webhook fires identically on both transports.
+
+mod common;
+use common::{spawn, SpawnSpec, Ws};
 
 use futures_util::SinkExt;
 use futures_util::StreamExt;
 use pylon::adapter::local::LocalAdapter;
-use pylon::adapter::Adapter;
 use pylon::app::static_file::StaticFileAppManager;
 use pylon::app::AppManager;
 use pylon::auth::signature::hmac_sha256_hex;
 use pylon::channel::registry::Registry;
 use pylon::server::config::ServerConfig;
-use pylon::server::router::{build_router, AppState};
 use pylon::webhook::dispatcher::SystemClock;
 use pylon::webhook::transport::{HttpTransport, WebhookTransport};
 use serde_json::{json, Value};
@@ -29,9 +30,6 @@ use tokio_tungstenite::tungstenite::Message;
 
 const SECRET: &str = "app-secret";
 const KEY: &str = "app-key";
-
-type Ws =
-    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 
 /// Spawn a local axum receiver that captures the first POST body + signature header,
 /// returning its address and a channel that yields `(raw_body, signature)`.
@@ -80,7 +78,7 @@ async fn spawn_pylon(receiver: SocketAddr) -> SocketAddr {
         ]"#
     );
     let apps: Arc<dyn AppManager> = Arc::new(StaticFileAppManager::from_json(&apps_json).unwrap());
-    let adapter: Arc<dyn Adapter> = Arc::new(LocalAdapter::new(Arc::new(Registry::new())));
+    let local = Arc::new(LocalAdapter::new(Arc::new(Registry::new())));
     let transport: Arc<dyn WebhookTransport> = Arc::new(HttpTransport::new(3, 50, 5000, 100));
     let webhooks = pylon::webhook::spawn(
         apps.clone(),
@@ -95,25 +93,28 @@ async fn spawn_pylon(receiver: SocketAddr) -> SocketAddr {
         webhook_batch_ms: 30,
         ..ServerConfig::default()
     };
-    let state = AppState {
+    // Route through the transport-parameterized harness with the REAL webhook
+    // dispatcher (not the null sink) and the concrete local adapter (so the
+    // percore sharded sink installs on it).
+    spawn(SpawnSpec {
         config,
         apps,
-        adapter,
+        local,
         conn_counts: Arc::new(Default::default()),
         webhooks,
-        saturated: None,
-    };
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move {
-        axum::serve(listener, build_router(state)).await.unwrap();
-    });
-    addr
+    })
+    .await
 }
 
 async fn connect(addr: SocketAddr) -> Ws {
     let url = format!("ws://{addr}/app/{KEY}?protocol=7");
-    let (ws, _) = tokio_tungstenite::connect_async(url).await.unwrap();
+    let (ws, _) = tokio::time::timeout(
+        Duration::from_secs(5),
+        tokio_tungstenite::connect_async(url),
+    )
+    .await
+    .expect("connect within 5s")
+    .expect("ws handshake");
     ws
 }
 
