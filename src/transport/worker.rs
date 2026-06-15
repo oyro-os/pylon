@@ -55,7 +55,7 @@ use mio::net::TcpListener;
 use mio::{Events, Interest, Poll, Token};
 use std::collections::{HashMap, HashSet};
 use std::io::{ErrorKind, Read};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -82,6 +82,11 @@ pub struct DispatchEnv {
     /// mirroring `AppState::conn_counts`.
     pub conn_counts: Arc<DashMap<String, Arc<AtomicUsize>>>,
     pub webhooks: crate::webhook::WebhookHandle,
+    /// SP10 admission control: the shared percore saturation flag. Stamped onto
+    /// each connection's [`ConnectionContext`] at session establish so a WS
+    /// `client-*` event is dropped at ingress under saturation. `None` when no
+    /// sink is wired (e.g. the redis+percore fallback), so the drop never fires.
+    pub saturated: Option<Arc<AtomicBool>>,
 }
 
 /// Configuration for a single worker event loop.
@@ -102,6 +107,16 @@ pub struct WorkerConfig {
     /// accept-distribution logging (so an operator can confirm `SO_REUSEPORT` is
     /// spreading connections across cores). `0` for a lone/test worker.
     pub worker_id: usize,
+    /// SP10: this worker's slice of the global memory budget (bytes). Each worker
+    /// owns its slice (Seastar shared-nothing model); the graduated shed (§6)
+    /// compares this worker's `inflight_bytes` against it. `0` ⇒ no budget
+    /// enforcement (echo workers / tests that don't size a budget).
+    pub per_worker_budget: u64,
+    /// SP10: this worker's slot in the shared inflight-bytes vector. The worker
+    /// stores its local `inflight_bytes` here every iteration so the off-hot-path
+    /// `percore_total_inflight_bytes()` test hook can sum across workers. `None`
+    /// for echo/test workers without budget accounting.
+    pub inflight_slot: Option<Arc<AtomicU64>>,
     /// Per-core SHARDED broadcast wiring (SP9). `Some` for percore dispatch
     /// workers: the inbound side of this worker's broadcast inbox (paired with
     /// the `Sender` held in the sink) plus the slot whose `waker` `OnceLock` this
@@ -215,6 +230,20 @@ pub fn run(mut cfg: WorkerConfig, shutdown: Arc<AtomicBool>) -> std::io::Result<
     // The sink-shared saturation flag, cleared after each full broadcast drain.
     let saturated = broadcast.as_ref().map(|w| w.saturated.clone());
 
+    // SP10 per-worker byte budget + inflight accounting. `inflight_bytes` is this
+    // worker's local (non-atomic) view of how many bytes are queued across all of
+    // its connections' out-queues — maintained as the exact SUM of every
+    // connection's `out_bytes()` (recomputed each iteration), so the byte-
+    // accounting invariant ("a byte enqueued is decremented exactly once, on send
+    // XOR drop") holds by construction with no double-decrement risk. It is
+    // mirrored into the shared `inflight_slot` for the `percore_total_inflight_
+    // bytes()` test hook, and drives the graduated shed on the broadcast drain.
+    let per_worker_budget = cfg.per_worker_budget;
+    let inflight_slot = cfg.inflight_slot.clone();
+    // Reassigned (to the exact sum of all connections' queued bytes) at the top of
+    // every loop iteration before any read; declared here for loop-outer scope.
+    let mut inflight_bytes: u64;
+
     // Worker-local subscription index: which of THIS worker's connections are in
     // each `(app, channel)`. Populated by reconciling `ctx.subscribed` after each
     // dispatch; consulted when a `BroadcastMsg` arrives to fan the frame out to
@@ -248,7 +277,14 @@ pub fn run(mut cfg: WorkerConfig, shutdown: Arc<AtomicBool>) -> std::io::Result<
             return Ok(());
         }
 
-        let pending_writes = conns.iter().any(|(_, e)| e.conn.has_pending_writes());
+        // Recompute this worker's inflight bytes as the exact sum of every
+        // connection's queued bytes (also tells us whether any writes pend, so
+        // the two scans fold into one). This is the byte budget's ground truth.
+        inflight_bytes = conns.iter().map(|(_, e)| e.conn.out_bytes() as u64).sum();
+        if let Some(slot) = &inflight_slot {
+            slot.store(inflight_bytes, Ordering::Relaxed);
+        }
+        let pending_writes = inflight_bytes > 0;
         let timeout = if did_work || pending_writes {
             Some(Duration::from_millis(0))
         } else {
@@ -336,8 +372,24 @@ pub fn run(mut cfg: WorkerConfig, shutdown: Arc<AtomicBool>) -> std::io::Result<
         // safety net under load when no Waker event fires). Drains are no-ops
         // when the inbox is empty.
         if let Some(rx) = broadcast_rx {
-            if drain_broadcasts(&poll, &mut conns, rx, &mut local_subs, &mut sid_to_token) {
+            if drain_broadcasts(
+                &poll,
+                &mut conns,
+                rx,
+                &mut local_subs,
+                &mut sid_to_token,
+                per_worker_budget,
+                &mut inflight_bytes,
+                saturated.as_ref(),
+            ) {
                 work = true;
+            }
+            // Re-sync from the exact post-drain sum (the drain enqueued/dropped
+            // and then flushed, sending bytes out): recompute so the counter and
+            // the test hook never transiently over-report above the true total.
+            inflight_bytes = conns.iter().map(|(_, e)| e.conn.out_bytes() as u64).sum();
+            if let Some(slot) = &inflight_slot {
+                slot.store(inflight_bytes, Ordering::Relaxed);
             }
             // `drain_broadcasts` empties the bounded hand-off inbox (its
             // `while rx.try_recv()` loop runs to `Empty`), so the channel now has
@@ -529,6 +581,7 @@ fn establish_session(env: &Arc<DispatchEnv>, path: &str) -> Option<Session> {
         user: None,
         webhooks: env.webhooks.clone(),
         presence_membership: HashMap::new(),
+        saturated: env.saturated.clone(),
     };
 
     Some(Session {
@@ -928,20 +981,77 @@ fn reconcile_membership(
     session.subs = session.ctx.subscribed.clone();
 }
 
-/// Deliver every queued [`BroadcastMsg`] to this worker's local subscribers.
+/// SP10 graduated-shed band, derived from this worker's `inflight_bytes` as a
+/// fraction of its `per_worker_budget` (Envoy Overload-Manager thresholds). A
+/// `per_worker_budget` of 0 disables enforcement (always `Normal`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ShedBand {
+    /// < 80%: enqueue every broadcast (per-conn drop-head still applies locally).
+    Normal,
+    /// 80–95%: skip subscribers whose own out-queue is already > 50% of its cap.
+    Pressure,
+    /// 95–100%: skip any subscriber whose out-queue is non-trivially backed up.
+    Severe,
+    /// ≥ 100%: drop the broadcast for this worker entirely; set saturated.
+    Saturated,
+}
+
+fn shed_band(inflight: u64, budget: u64) -> ShedBand {
+    if budget == 0 {
+        return ShedBand::Normal;
+    }
+    // Compare with integer math: inflight*100 vs budget*{80,95,100}.
+    let scaled = inflight.saturating_mul(100);
+    if scaled < budget.saturating_mul(80) {
+        ShedBand::Normal
+    } else if scaled < budget.saturating_mul(95) {
+        ShedBand::Pressure
+    } else if scaled < budget.saturating_mul(100) {
+        ShedBand::Severe
+    } else {
+        ShedBand::Saturated
+    }
+}
+
+/// Whether, in the current band, a frame should be skipped for a subscriber
+/// whose out-queue currently holds `out_bytes` against its `high_water` cap.
+/// `Normal` never skips; `Pressure` skips the > 50%-full (slow consumers);
+/// `Severe` skips any backed-up (non-trivially non-empty) queue; `Saturated` is
+/// handled by the caller (whole broadcast dropped).
+fn should_skip(band: ShedBand, out_bytes: usize, high_water: usize) -> bool {
+    match band {
+        ShedBand::Normal => false,
+        ShedBand::Pressure => out_bytes * 2 > high_water, // > 50% full
+        // > 1/16 of the cap ⇒ "non-trivially backed up". A caught-up subscriber
+        // (queue drained to ~0 between iterations) sails through; one that hasn't
+        // drained its last delivery is shed.
+        ShedBand::Severe => out_bytes * 16 > high_water,
+        ShedBand::Saturated => true,
+    }
+}
+
+/// Deliver every queued [`BroadcastMsg`] to this worker's local subscribers,
+/// applying the SP10 graduated shed (§6) against this worker's byte budget.
 ///
-/// For each message: look up the `(app, channel)` subscriber set, and for each
-/// subscriber (skipping `except`) find its slab entry via `sid_to_token` and
-/// `queue` the already-WS-framed `frame` (an `Arc` bump — never re-encoded).
-/// Connections that backpressure-close are torn down. Returns `true` if any
-/// frame was queued (so the adaptive poll stays tight) — the actual socket write
-/// is done by flushing touched connections, handled by the caller.
+/// For each message: classify the current [`ShedBand`] from `inflight_bytes /
+/// per_worker_budget`; in `Saturated` (≥100%) the whole broadcast is dropped and
+/// the sink flagged; otherwise, for each subscriber (skipping `except`), the
+/// already-WS-framed `frame` is `queue`d (an `Arc` bump — never re-encoded)
+/// UNLESS the band says to skip a backed-up subscriber. `inflight_bytes` is kept
+/// live across the drain (each enqueue adds the net byte delta, accounting for
+/// any drop-head eviction) so the band tightens as the worker fills within a
+/// single drain. Connections that backpressure-close are torn down. Returns
+/// `true` if any frame was queued.
+#[allow(clippy::too_many_arguments)]
 fn drain_broadcasts(
     poll: &Poll,
     conns: &mut slab::Slab<Entry>,
     rx: &std::sync::mpsc::Receiver<crate::transport::fanout::BroadcastMsg>,
     local_subs: &mut HashMap<(String, String), HashSet<SocketId>>,
     sid_to_token: &mut HashMap<SocketId, usize>,
+    per_worker_budget: u64,
+    inflight_bytes: &mut u64,
+    saturated: Option<&Arc<AtomicBool>>,
 ) -> bool {
     let mut touched: HashSet<usize> = HashSet::new();
     // Connections that backpressured during delivery; closed after the drain so
@@ -954,6 +1064,19 @@ fn drain_broadcasts(
             continue; // no local subscribers for this channel on this worker
         };
         for sid in subs.iter() {
+            // Reclassify PER SUBSCRIBER: the band tightens as `inflight_bytes`
+            // grows within this drain, so once the worker crosses 100% mid-fan-out
+            // it stops enqueueing for the remaining subscribers of this very
+            // broadcast — the budget is never blown past by a single large channel.
+            let band = shed_band(*inflight_bytes, per_worker_budget);
+            if band == ShedBand::Saturated {
+                // ≥100%: never enqueue past the budget. Flag saturation so the
+                // publish-admission path 503s; skip enqueueing this subscriber.
+                if let Some(sat) = saturated {
+                    sat.store(true, Ordering::Relaxed);
+                }
+                continue;
+            }
             if msg.except.as_ref() == Some(sid) {
                 continue; // sender exclusion
             }
@@ -970,11 +1093,23 @@ fn drain_broadcasts(
             if entry.session.is_none() || entry.conn.state != ConnState::Open {
                 continue;
             }
+            // Graduated shed: under pressure, skip backed-up subscribers so the
+            // fast (caught-up) ones still get every frame — targeted drop.
+            if should_skip(band, entry.conn.out_bytes(), entry.conn.high_water()) {
+                continue;
+            }
             // SP10: the per-connection queue is byte-bounded drop-head — it never
             // rejects. A slow consumer simply loses its OLDEST queued frame(s)
             // (freshest-wins, at-most-once), keeping memory bounded without
-            // closing the connection or stalling the fast path.
+            // closing the connection or stalling the fast path. Track the net
+            // byte delta (enqueue minus any drop-head eviction) into the live
+            // inflight counter so the band stays accurate within this drain.
+            let before = entry.conn.out_bytes();
             let _dropped = entry.conn.queue(msg.frame.clone());
+            let after = entry.conn.out_bytes();
+            *inflight_bytes = inflight_bytes
+                .saturating_add(after as u64)
+                .saturating_sub(before as u64);
             touched.insert(token);
         }
     }
@@ -1028,6 +1163,8 @@ mod tests {
                     rest_handoff: None,
                     worker_id: 0,
                     broadcast: None,
+                    per_worker_budget: 0,
+                    inflight_slot: None,
                 },
                 sd,
             )

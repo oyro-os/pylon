@@ -263,16 +263,26 @@ impl Connection {
         !self.out.is_empty()
     }
 
+    /// This connection's out-queue byte cap (its drop-head high-water). The
+    /// graduated-shed decision (SP10 §6) compares `out_bytes()` against this to
+    /// classify a subscriber as backed-up / slow.
+    pub fn high_water(&self) -> usize {
+        self.high_water
+    }
+
+    /// Total bytes currently queued across all of `out`. The per-worker
+    /// `inflight_bytes` accounting (SP10) reads this before/after each
+    /// `queue`/`flush` to maintain its counter as the exact sum of every
+    /// connection's queued bytes — so a byte enqueued is decremented exactly once
+    /// (on send via `flush`, or on drop-head eviction inside `queue`).
+    pub fn out_bytes(&self) -> usize {
+        self.out_bytes
+    }
+
     // ---- test accessors -------------------------------------------------------
     // Read-only views of the private out-queue state, used by the drop-head unit
     // tests. `#[cfg(test)]` so they add no surface (or dead-code warnings) to the
     // library build.
-
-    /// Total bytes currently queued across all of `out`.
-    #[cfg(test)]
-    pub fn out_bytes(&self) -> usize {
-        self.out_bytes
-    }
 
     /// Number of frames currently queued.
     #[cfg(test)]

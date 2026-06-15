@@ -5,6 +5,12 @@ edition = "2021"
 description = "A Pusher-compatible real-time WebSocket server"
 repository = "https://github.com/oyro-os/pylon"
 
+[features]
+# Exposes off-hot-path debug accessors (e.g. `percore_total_inflight_bytes`) for
+# integration tests of the SP10 overload accounting. Off by default; the crate's
+# own `cargo test` enables it implicitly via `cfg(test)`.
+test-hooks = []
+
 [dependencies]
 # Async runtime
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "signal", "time"] }
@@ -65,6 +71,10 @@ core_affinity = "0.8"
 rayon = "1"
 
 [dev-dependencies]
+# Self-reference with `test-hooks` so integration tests (which see `pylon` as an
+# external crate, where `cfg(test)` is NOT active) can call the off-hot-path
+# debug accessors like `percore_total_inflight_bytes`.
+pylon = { path = ".", features = ["test-hooks"] }
 # Enables paused-time control (`start_paused`, `tokio::time::advance`) in tests.
 tokio = { version = "1", features = ["test-util"] }
 tokio-tungstenite = "0.24"

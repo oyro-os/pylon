@@ -23,9 +23,23 @@ pub struct ConnectionContext {
     pub presence_membership: std::collections::HashMap<String, String>,
     /// Per-connection client-event rate limiter (Pusher: 10 events/sec/connection → 4301).
     pub client_event_rate: crate::ws::rate::RateWindow,
+    /// SP10 admission control: the percore broadcast pipeline's saturation flag.
+    /// When set and saturated, a WS `client-*` event is dropped at ingress
+    /// (mirroring the rate-limit drop) instead of broadcasting — the WS analogue
+    /// of the REST 503. `None` off-percore (legacy transport / tests), so the
+    /// drop never fires and behaviour is unchanged.
+    pub saturated: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 }
 
 impl ConnectionContext {
+    /// Whether the percore broadcast pipeline is currently saturated (SP10).
+    /// `false` when no flag is wired (off-percore).
+    pub(in crate::ws) fn is_saturated(&self) -> bool {
+        self.saturated
+            .as_ref()
+            .is_some_and(|s| s.load(std::sync::atomic::Ordering::Relaxed))
+    }
+
     pub(in crate::ws) fn handle(&self) -> ConnectionHandle {
         ConnectionHandle {
             socket_id: self.socket_id.clone(),

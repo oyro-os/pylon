@@ -7,7 +7,7 @@ use crate::webhook::WebhookHandle;
 use axum::routing::get;
 use axum::Router;
 use dashmap::DashMap;
-use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::{AtomicBool, AtomicUsize};
 use std::sync::Arc;
 
 #[derive(Clone)]
@@ -17,6 +17,23 @@ pub struct AppState {
     pub adapter: Arc<dyn Adapter>,
     pub conn_counts: Arc<DashMap<String, Arc<AtomicUsize>>>,
     pub webhooks: WebhookHandle,
+    /// SP10 admission control: the percore broadcast pipeline's saturation flag,
+    /// threaded as a side channel (NOT via the `Adapter` trait, which stays
+    /// unchanged). `Some` under the percore transport (a clone of the
+    /// `LocalAdapter`'s flag); `None` for the legacy/local path, where
+    /// [`AppState::is_saturated`] is always `false` so the 503 gate is a no-op.
+    pub saturated: Option<Arc<AtomicBool>>,
+}
+
+impl AppState {
+    /// Cheap admission-control check: is the publish pipeline saturated? Off
+    /// percore (`saturated == None`) this is always `false`, so the REST 503 gate
+    /// and the WS client-event drop are no-ops and behaviour is unchanged.
+    pub fn is_saturated(&self) -> bool {
+        self.saturated
+            .as_ref()
+            .is_some_and(|s| s.load(std::sync::atomic::Ordering::Relaxed))
+    }
 }
 
 pub fn build_router(state: AppState) -> Router {

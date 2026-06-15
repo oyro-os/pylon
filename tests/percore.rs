@@ -74,6 +74,7 @@ async fn spawn(config: ServerConfig) -> Harness {
         strict_protocol: config.strict_protocol,
         conn_counts: Arc::new(Default::default()),
         webhooks: pylon::webhook::WebhookHandle::null(),
+        saturated: None,
     });
 
     let port = free_port();
@@ -90,6 +91,8 @@ async fn spawn(config: ServerConfig) -> Harness {
                 rest_handoff: None,
                 worker_id: 0,
                 broadcast: None,
+                per_worker_budget: 0,
+                inflight_slot: None,
             },
             sd,
         )

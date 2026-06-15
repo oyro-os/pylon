@@ -95,6 +95,8 @@ async fn main() -> anyhow::Result<()> {
                 adapter,
                 conn_counts,
                 webhooks,
+                // Legacy transport self-throttles; no SP10 saturation admission.
+                saturated: None,
             };
             let listener =
                 tokio::net::TcpListener::bind((config.bind.as_str(), config.port)).await?;
@@ -124,6 +126,10 @@ async fn main() -> anyhow::Result<()> {
                 adapter: adapter.clone(),
                 conn_counts: conn_counts.clone(),
                 webhooks: webhooks.clone(),
+                // SP10: the REST 503 admission gate reads the percore saturation
+                // flag (the LocalAdapter's, shared with the sink). `None` for the
+                // redis+percore fallback (no concrete local adapter).
+                saturated: local.as_ref().map(|l| l.saturation_flag()),
             };
             let rest_router = build_router(rest_state);
             tokio::spawn(pylon::transport::rest::serve(rest_rx, rest_router));

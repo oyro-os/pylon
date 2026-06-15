@@ -100,6 +100,7 @@ async fn spawn() -> Harness {
         adapter: adapter.clone(),
         conn_counts: Arc::clone(&conn_counts),
         webhooks: webhooks.clone(),
+        saturated: Some(local.saturation_flag()),
     };
     let rest_router = build_router(rest_state);
     tokio::spawn(pylon::transport::rest::serve(rest_rx, rest_router));

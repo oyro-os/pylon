@@ -1489,6 +1489,7 @@ dependencies = [
  "md-5",
  "mimalloc",
  "mio",
+ "pylon",
  "rand 0.8.6",
  "rayon",
  "reqwest",

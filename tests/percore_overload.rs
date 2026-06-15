@@ -57,6 +57,26 @@ const APPS: &str = r#"[
      "capacity":0,"client_messages_enabled":true,"subscription_count_enabled":false}
 ]"#;
 
+/// Serializes the overload tests. The `percore_total_inflight_bytes()` debug
+/// hook sums a PROCESS-GLOBAL slot vector that each `run_percore` replaces on
+/// spawn, so two concurrent percore harnesses would clobber each other's slots.
+/// Every test here holds this lock for its duration so only one harness lives at
+/// a time. `tokio::sync::Mutex` is await-safe (held across the test body).
+static HARNESS_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// Base percore config for a harness on `port` — overload knobs left at their
+/// auto defaults. Individual tests clone this and set the budget/cap fields
+/// directly (no process-global `PYLON_*` env, so tests stay parallel-safe).
+fn base_config(port: u16) -> ServerConfig {
+    ServerConfig {
+        transport: TransportMode::Percore,
+        bind: "127.0.0.1".to_string(),
+        port,
+        workers: N_WORKERS,
+        ..Default::default()
+    }
+}
+
 type Ws =
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 
@@ -87,14 +107,13 @@ fn free_port() -> u16 {
 /// `LocalAdapter` (sharded sink installed by `run_percore`) and a REST plane
 /// served on the test's tokio runtime. Waits for the listeners to bind.
 async fn spawn() -> Harness {
-    let port = free_port();
-    let config = ServerConfig {
-        transport: TransportMode::Percore,
-        bind: "127.0.0.1".to_string(),
-        port,
-        workers: N_WORKERS,
-        ..Default::default()
-    };
+    spawn_with(base_config(free_port())).await
+}
+
+/// Start a percore harness from an explicit `config` (so a test can set the SP10
+/// budget/cap knobs directly without touching process-global env).
+async fn spawn_with(config: ServerConfig) -> Harness {
+    let port = config.port;
 
     let apps: Arc<dyn AppManager> = Arc::new(StaticFileAppManager::from_json(APPS).unwrap());
     let local = Arc::new(LocalAdapter::new(Arc::new(Registry::new())));
@@ -110,6 +129,7 @@ async fn spawn() -> Harness {
         adapter: adapter.clone(),
         conn_counts: Arc::clone(&conn_counts),
         webhooks: webhooks.clone(),
+        saturated: Some(local.saturation_flag()),
     };
     let rest_router = build_router(rest_state);
     tokio::spawn(pylon::transport::rest::serve(rest_rx, rest_router));
@@ -236,6 +256,7 @@ async fn publish(port: u16, client: &reqwest::Client, channel: &str, data: &str)
 /// hard wall and a fresh subscriber is still served afterwards.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn overload_flood_does_not_hang_and_server_stays_alive() {
+    let _guard = HARNESS_LOCK.lock().await;
     // The entire test body runs under a hard wall: a hang fails deterministically
     // instead of blocking CI forever.
     tokio::time::timeout(WALL, async {
@@ -318,15 +339,88 @@ async fn overload_flood_does_not_hang_and_server_stays_alive() {
 }
 
 /// Phase 2 gate: under the flood, the total bytes queued across all workers must
-/// never exceed the per-worker byte budget × workers. This needs the per-worker
-/// byte-budget accounting + the `percore_total_inflight_bytes()` debug hook that
-/// Phase 2 wires, so it is ignored here.
-// TODO(sp10-phase2): un-ignore when per-worker budget lands
-#[ignore]
-#[tokio::test]
+/// never exceed the configured memory budget. With a small explicit budget,
+/// flood publishes to many never-reading subscribers and sample
+/// `percore_total_inflight_bytes()` throughout — it must stay within the budget
+/// (a small per-frame slack for the in-flight enqueue before the next loop-top
+/// recompute / shed kicks in).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn overload_total_inflight_stays_within_budget() {
-    // Placeholder: Phase 2 adds `percore_total_inflight_bytes()` and the
-    // per-worker budget; this test will flood and assert
-    // `percore_total_inflight_bytes() <= budget` throughout.
-    unimplemented!("wired in SP10 Phase 2 (Task 2.2)");
+    let _guard = HARNESS_LOCK.lock().await;
+    // A small, explicit budget so the bound is tight and the test is fast.
+    const BUDGET: u64 = 16 << 20; // 16 MiB across all workers (4 MiB/worker)
+    // Size the per-conn cap so the per-worker drop-head caps SUM to the per-worker
+    // budget: 4 MiB/worker ÷ 50 expected ≈ 84 KiB; with ~50 subs/worker that's
+    // 50 × 84 KiB ≈ 4 MiB = per-worker budget, so total inflight is bounded by
+    // both the graduated shed (new enqueues) AND the per-conn drop-head (already
+    // queued) — the two together hold the total at/under the budget.
+    let config = ServerConfig {
+        memory_budget_bytes: BUDGET,
+        expected_conns_per_worker: 50,
+        perconn_queue_min_bytes: 16 << 10,
+        perconn_queue_max_bytes: 128 << 10,
+        ..base_config(free_port())
+    };
+
+    let result = tokio::time::timeout(WALL, async {
+        let h = spawn_with(config).await;
+        let channel = "budget-chan";
+
+        // Connect subscribers that NEVER read — their out-queues back up, so the
+        // per-worker budget + drop-head must cap total queued bytes.
+        let mut subs: Vec<Ws> = Vec::with_capacity(N_SUBS);
+        for _ in 0..N_SUBS {
+            let mut ws = connect(h.port).await;
+            let est = next_json(&mut ws).await;
+            assert_eq!(est["event"], "pusher:connection_established");
+            subscribe_public(&mut ws, channel).await;
+            subs.push(ws);
+        }
+
+        let client = reqwest::Client::new();
+        let port = h.port;
+        // A larger payload so queued bytes accumulate fast against the small budget.
+        let big = "x".repeat(4096);
+        let big2 = big.clone();
+        let mut publishers = Vec::new();
+        for _ in 0..8 {
+            let client = client.clone();
+            let payload = big2.clone();
+            publishers.push(tokio::spawn(async move {
+                let start = Instant::now();
+                while start.elapsed() < FLOOD {
+                    let _ = publish(port, &client, channel, &payload).await;
+                }
+            }));
+        }
+
+        // Sample the inflight total while the flood runs; it must never exceed
+        // the budget plus a small slack (a handful of in-flight per-conn caps per
+        // worker — the most a single drain can transiently add before the next
+        // recompute / shed). per_conn_cap here is ≤ 128 KiB.
+        let slack: u64 = (N_WORKERS as u64) * 4 * (128 << 10);
+        let mut max_seen: u64 = 0;
+        let sample_until = Instant::now() + FLOOD;
+        while Instant::now() < sample_until {
+            let inflight = pylon::transport::percore_total_inflight_bytes();
+            max_seen = max_seen.max(inflight);
+            assert!(
+                inflight <= BUDGET + slack,
+                "inflight {inflight} exceeded budget {BUDGET} (+slack {slack})"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        for p in publishers {
+            let _ = p.await;
+        }
+        // We must have actually accumulated SOME queued bytes (proving the path
+        // was exercised, not a no-op where everything drained instantly).
+        assert!(max_seen > 0, "no inflight bytes ever observed; flood was a no-op");
+
+        drop(subs);
+        drop(h);
+    })
+    .await;
+
+    result.expect("budget flood did not complete within the wall");
 }

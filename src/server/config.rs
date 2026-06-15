@@ -70,6 +70,26 @@ pub struct ServerConfig {
     /// Number of per-core worker threads for `TransportMode::Percore`. `0` means
     /// "auto" — one worker per available CPU. See [`ServerConfig::worker_count`].
     pub workers: usize,
+    // ── SP10 adaptive overload (all auto-derived; overrides only) ──────────────
+    /// Total memory budget in bytes for the percore transport. `0` (default) ⇒
+    /// auto: `memory_budget(detect_effective_mem())`. `PYLON_MEMORY_BUDGET_BYTES`.
+    pub memory_budget_bytes: u64,
+    /// Memory budget as a fraction of the effective envelope (0.0..=1.0), applied
+    /// when `memory_budget_bytes == 0`. `0.0` (default) ⇒ use the
+    /// `max(1.5 GiB, 7%)` reserve formula instead. `PYLON_MEMORY_BUDGET_FRACTION`.
+    pub memory_budget_fraction: f64,
+    /// Expected concurrent connections per worker, used to derive the
+    /// per-connection out-queue cap. `PYLON_EXPECTED_CONNS_PER_WORKER` (default 50_000).
+    pub expected_conns_per_worker: u64,
+    /// Lower clamp for the per-connection out-queue cap (bytes).
+    /// `PYLON_PERCONN_QUEUE_MIN_BYTES` (default 256 KiB).
+    pub perconn_queue_min_bytes: u64,
+    /// Upper clamp for the per-connection out-queue cap (bytes).
+    /// `PYLON_PERCONN_QUEUE_MAX_BYTES` (default 8 MiB).
+    pub perconn_queue_max_bytes: u64,
+    /// Capacity (frames) of each worker's bounded broadcast hand-off channel.
+    /// `PYLON_BROADCAST_HANDOFF_CAP` (default 1024).
+    pub broadcast_handoff_cap: usize,
 }
 
 impl Default for ServerConfig {
@@ -110,6 +130,12 @@ impl Default for ServerConfig {
             redis_sharded_pubsub: false,
             transport: TransportMode::Legacy,
             workers: 0,
+            memory_budget_bytes: 0,
+            memory_budget_fraction: 0.0,
+            expected_conns_per_worker: 50_000,
+            perconn_queue_min_bytes: 256 << 10,
+            perconn_queue_max_bytes: 8 << 20,
+            broadcast_handoff_cap: crate::transport::fanout::DEFAULT_BROADCAST_HANDOFF_CAP,
         }
     }
 }
@@ -278,7 +304,50 @@ impl ServerConfig {
                 c.workers = p;
             }
         }
+        if let Ok(v) = std::env::var("PYLON_MEMORY_BUDGET_BYTES") {
+            if let Ok(p) = v.parse() {
+                c.memory_budget_bytes = p;
+            }
+        }
+        if let Ok(v) = std::env::var("PYLON_MEMORY_BUDGET_FRACTION") {
+            if let Ok(p) = v.parse() {
+                c.memory_budget_fraction = p;
+            }
+        }
+        if let Ok(v) = std::env::var("PYLON_EXPECTED_CONNS_PER_WORKER") {
+            if let Ok(p) = v.parse() {
+                c.expected_conns_per_worker = p;
+            }
+        }
+        if let Ok(v) = std::env::var("PYLON_PERCONN_QUEUE_MIN_BYTES") {
+            if let Ok(p) = v.parse() {
+                c.perconn_queue_min_bytes = p;
+            }
+        }
+        if let Ok(v) = std::env::var("PYLON_PERCONN_QUEUE_MAX_BYTES") {
+            if let Ok(p) = v.parse() {
+                c.perconn_queue_max_bytes = p;
+            }
+        }
+        if let Ok(v) = std::env::var("PYLON_BROADCAST_HANDOFF_CAP") {
+            if let Ok(p) = v.parse() {
+                c.broadcast_handoff_cap = p;
+            }
+        }
         c
+    }
+
+    /// Resolve the percore total memory budget (bytes): the explicit
+    /// `memory_budget_bytes` override if non-zero; else the configured fraction
+    /// of `effective_mem` if set; else the `max(1.5 GiB, 7%)` reserve formula.
+    pub fn resolved_memory_budget(&self, effective_mem: u64) -> u64 {
+        if self.memory_budget_bytes != 0 {
+            self.memory_budget_bytes
+        } else if self.memory_budget_fraction > 0.0 {
+            ((effective_mem as f64) * self.memory_budget_fraction) as u64
+        } else {
+            crate::server::resources::memory_budget(effective_mem)
+        }
     }
 
     /// Resolve the per-core worker count: the configured value, or — when `0`
@@ -348,6 +417,45 @@ mod tests {
         assert_eq!(c.redis_sweep_interval_secs, 10);
         assert_eq!(c.webhook_vacated_grace_ms, 3000);
         assert!(!c.redis_sharded_pubsub);
+        // SP10 adaptive-overload defaults (all auto).
+        assert_eq!(c.memory_budget_bytes, 0);
+        assert_eq!(c.memory_budget_fraction, 0.0);
+        assert_eq!(c.expected_conns_per_worker, 50_000);
+        assert_eq!(c.perconn_queue_min_bytes, 256 << 10);
+        assert_eq!(c.perconn_queue_max_bytes, 8 << 20);
+        assert_eq!(c.broadcast_handoff_cap, 1024);
+    }
+
+    #[test]
+    fn sp10_overload_env_overrides_apply() {
+        std::env::set_var("PYLON_MEMORY_BUDGET_BYTES", "67108864");
+        std::env::set_var("PYLON_EXPECTED_CONNS_PER_WORKER", "1000");
+        std::env::set_var("PYLON_PERCONN_QUEUE_MIN_BYTES", "4096");
+        std::env::set_var("PYLON_PERCONN_QUEUE_MAX_BYTES", "1048576");
+        std::env::set_var("PYLON_BROADCAST_HANDOFF_CAP", "16");
+        let c = ServerConfig::from_env();
+        assert_eq!(c.memory_budget_bytes, 67_108_864);
+        assert_eq!(c.expected_conns_per_worker, 1000);
+        assert_eq!(c.perconn_queue_min_bytes, 4096);
+        assert_eq!(c.perconn_queue_max_bytes, 1_048_576);
+        assert_eq!(c.broadcast_handoff_cap, 16);
+        // An explicit byte budget wins over the formula.
+        assert_eq!(c.resolved_memory_budget(8u64 << 30), 67_108_864);
+        std::env::remove_var("PYLON_MEMORY_BUDGET_BYTES");
+        std::env::remove_var("PYLON_EXPECTED_CONNS_PER_WORKER");
+        std::env::remove_var("PYLON_PERCONN_QUEUE_MIN_BYTES");
+        std::env::remove_var("PYLON_PERCONN_QUEUE_MAX_BYTES");
+        std::env::remove_var("PYLON_BROADCAST_HANDOFF_CAP");
+    }
+
+    #[test]
+    fn resolved_budget_falls_back_to_formula() {
+        let c = ServerConfig::default();
+        // No override → the max(1.5 GiB, 7%) reserve formula.
+        assert_eq!(
+            c.resolved_memory_budget(4u64 << 30),
+            crate::server::resources::memory_budget(4u64 << 30)
+        );
     }
 
     #[test]

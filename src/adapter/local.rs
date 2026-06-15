@@ -24,6 +24,12 @@ pub struct LocalAdapter {
     /// no per-connection mpsc); when absent, the legacy registry mailbox path is
     /// used. `OnceLock` because the sink is installed exactly once at startup.
     bcast_sink: std::sync::OnceLock<crate::transport::fanout::BroadcastSink>,
+    /// SP10 admission control: the percore broadcast pipeline's saturation flag.
+    /// Owned here (created at construction) so it can be shared with the REST
+    /// `AppState` (which reads it to 503) AND with the sink/workers (which set and
+    /// clear it) — `run_percore` installs a sink that points at this same flag.
+    /// Off-percore it simply stays `false`, so the 503 path is a no-op.
+    saturated: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl LocalAdapter {
@@ -33,6 +39,7 @@ impl LocalAdapter {
             cache: CacheStore::new(),
             users: UserRegistry::new(),
             bcast_sink: std::sync::OnceLock::new(),
+            saturated: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 
@@ -40,6 +47,20 @@ impl LocalAdapter {
     /// before spawning workers; idempotent (a second call is ignored).
     pub fn set_broadcast_sink(&self, sink: crate::transport::fanout::BroadcastSink) {
         let _ = self.bcast_sink.set(sink);
+    }
+
+    /// The shared saturation flag (SP10). `run_percore` builds the broadcast sink
+    /// around this very `Arc` so the publishers' "saturated" signal and the REST
+    /// admission check observe the same bit. Cloned into `AppState` for the 503
+    /// gate.
+    pub fn saturation_flag(&self) -> Arc<std::sync::atomic::AtomicBool> {
+        self.saturated.clone()
+    }
+
+    /// Cheap admission-control check (SP10): whether the percore broadcast
+    /// pipeline is currently saturated. Off-percore this stays `false`.
+    pub fn is_saturated(&self) -> bool {
+        self.saturated.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// The installed per-core broadcast sink, if any (percore active).

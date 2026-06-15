@@ -21,6 +21,7 @@ use crate::adapter::local::LocalAdapter;
 use crate::adapter::Adapter;
 use crate::app::AppManager;
 use crate::server::config::ServerConfig;
+use crate::server::resources;
 use crate::webhook::WebhookHandle;
 use dashmap::DashMap;
 use fanout::{BroadcastSink, WorkerSlot};
@@ -30,6 +31,33 @@ use tokio::sync::mpsc::UnboundedSender;
 use worker::{BroadcastWiring, DispatchEnv, Mode, WorkerConfig};
 
 pub use rest::RestConn;
+
+/// Process-global registry of the live per-core workers' inflight-byte counters,
+/// one `AtomicU64` per worker. Installed by [`run_percore`] (test-hooks builds)
+/// and summed by [`percore_total_inflight_bytes`]. Behind a feature gate so it
+/// adds no surface to release builds.
+#[cfg(any(test, feature = "test-hooks"))]
+static INFLIGHT_SLOTS: std::sync::OnceLock<std::sync::Mutex<Vec<Arc<AtomicU64>>>> =
+    std::sync::OnceLock::new();
+
+/// Test hook (SP10): total bytes queued across ALL per-core workers — the sum of
+/// each worker's local `inflight_bytes` counter (mirrored into a shared
+/// `AtomicU64` slot every loop iteration). Used by the overload flood test to
+/// assert the total stays within the configured memory budget. Returns 0 before
+/// any percore server has installed its slots.
+#[cfg(any(test, feature = "test-hooks"))]
+pub fn percore_total_inflight_bytes() -> u64 {
+    INFLIGHT_SLOTS
+        .get()
+        .map(|m| {
+            m.lock()
+                .unwrap()
+                .iter()
+                .map(|s| s.load(std::sync::atomic::Ordering::Relaxed))
+                .sum()
+        })
+        .unwrap_or(0)
+}
 
 /// Run the per-core (`PYLON_TRANSPORT=percore`) transport as the actual server.
 ///
@@ -71,6 +99,12 @@ pub fn run_percore(
         .parse()
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
 
+    // SP10: the shared saturation flag the WS client-event ingress drop reads. It
+    // lives on the `LocalAdapter` (so the REST `AppState` and the sink share the
+    // SAME bit); `None` when there's no concrete local adapter (redis+percore
+    // fallback), so the WS drop never fires there.
+    let saturated_flag = local.as_ref().map(|l| l.saturation_flag());
+
     let env = Arc::new(DispatchEnv {
         apps,
         adapter,
@@ -79,21 +113,56 @@ pub fn run_percore(
         strict_protocol: config.strict_protocol,
         conn_counts,
         webhooks,
+        saturated: saturated_flag,
     });
 
     // WS frame cap: bound a single inbound frame's payload. The configured
     // event-payload limit is small (KiB), so use a 1 MiB frame ceiling that
     // comfortably covers any legitimate Pusher frame while bounding abuse.
     let max_payload = config.max_event_payload_bytes.max(1 << 20);
-    // Per-connection outbound high-water before a backpressure close (4 MiB).
-    let high_water = 4 << 20;
 
+    // SP10 self-sizing: worker count (explicit or `available_parallelism`), the
+    // total memory budget (explicit/fraction override or the `max(1.5 GiB, 7%)`
+    // reserve formula over the effective — cgroup-aware — envelope), each
+    // worker's budget slice, and the per-connection out-queue cap clamped to the
+    // configured [min, max] window. `per_conn_cap` becomes each `Connection`'s
+    // `high_water`, so a slow consumer's drop-head queue is sized to the host.
     let worker_count = config.worker_count();
+    let effective_mem = resources::detect_effective_mem();
+    let budget = config.resolved_memory_budget(effective_mem);
+    let per_worker_budget = budget / worker_count.max(1) as u64;
+    let per_conn_cap = resources::per_conn_cap(per_worker_budget, config.expected_conns_per_worker)
+        .clamp(config.perconn_queue_min_bytes, config.perconn_queue_max_bytes);
+    let high_water = per_conn_cap as usize;
+
     // CPU ids to pin to. May be empty if the OS won't report them — workers then
     // run unpinned (still fully functional, just not affinity-bound).
     let core_ids = core_affinity::get_core_ids().unwrap_or_default();
 
-    tracing::info!(%addr, workers = worker_count, "pylon percore: {worker_count} workers on {addr}");
+    tracing::info!(
+        %addr,
+        workers = worker_count,
+        budget_mib = budget >> 20,
+        per_conn_cap_kib = per_conn_cap >> 10,
+        "pylon percore: {worker_count} workers, budget {} MiB, per-conn cap {} KiB",
+        budget >> 20,
+        per_conn_cap >> 10,
+    );
+
+    // Per-worker inflight-byte counters (one shared `AtomicU64` per worker). Each
+    // worker mirrors its local `inflight_bytes` into its slot every loop; the
+    // off-hot-path `percore_total_inflight_bytes()` test hook sums them.
+    let inflight_slots: Vec<Arc<AtomicU64>> =
+        (0..worker_count).map(|_| Arc::new(AtomicU64::new(0))).collect();
+    #[cfg(any(test, feature = "test-hooks"))]
+    {
+        let mut g = INFLIGHT_SLOTS
+            .get_or_init(|| std::sync::Mutex::new(Vec::new()))
+            .lock()
+            .unwrap();
+        g.clear();
+        g.extend(inflight_slots.iter().cloned());
+    }
 
     // Build the per-core sharded broadcast plumbing: one `(Sender, Receiver)`
     // pair + `WorkerSlot` per worker. The `Sender`s live in the sink (installed
@@ -105,7 +174,7 @@ pub fn run_percore(
     // Bounded broadcast hand-off capacity (frames) per worker (SP10): the
     // publish→workers channel is bounded so a publish flood that outruns delivery
     // is dropped at the hand-off rather than buffered unbounded (the SP9 hang).
-    let handoff_cap = fanout::DEFAULT_BROADCAST_HANDOFF_CAP;
+    let handoff_cap = config.broadcast_handoff_cap;
 
     let mut wirings: Vec<Option<BroadcastWiring>> = Vec::with_capacity(worker_count);
     if let Some(local) = &local {
@@ -125,9 +194,12 @@ pub fn run_percore(
             }));
             receivers.push(rx);
         }
-        // Sink-shared saturation flag: set by the publisher on a full hand-off,
-        // cleared by each worker after it drains its inbox to empty.
-        let saturated = Arc::new(AtomicBool::new(false));
+        // Sink-shared saturation flag: set by the publisher on a full hand-off
+        // OR by a worker that hit ≥100% of its byte budget, cleared by each
+        // worker after it drains its inbox to empty. Sourced from the
+        // `LocalAdapter` so the REST `AppState`'s 503 admission check (which holds
+        // a clone via `saturation_flag()`) observes the SAME bit.
+        let saturated = local.saturation_flag();
         let sink = BroadcastSink {
             workers: Arc::new(slots.clone()),
             saturated: saturated.clone(),
@@ -157,6 +229,8 @@ pub fn run_percore(
             rest_handoff: rest_handoff.clone(),
             worker_id: i,
             broadcast: wiring,
+            per_worker_budget,
+            inflight_slot: Some(inflight_slots[i].clone()),
         };
         let shutdown = shutdown.clone();
         let core = core_ids.get(i % core_ids.len().max(1)).copied();
