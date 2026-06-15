@@ -667,12 +667,13 @@ fn handle_handshake(poll: &Poll, entry: &mut Entry, cfg: &WorkerConfig, now_ns: 
 
             // For a dispatch worker, build the v7 session now: resolve the app,
             // check capacity, create the mailbox + ConnectionContext, and queue
-            // the connection_established frame. On failure we just close the
-            // socket (acceptable for this task; the legacy path sends an error
-            // frame first).
+            // the connection_established frame. On a rejection (unknown app 4001,
+            // unsupported protocol 4007, over-capacity 4004) emit the `pusher:error`
+            // frame + a WS Close carrying the error code — byte-for-byte parity with
+            // the legacy `ws::upgrade::reject`.
             if let Mode::Dispatch(env) = &cfg.mode {
                 match establish_session(env, &path) {
-                    Some(session) => {
+                    Ok(session) => {
                         let established = ServerEvent::ConnectionEstablished {
                             socket_id: session.ctx.socket_id.clone(),
                             activity_timeout: env.activity_timeout,
@@ -685,7 +686,12 @@ fn handle_handshake(poll: &Poll, entry: &mut Entry, cfg: &WorkerConfig, now_ns: 
                             .queue(Arc::from(out.to_vec().into_boxed_slice()), now_ns);
                         entry.session = Some(session);
                     }
-                    None => return Action::Close,
+                    Err(reject) => {
+                        queue_reject(entry, &reject, now_ns);
+                        // Flush so the error + Close reach the peer, then tear down.
+                        let _ = flush_and_arm(poll, entry, now_ns);
+                        return Action::Close;
+                    }
                 }
             }
 
@@ -707,17 +713,41 @@ fn handle_handshake(poll: &Poll, entry: &mut Entry, cfg: &WorkerConfig, now_ns: 
     }
 }
 
+/// A pre-session rejection: the `pusher:error` to emit plus the codec that should
+/// encode it. `codec` is `None` only when protocol negotiation itself failed (no
+/// codec exists yet) — then the error frame is a hand-built raw JSON object, the
+/// exact `ws::upgrade::reject(.., None)` fallback.
+struct Reject {
+    error: crate::protocol::error::PusherError,
+    codec: Option<Box<dyn Codec>>,
+}
+
 /// Resolve the app + protocol from a `/app/{key}?protocol=N` path and build the
 /// v7 [`Session`], mirroring `ws::upgrade::serve`: negotiate codec, look up the
 /// app by key, enforce per-app capacity, and assemble the [`ConnectionContext`]
-/// the same way `connection::task::run` does. Returns `None` (→ close) on any
-/// rejection (bad protocol, unknown app, over capacity).
-fn establish_session(env: &Arc<DispatchEnv>, path: &str) -> Option<Session> {
+/// the same way `connection::task::run` does. Returns `Err(Reject)` on any
+/// rejection (unsupported protocol → 4007, unknown app → 4001, over capacity →
+/// 4004), carrying the `pusher:error` + the codec to encode it — so the caller
+/// emits the error frame then a WS Close, matching legacy byte-for-byte.
+fn establish_session(env: &Arc<DispatchEnv>, path: &str) -> Result<Session, Reject> {
+    use crate::protocol::error::PusherError;
     let (key, protocol) = parse_app_path(path);
 
-    let codec = negotiate(protocol.as_deref(), env.strict_protocol).ok()?;
+    // Negotiation failure (e.g. `protocol=3`) has no codec yet → raw fallback.
+    let codec = match negotiate(protocol.as_deref(), env.strict_protocol) {
+        Ok(c) => c,
+        Err(error) => return Err(Reject { error, codec: None }),
+    };
 
-    let app = futures_executor::block_on(env.apps.by_key(&key))?;
+    let app = match futures_executor::block_on(env.apps.by_key(&key)) {
+        Some(a) => a,
+        None => {
+            return Err(Reject {
+                error: PusherError::app_not_found(),
+                codec: Some(codec),
+            })
+        }
+    };
 
     let counter = env
         .conn_counts
@@ -727,7 +757,10 @@ fn establish_session(env: &Arc<DispatchEnv>, path: &str) -> Option<Session> {
     let current = counter.fetch_add(1, Ordering::SeqCst);
     if app.capacity != 0 && current >= app.capacity as usize {
         counter.fetch_sub(1, Ordering::SeqCst);
-        return None;
+        return Err(Reject {
+            error: PusherError::over_capacity(),
+            codec: Some(codec),
+        });
     }
 
     let socket_id = SocketId::generate();
@@ -748,13 +781,46 @@ fn establish_session(env: &Arc<DispatchEnv>, path: &str) -> Option<Session> {
         saturated: env.saturated.clone(),
     };
 
-    Some(Session {
+    Ok(Session {
         ctx,
         rx,
         codec,
         conn_count: counter,
         subs: HashSet::new(),
     })
+}
+
+/// Queue the pre-session rejection frames onto `entry`'s out-queue: first the
+/// `pusher:error` Text frame (codec-encoded when a codec exists, else the raw
+/// JSON fallback), then a WebSocket Close frame carrying the error `code` +
+/// `message`. Mirrors `ws::upgrade::reject` exactly so the percore rejection is
+/// byte-for-byte identical to legacy. The caller flushes and closes.
+fn queue_reject(entry: &mut Entry, reject: &Reject, now_ns: u64) {
+    // 1) the pusher:error Text frame.
+    let text = match &reject.codec {
+        Some(c) => c.encode(&ServerEvent::Error(reject.error.clone())),
+        None => serde_json::json!({
+            "event": "pusher:error",
+            "data": { "code": reject.error.code, "message": reject.error.message }
+        })
+        .to_string(),
+    };
+    let mut out = BytesMut::new();
+    frame::encode_text(&mut out, text.as_bytes());
+    let _ = entry
+        .conn
+        .queue(Arc::from(out.to_vec().into_boxed_slice()), now_ns);
+
+    // 2) the WS Close frame: code = the pusher error code, reason = its message.
+    let reason = &reject.error.message;
+    let mut frame_body = Vec::with_capacity(2 + reason.len());
+    frame_body.extend_from_slice(&reject.error.code.to_be_bytes());
+    frame_body.extend_from_slice(reason.as_bytes());
+    let mut close_out = BytesMut::new();
+    frame::encode(&mut close_out, true, OpCode::Close, &frame_body);
+    let _ = entry
+        .conn
+        .queue(Arc::from(close_out.to_vec().into_boxed_slice()), now_ns);
 }
 
 /// Split a `/app/{key}` path (with an optional `?protocol=N&...` query) into the
