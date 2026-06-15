@@ -33,9 +33,17 @@ async fn main() -> anyhow::Result<()> {
     } else {
         None
     };
-    let adapter: Arc<dyn Adapter> = match &redis {
-        Some(r) => r.clone(),
-        None => Arc::new(LocalAdapter::new(Arc::new(Registry::new()))),
+    // Keep the CONCRETE local adapter (when not redis) so the percore transport
+    // can install its sharded broadcast sink on it. `None` under redis.
+    let local: Option<Arc<LocalAdapter>> = match &redis {
+        Some(_) => None,
+        None => Some(Arc::new(LocalAdapter::new(Arc::new(Registry::new())))),
+    };
+    let adapter: Arc<dyn Adapter> = match (&redis, &local) {
+        (Some(r), _) => r.clone(),
+        (None, Some(l)) => l.clone(),
+        // Unreachable: exactly one of redis/local is set above.
+        (None, None) => Arc::new(LocalAdapter::new(Arc::new(Registry::new()))),
     };
 
     // Webhook dispatcher: real HTTP transport (reqwest+rustls), system clock.
@@ -120,6 +128,17 @@ async fn main() -> anyhow::Result<()> {
             let rest_router = build_router(rest_state);
             tokio::spawn(pylon::transport::rest::serve(rest_rx, rest_router));
 
+            // Per-core sharded fan-out applies only to the local adapter. With
+            // redis+percore the concrete `LocalAdapter` isn't available, so the
+            // sink is skipped and broadcasts fall back to the legacy mailbox path.
+            if local.is_none() {
+                tracing::warn!(
+                    "redis adapter with percore transport: sharded broadcast \
+                     fan-out is unavailable; using the legacy mailbox path"
+                );
+            }
+            let local_for_sink = local.clone();
+
             let shutdown = Arc::new(AtomicBool::new(false));
             let worker_shutdown = shutdown.clone();
             let worker_config = config.clone();
@@ -132,6 +151,7 @@ async fn main() -> anyhow::Result<()> {
                     webhooks,
                     Some(rest_tx),
                     worker_shutdown,
+                    local_for_sink,
                 )
             });
 

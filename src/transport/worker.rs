@@ -64,6 +64,11 @@ use tokio::sync::mpsc;
 /// `usize` is guaranteed never to collide with a connection token.
 const LISTENER: Token = Token(usize::MAX);
 
+/// Reserved token for this worker's broadcast-inbox [`mio::Waker`]. One below
+/// [`LISTENER`]; slab keys grow from 0 so neither reserved value can collide
+/// with a connection token.
+const BCAST_WAKER: Token = Token(usize::MAX - 1);
+
 /// Shared, `Arc`-cloneable bundle of the `AppState` pieces a [`Mode::Dispatch`]
 /// worker needs to build a [`ConnectionContext`] per connection — the same
 /// inputs `ws::upgrade::serve` threads into `ConnectionParams`.
@@ -97,6 +102,24 @@ pub struct WorkerConfig {
     /// accept-distribution logging (so an operator can confirm `SO_REUSEPORT` is
     /// spreading connections across cores). `0` for a lone/test worker.
     pub worker_id: usize,
+    /// Per-core SHARDED broadcast wiring (SP9). `Some` for percore dispatch
+    /// workers: the inbound side of this worker's broadcast inbox (paired with
+    /// the `Sender` held in the sink) plus the slot whose `waker` `OnceLock` this
+    /// worker fills at startup so the sink can nudge it. `None` for echo workers
+    /// and the single-worker `tests/percore.rs` parity harness, which fall back
+    /// to draining nothing here (those tests use no sink, so broadcasts route via
+    /// the legacy registry mailbox path instead).
+    pub broadcast: Option<BroadcastWiring>,
+}
+
+/// The per-worker half of the sharded broadcast plumbing handed to [`run`].
+pub struct BroadcastWiring {
+    /// Inbound broadcast hand-offs from the sink (the matching `Sender` lives in
+    /// `slot.tx`). Drained on the [`BCAST_WAKER`] event and once per loop.
+    pub rx: std::sync::mpsc::Receiver<crate::transport::fanout::BroadcastMsg>,
+    /// This worker's sink slot; its `waker` `OnceLock` is filled at startup with
+    /// a `Waker` built from this worker's own `Poll` registry.
+    pub slot: Arc<crate::transport::fanout::WorkerSlot>,
 }
 
 /// Worker behaviour for inbound frames.
@@ -117,6 +140,10 @@ struct Session {
     codec: Box<dyn Codec>,
     /// The app id + its connection counter, so disconnect can decrement.
     conn_count: Arc<AtomicUsize>,
+    /// The channel set this connection was in as of the last `local_subs`
+    /// reconcile. Diffed against `ctx.subscribed` after each dispatch to compute
+    /// the worker-local subscription-index deltas (added/removed channels).
+    subs: HashSet<String>,
 }
 
 /// Per-connection slab entry: the [`Connection`] plus its read remainder and,
@@ -159,11 +186,37 @@ fn reuseport_listener(addr: std::net::SocketAddr) -> std::io::Result<TcpListener
 /// with the same address, and the kernel spreads accepts across them. Returns
 /// once `shutdown` is observed `true` (clean stop) or a fatal I/O error occurs
 /// while binding/polling.
-pub fn run(cfg: WorkerConfig, shutdown: Arc<AtomicBool>) -> std::io::Result<()> {
+pub fn run(mut cfg: WorkerConfig, shutdown: Arc<AtomicBool>) -> std::io::Result<()> {
     let mut poll = Poll::new()?;
     let mut listener = reuseport_listener(cfg.addr)?;
     poll.registry()
         .register(&mut listener, LISTENER, Interest::READABLE)?;
+
+    // Per-core sharded broadcast plumbing (SP9). Take the wiring out of `cfg`
+    // (the `Receiver` is not `Sync`, so it can't stay borrowed); build this
+    // worker's own `Waker` on the reserved token and publish it into the sink
+    // slot so the publisher can nudge us to drain. `None` ⇒ no broadcast inbox
+    // (echo workers / single-worker parity harness): broadcasts route via the
+    // legacy mailbox path, drained by `drain_all_sessions` as before.
+    let broadcast = cfg.broadcast.take();
+    let broadcast_rx = match &broadcast {
+        Some(w) => {
+            let waker = Arc::new(mio::Waker::new(poll.registry(), BCAST_WAKER)?);
+            // The slot is created with an empty `OnceLock`; this is its only set.
+            let _ = w.slot.waker.set(waker);
+            Some(&w.rx)
+        }
+        None => None,
+    };
+
+    // Worker-local subscription index: which of THIS worker's connections are in
+    // each `(app, channel)`. Populated by reconciling `ctx.subscribed` after each
+    // dispatch; consulted when a `BroadcastMsg` arrives to fan the frame out to
+    // exactly this worker's local subscribers.
+    let mut local_subs: HashMap<(String, String), HashSet<SocketId>> = HashMap::new();
+    // Reverse lookup: a subscriber's `socket_id` → its slab token, so a broadcast
+    // delivery can find the connection in O(1) without scanning the slab.
+    let mut sid_to_token: HashMap<SocketId, usize> = HashMap::new();
 
     let mut events = Events::with_capacity(1024);
     let mut conns: slab::Slab<Entry> = slab::Slab::new();
@@ -213,6 +266,9 @@ pub fn run(cfg: WorkerConfig, shutdown: Arc<AtomicBool>) -> std::io::Result<()> 
                 LISTENER => {
                     accepted_total += accept_ready(&poll, &mut listener, &mut conns, &cfg);
                 }
+                // The broadcast `Waker` only exists to unblock the poll so the
+                // post-loop drain runs promptly; no per-event work here.
+                BCAST_WAKER => {}
                 token => {
                     let key = token.0;
                     // The connection may have been removed earlier in this same
@@ -224,21 +280,36 @@ pub fn run(cfg: WorkerConfig, shutdown: Arc<AtomicBool>) -> std::io::Result<()> 
 
                     // A peer hangup / error: tear down regardless of r/w intent.
                     if event.is_error() || event.is_read_closed() || event.is_write_closed() {
-                        remove(&poll, &mut conns, key);
+                        remove(&poll, &mut conns, key, &mut local_subs, &mut sid_to_token);
                         continue;
                     }
 
                     if event.is_readable() {
                         match handle_readable(&poll, &mut conns, key, &cfg) {
                             Action::Close => {
-                                remove(&poll, &mut conns, key);
+                                remove(&poll, &mut conns, key, &mut local_subs, &mut sid_to_token);
                                 continue;
                             }
                             Action::Handoff(prefix) => {
                                 handoff_rest(&poll, &mut conns, key, &cfg, prefix);
                                 continue;
                             }
-                            Action::Keep => {}
+                            Action::Keep => {
+                                // A subscribe/unsubscribe in this readable batch
+                                // may have changed channel membership; reconcile
+                                // this connection's worker-local subscription
+                                // index so later broadcasts route correctly.
+                                if let Some(entry) = conns.get_mut(key) {
+                                    if let Some(session) = entry.session.as_mut() {
+                                        reconcile_membership(
+                                            session,
+                                            key,
+                                            &mut local_subs,
+                                            &mut sid_to_token,
+                                        );
+                                    }
+                                }
+                            }
                         }
                     }
 
@@ -246,19 +317,33 @@ pub fn run(cfg: WorkerConfig, shutdown: Arc<AtomicBool>) -> std::io::Result<()> 
                         && conns.contains(key)
                         && handle_writable(&poll, &mut conns, key) == Action::Close
                     {
-                        remove(&poll, &mut conns, key);
+                        remove(&poll, &mut conns, key, &mut local_subs, &mut sid_to_token);
                     }
                 }
             }
         }
 
+        // Per-core SHARDED fan-out: drain this worker's broadcast inbox and
+        // deliver each already-WS-framed payload to its LOCAL subscribers by
+        // direct slab-enqueue (no per-conn mpsc, no per-conn wake). Run every
+        // iteration (the Waker wakes an idle worker; the unconditional drain is a
+        // safety net under load when no Waker event fires). Drains are no-ops
+        // when the inbox is empty.
+        if let Some(rx) = broadcast_rx {
+            if drain_broadcasts(&poll, &mut conns, rx, &mut local_subs, &mut sid_to_token) {
+                work = true;
+            }
+        }
+
         // Draining every Open dispatch connection once per loop iteration is how
-        // a broadcast queued onto a *peer's* mailbox (which had no readiness
-        // event of its own — including a peer owned by a different worker, since
-        // fan-out writes cross-thread into per-conn mailboxes) is flushed without
-        // waiting for that peer to speak. `drain_all_sessions` reports whether it
-        // actually wrote anything so the adaptive timeout stays tight under load.
-        if dispatch && drain_all_sessions(&poll, &mut conns) {
+        // a DIRECT send queued onto a connection's mailbox (subscription_succeeded,
+        // member rosters, send_to_user, terminate, …) — which had no readiness
+        // event of its own — is flushed without waiting for that peer to speak.
+        // (Channel broadcasts now go through `drain_broadcasts` above when a sink
+        // is wired; the legacy registry mailbox path still uses this drain.)
+        // `drain_all_sessions` reports whether it actually wrote anything so the
+        // adaptive timeout stays tight under load.
+        if dispatch && drain_all_sessions(&poll, &mut conns, &mut local_subs, &mut sid_to_token) {
             work = true;
         }
 
@@ -446,6 +531,7 @@ fn establish_session(env: &Arc<DispatchEnv>, path: &str) -> Option<Session> {
         rx,
         codec,
         conn_count: counter,
+        subs: HashSet::new(),
     })
 }
 
@@ -648,7 +734,12 @@ fn drain_session(poll: &Poll, entry: &mut Entry) -> (Action, bool) {
 /// so a broadcast queued onto a peer's mailbox is delivered even when that peer
 /// produced no readiness event of its own. Returns `true` if any connection
 /// actually wrote a queued event (used to keep the adaptive poll tight).
-fn drain_all_sessions(poll: &Poll, conns: &mut slab::Slab<Entry>) -> bool {
+fn drain_all_sessions(
+    poll: &Poll,
+    conns: &mut slab::Slab<Entry>,
+    local_subs: &mut HashMap<(String, String), HashSet<SocketId>>,
+    sid_to_token: &mut HashMap<SocketId, usize>,
+) -> bool {
     let keys: Vec<usize> = conns
         .iter()
         .filter(|(_, e)| e.session.is_some() && e.conn.state == ConnState::Open)
@@ -662,7 +753,7 @@ fn drain_all_sessions(poll: &Poll, conns: &mut slab::Slab<Entry>) -> bool {
         let (action, wrote) = drain_session(poll, &mut conns[key]);
         wrote_any |= wrote;
         if action == Action::Close {
-            remove(poll, conns, key);
+            remove(poll, conns, key, local_subs, sid_to_token);
         }
     }
     wrote_any
@@ -772,17 +863,165 @@ fn handoff_rest(
     }
 }
 
-/// Remove a connection: run the protocol on-close hook (dispatch only),
-/// decrement the app's connection counter, deregister its socket, and drop the
-/// slab entry.
-fn remove(poll: &Poll, conns: &mut slab::Slab<Entry>, key: usize) {
+/// Remove a connection: drop it from the worker's sharded-broadcast indexes,
+/// run the protocol on-close hook (dispatch only), decrement the app's
+/// connection counter, deregister its socket, and drop the slab entry.
+///
+/// The index cleanup happens BEFORE `on_close()` so that the unsubscribe-driven
+/// broadcasts `on_close` fans out (member_removed / subscription_count) can no
+/// longer route back to this very connection, and so a concurrent broadcast
+/// drain never targets a slab slot that is about to vanish.
+fn remove(
+    poll: &Poll,
+    conns: &mut slab::Slab<Entry>,
+    key: usize,
+    local_subs: &mut HashMap<(String, String), HashSet<SocketId>>,
+    sid_to_token: &mut HashMap<SocketId, usize>,
+) {
     if let Some(mut entry) = conns.try_remove(key) {
         if let Some(mut session) = entry.session.take() {
+            deindex_connection(&session, local_subs, sid_to_token);
             futures_executor::block_on(session.ctx.on_close());
             session.conn_count.fetch_sub(1, Ordering::SeqCst);
         }
         let _ = poll.registry().deregister(&mut entry.conn.stream);
     }
+}
+
+/// Drop a closing connection's `socket_id` from every `(app, channel)` it was
+/// indexed under, and from the reverse `socket_id → token` map. Uses the
+/// session's last-reconciled `subs` set (the channels recorded in `local_subs`),
+/// so it removes exactly the entries `reconcile_membership` inserted.
+fn deindex_connection(
+    session: &Session,
+    local_subs: &mut HashMap<(String, String), HashSet<SocketId>>,
+    sid_to_token: &mut HashMap<SocketId, usize>,
+) {
+    let app = session.ctx.app.id.clone();
+    let sid = &session.ctx.socket_id;
+    for channel in &session.subs {
+        let k = (app.clone(), channel.clone());
+        if let Some(set) = local_subs.get_mut(&k) {
+            set.remove(sid);
+            if set.is_empty() {
+                local_subs.remove(&k);
+            }
+        }
+    }
+    sid_to_token.remove(sid);
+}
+
+/// Reconcile a connection's worker-local subscription index against the protocol
+/// state after a dispatch. Diffs the session's previously-recorded channel set
+/// (`session.subs`) against `ctx.subscribed`: channels newly joined are inserted
+/// into `local_subs` (and the `socket_id → token` reverse map is (re)stamped),
+/// channels left are removed. Cheap when nothing changed (two set diffs over the
+/// usually-tiny per-connection channel set). `token` is this connection's slab
+/// key. No-op for a connection in no channels with no change.
+fn reconcile_membership(
+    session: &mut Session,
+    token: usize,
+    local_subs: &mut HashMap<(String, String), HashSet<SocketId>>,
+    sid_to_token: &mut HashMap<SocketId, usize>,
+) {
+    if session.subs == session.ctx.subscribed {
+        return;
+    }
+    let app = session.ctx.app.id.clone();
+    let sid = &session.ctx.socket_id;
+
+    // Added channels: present in ctx.subscribed, absent from the recorded set.
+    for channel in session.ctx.subscribed.difference(&session.subs) {
+        local_subs
+            .entry((app.clone(), channel.clone()))
+            .or_default()
+            .insert(sid.clone());
+    }
+    // Removed channels: were recorded, no longer subscribed.
+    for channel in session.subs.difference(&session.ctx.subscribed) {
+        let k = (app.clone(), channel.clone());
+        if let Some(set) = local_subs.get_mut(&k) {
+            set.remove(sid);
+            if set.is_empty() {
+                local_subs.remove(&k);
+            }
+        }
+    }
+    // Keep the reverse map current (stamp on first subscribe; harmless re-stamp).
+    sid_to_token.insert(sid.clone(), token);
+    // Record the new set as the reconcile baseline.
+    session.subs = session.ctx.subscribed.clone();
+}
+
+/// Deliver every queued [`BroadcastMsg`] to this worker's local subscribers.
+///
+/// For each message: look up the `(app, channel)` subscriber set, and for each
+/// subscriber (skipping `except`) find its slab entry via `sid_to_token` and
+/// `queue` the already-WS-framed `frame` (an `Arc` bump — never re-encoded).
+/// Connections that backpressure-close are torn down. Returns `true` if any
+/// frame was queued (so the adaptive poll stays tight) — the actual socket write
+/// is done by flushing touched connections, handled by the caller.
+fn drain_broadcasts(
+    poll: &Poll,
+    conns: &mut slab::Slab<Entry>,
+    rx: &std::sync::mpsc::Receiver<crate::transport::fanout::BroadcastMsg>,
+    local_subs: &mut HashMap<(String, String), HashSet<SocketId>>,
+    sid_to_token: &mut HashMap<SocketId, usize>,
+) -> bool {
+    let mut touched: HashSet<usize> = HashSet::new();
+    // Connections that backpressured during delivery; closed after the drain so
+    // we don't mutate the slab mid-lookup.
+    let mut to_close: Vec<usize> = Vec::new();
+
+    while let Ok(msg) = rx.try_recv() {
+        let key = (msg.app.to_string(), msg.channel.to_string());
+        let Some(subs) = local_subs.get(&key) else {
+            continue; // no local subscribers for this channel on this worker
+        };
+        for sid in subs.iter() {
+            if msg.except.as_ref() == Some(sid) {
+                continue; // sender exclusion
+            }
+            let Some(&token) = sid_to_token.get(sid) else {
+                continue; // stale index entry; connection gone
+            };
+            if to_close.contains(&token) {
+                continue;
+            }
+            let Some(entry) = conns.get_mut(token) else {
+                continue;
+            };
+            // Only deliver to Open dispatch connections.
+            if entry.session.is_none() || entry.conn.state != ConnState::Open {
+                continue;
+            }
+            if entry.conn.queue(msg.frame.clone()).is_err() {
+                // Backpressure: this slow consumer is closed (parity with the
+                // per-connection mailbox high-water policy).
+                to_close.push(token);
+            } else {
+                touched.insert(token);
+            }
+        }
+    }
+
+    let wrote = !touched.is_empty();
+    // Flush every connection we queued onto. A flush that backpressures arms
+    // writable interest (handled in flush_and_arm); a failed flush closes.
+    for token in touched {
+        if to_close.contains(&token) {
+            continue;
+        }
+        if let Some(entry) = conns.get_mut(token) {
+            if flush_and_arm(poll, entry) == Action::Close {
+                to_close.push(token);
+            }
+        }
+    }
+    for token in to_close {
+        remove(poll, conns, token, local_subs, sid_to_token);
+    }
+    wrote
 }
 
 #[cfg(test)]
@@ -814,6 +1053,7 @@ mod tests {
                     mode: Mode::Echo,
                     rest_handoff: None,
                     worker_id: 0,
+                    broadcast: None,
                 },
                 sd,
             )

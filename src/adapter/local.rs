@@ -17,6 +17,13 @@ pub struct LocalAdapter {
     registry: Arc<Registry>,
     cache: CacheStore,
     users: UserRegistry,
+    /// Per-core SHARDED broadcast sink. Set by `run_percore` BEFORE any worker
+    /// spawns when the per-core transport is active; `None` for the legacy
+    /// (axum) transport and standalone tests. When present, channel broadcasts
+    /// are routed to the workers (each fans out to its own local subscribers,
+    /// no per-connection mpsc); when absent, the legacy registry mailbox path is
+    /// used. `OnceLock` because the sink is installed exactly once at startup.
+    bcast_sink: std::sync::OnceLock<crate::transport::fanout::BroadcastSink>,
 }
 
 impl LocalAdapter {
@@ -25,7 +32,19 @@ impl LocalAdapter {
             registry,
             cache: CacheStore::new(),
             users: UserRegistry::new(),
+            bcast_sink: std::sync::OnceLock::new(),
         }
+    }
+
+    /// Install the per-core sharded broadcast sink. Called once by `run_percore`
+    /// before spawning workers; idempotent (a second call is ignored).
+    pub fn set_broadcast_sink(&self, sink: crate::transport::fanout::BroadcastSink) {
+        let _ = self.bcast_sink.set(sink);
+    }
+
+    /// The installed per-core broadcast sink, if any (percore active).
+    fn broadcast_sink(&self) -> Option<&crate::transport::fanout::BroadcastSink> {
+        self.bcast_sink.get()
     }
 
     /// Every local subscription as `(app, channel, socket_id)`. Exposed so the Redis
@@ -91,8 +110,27 @@ impl Adapter for LocalAdapter {
         event: ServerEvent,
         except: Option<SocketId>,
     ) {
-        self.registry
-            .broadcast(app, channel, &event, except.as_ref());
+        if let Some(sink) = self.broadcast_sink() {
+            // Per-core active: encode the v7 JSON once, WS-frame it once, and
+            // route the shared frame to every worker. Each worker fans it out to
+            // its own local subscribers by direct slab-enqueue.
+            let json: Arc<str> = match &event {
+                ServerEvent::Raw(f) => f.clone(),
+                other => Arc::from(crate::protocol::v7::frames::encode(other).as_str()),
+            };
+            let mut buf = bytes::BytesMut::new();
+            crate::transport::frame::encode_text(&mut buf, json.as_bytes());
+            sink.broadcast(
+                Arc::from(app),
+                Arc::from(channel),
+                Arc::from(&buf[..]),
+                except,
+            );
+        } else {
+            // Legacy mailbox path (axum transport / tests): UNCHANGED.
+            self.registry
+                .broadcast(app, channel, &event, except.as_ref());
+        }
     }
 
     async fn channels(&self, app: &str, prefix: Option<&str>) -> Vec<ChannelSummary> {

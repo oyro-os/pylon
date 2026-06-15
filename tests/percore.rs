@@ -89,6 +89,7 @@ async fn spawn(config: ServerConfig) -> Harness {
                 mode: Mode::Dispatch(env),
                 rest_handoff: None,
                 worker_id: 0,
+                broadcast: None,
             },
             sd,
         )
