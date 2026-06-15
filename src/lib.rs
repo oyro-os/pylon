@@ -9,6 +9,10 @@
 pub mod adapter;
 pub mod app;
 pub mod channel;
+// SP11 per-core clustering: the `ClusterBridge` hosts a `RedisAdapter` on a dedicated
+// tokio runtime so the SYNC percore workers can fire fire-and-forget cluster commands
+// without ever blocking on Redis.
+pub mod cluster;
 pub mod connection;
 pub mod http;
 pub mod presence;

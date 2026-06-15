@@ -208,12 +208,31 @@ pub struct RedisAdapter {
 
 impl RedisAdapter {
     /// Connect to Redis (per `cfg.redis_url` / `cfg.redis_pool_size`) and build
-    /// the adapter. Fails loud if Redis is unreachable.
+    /// the adapter with its OWN private [`LocalAdapter`]. Fails loud if Redis is
+    /// unreachable.
+    ///
+    /// This is the standalone-node constructor; it delegates to [`with_local`] with
+    /// a freshly-created `LocalAdapter` so there is ONE construction path.
+    ///
+    /// [`with_local`]: RedisAdapter::with_local
     pub async fn new(cfg: &ServerConfig) -> anyhow::Result<Self> {
+        Self::with_local(cfg, Arc::new(LocalAdapter::new(Arc::new(Registry::new())))).await
+    }
+
+    /// Connect to Redis (per `cfg.redis_url` / `cfg.redis_pool_size`) and build the
+    /// adapter sharing the caller-supplied `local`. Fails loud if Redis is unreachable.
+    ///
+    /// Identical to [`new`] except the `LocalAdapter` is INJECTED rather than created
+    /// internally. The percore [`ClusterBridge`] uses this to hand the adapter the SAME
+    /// `LocalAdapter` the workers broadcast through, so cross-node frames the receive loop
+    /// re-delivers via `local.broadcast(Raw(..))` shard straight to the workers' sink.
+    ///
+    /// [`new`]: RedisAdapter::new
+    /// [`ClusterBridge`]: crate::cluster::bridge::ClusterBridge
+    pub async fn with_local(cfg: &ServerConfig, local: Arc<LocalAdapter>) -> anyhow::Result<Self> {
         let node_id = uuid::Uuid::new_v4().to_string();
         let keys = keys::Keys::new(&cfg.redis_prefix);
         let clients = client::RedisClients::connect(&cfg.redis_url, cfg.redis_pool_size).await?;
-        let local = Arc::new(LocalAdapter::new(Arc::new(Registry::new())));
 
         // Spawn the pub/sub receive loop. It shares the local adapter so remote
         // broadcasts land on this node's sockets. The handle is stored on the
@@ -312,6 +331,16 @@ impl RedisAdapter {
         )
         .await;
         (report.acquired, report.reaped, report.vacated)
+    }
+
+    /// This adapter's cluster node id (the UUID minted in [`with_local`]). The percore
+    /// [`ClusterBridge`] reads it back across the startup handshake so its `ClusterHandle`
+    /// can advertise the live node id to the workers.
+    ///
+    /// [`with_local`]: RedisAdapter::with_local
+    /// [`ClusterBridge`]: crate::cluster::bridge::ClusterBridge
+    pub fn node_id(&self) -> &str {
+        &self.node_id
     }
 
     /// Test-support accessor: the set of Redis pub/sub channels this node's
