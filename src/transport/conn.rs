@@ -149,6 +149,16 @@ pub struct Connection {
     /// Count of frames dropped by CoDel on dequeue for being stale (sojourn
     /// `> 2 * target` while overloaded). Distinct from drop-head evictions.
     codel_dropped: u64,
+    /// Signed accumulator of every change to `out_bytes` since the last
+    /// [`take_inflight_delta`](Self::take_inflight_delta), so the worker can
+    /// maintain its `inflight_bytes` total incrementally (O(work), not
+    /// O(connections)) instead of re-summing every connection each loop. Every
+    /// mutation site that changes `out_bytes` — the `queue` enqueue/drop-head
+    /// eviction, the `flush` send, and the CoDel staleness drop — folds the exact
+    /// signed delta in here. Bounded by the queue cap (≤ a few MiB), so `i64`
+    /// never overflows. Invariant: across any sequence of operations the SUM of
+    /// the deltas taken equals the net change in `out_bytes`.
+    inflight_delta: i64,
 }
 
 impl Connection {
@@ -166,6 +176,7 @@ impl Connection {
             codel: CodelParams::DISABLED,
             codel_state: CodelState::default(),
             codel_dropped: 0,
+            inflight_delta: 0,
         }
     }
 
@@ -228,9 +239,16 @@ impl Connection {
             // Remove the oldest droppable frame.
             let (victim, _ts) = self.out.remove(locked).expect("len checked");
             self.out_bytes -= victim.len();
+            // Drop-head eviction: this byte was queued earlier (counted into the
+            // worker total then) and is now gone without being sent, so fold the
+            // negative delta in so the worker's incremental total tracks it.
+            self.inflight_delta -= victim.len() as i64;
             dropped += 1;
         }
         self.out_bytes += flen;
+        // The newly-queued frame adds to this connection's queued bytes; fold the
+        // positive delta in for the worker's incremental inflight total.
+        self.inflight_delta += flen as i64;
         self.out.push_back((frame, now_ns));
         dropped
     }
@@ -273,7 +291,12 @@ impl Connection {
                     if self.out_cursor == front.len() {
                         // Frame fully written: drop it, reset the cursor, and
                         // continue coalescing into the next frame.
-                        self.out_bytes -= front.len();
+                        let sent = front.len();
+                        self.out_bytes -= sent;
+                        // Sent bytes leave the queue: fold the negative delta in so
+                        // the worker's incremental inflight total drops by exactly
+                        // the bytes that went out (matching the `out_bytes` change).
+                        self.inflight_delta -= sent as i64;
                         self.out.pop_front();
                         self.out_cursor = 0;
                     }
@@ -343,6 +366,9 @@ impl Connection {
                 // drop it and look at the next one (which may also be stale).
                 let (victim, _ts) = self.out.pop_front().expect("front checked");
                 self.out_bytes -= victim.len();
+                // CoDel staleness drop: this queued byte is discarded unsent, so
+                // fold the negative delta in for the worker's incremental total.
+                self.inflight_delta -= victim.len() as i64;
                 self.codel_dropped += 1;
                 continue;
             }
@@ -475,6 +501,25 @@ impl Connection {
     /// (on send via `flush`, or on drop-head eviction inside `queue`).
     pub fn out_bytes(&self) -> usize {
         self.out_bytes
+    }
+
+    /// Take and reset this connection's accumulated `out_bytes` delta since the
+    /// last call, for the worker's INCREMENTAL inflight accounting (replaces the
+    /// O(connections) re-sum every loop iteration with an O(work) fold).
+    ///
+    /// Every mutation site that changes `out_bytes` — `queue` (enqueue +
+    /// drop-head eviction), `flush` (send), and the CoDel staleness drop — folds
+    /// its exact signed delta into the accumulator. So the value returned here is
+    /// precisely the net change in `out_bytes` over the operations since the
+    /// previous take. The worker adds it to its running `inflight_bytes` after
+    /// every site that touches this connection's out-queue; the sum of all deltas
+    /// ever taken equals the connection's current `out_bytes`. Resets to `0`.
+    ///
+    /// A connection being `remove`d must have its delta taken (or its `out_bytes`
+    /// subtracted) before it is dropped, so its still-queued bytes are removed
+    /// from the worker total and the counter cannot leak upward.
+    pub fn take_inflight_delta(&mut self) -> i64 {
+        std::mem::take(&mut self.inflight_delta)
     }
 
     // ---- test accessors -------------------------------------------------------
@@ -742,6 +787,92 @@ mod tests {
         // turn the partial write into a Closed status.
         let _ = peer.peer_addr();
         drop(peer);
+    }
+
+    // ---- incremental inflight-delta accounting --------------------------------
+
+    /// The signed `out_bytes` accumulator tracks queue/flush/drop exactly: queue N
+    /// bytes → delta +N; flush all → delta −N; a drop-head eviction reflects the
+    /// evicted bytes; and the running sum of every delta taken equals the final
+    /// `out_bytes`.
+    #[test]
+    fn inflight_delta_tracks_queue_flush_and_drop_head() {
+        let (server, mut client) = pair();
+        let mut c = Connection::new(server, 100); // 100-byte cap → drop-head fires
+        let f = |n: u8, len: usize| -> Arc<[u8]> { Arc::from(vec![n; len].into_boxed_slice()) };
+
+        // Running sum of all deltas taken; must always equal out_bytes().
+        let mut running: i64 = 0;
+        let take = |c: &mut Connection, running: &mut i64| {
+            *running += c.take_inflight_delta();
+            assert_eq!(*running, c.out_bytes() as i64, "delta sum must track out_bytes");
+        };
+
+        // queue N bytes → delta +N.
+        assert_eq!(c.queue(f(1, 40), 0), 0);
+        assert_eq!(c.take_inflight_delta(), 40, "queue 40 → +40");
+        running += 40;
+        assert_eq!(running, c.out_bytes() as i64);
+
+        assert_eq!(c.queue(f(2, 40), 0), 0); // out_bytes = 80, no drop
+        take(&mut c, &mut running);
+
+        // queue past the cap → drop-head evicts the oldest; delta = +new − evicted.
+        let dropped = c.queue(f(3, 40), 0); // 120 > 100 → drop f(1) (40), add f(3) (40)
+        assert_eq!(dropped, 1);
+        // Net out_bytes unchanged (80), so the delta over this op is 0 (+40 − 40).
+        assert_eq!(c.take_inflight_delta(), 0, "drop-head: +40 added − 40 evicted = 0 net");
+        // running stays at 80 (matches out_bytes).
+        assert_eq!(running, c.out_bytes() as i64);
+
+        // flush all → delta −(bytes sent). Drain the peer so the writes complete.
+        assert_eq!(c.flush(0), WriteStatus::Drained);
+        let after_flush = c.take_inflight_delta();
+        assert_eq!(after_flush, -80, "flush drained 80 queued bytes → −80");
+        running += after_flush;
+        assert_eq!(running, 0, "sum of all deltas == final out_bytes (0)");
+        assert_eq!(c.out_bytes(), 0);
+        // Consume what the peer received so the socket buffer doesn't wedge the test.
+        let mut sink = [0u8; 256];
+        let _ = client.read(&mut sink);
+    }
+
+    /// A CoDel staleness drop folds its evicted bytes into the delta too, so the
+    /// running sum still equals `out_bytes` when CoDel drops a stale frame.
+    #[test]
+    fn inflight_delta_tracks_codel_staleness_drop() {
+        let (server, peer) = pair();
+        peer.set_nonblocking(true).unwrap();
+        let mut c = Connection::new(server, 1 << 20);
+        c.set_codel(CodelParams {
+            target_ns: TARGET_NS,
+            interval_ns: INTERVAL_NS,
+        });
+
+        let mut running: i64 = 0;
+        // Drive one interval at 6 ms sojourn to flip into the overloaded regime.
+        for k in 0..=20u8 {
+            let now = (k as u64 + 1) * 6_000_000;
+            let enqueue = now - 6_000_000;
+            c.queue(small(k), enqueue);
+            assert_eq!(c.flush(now), WriteStatus::Drained);
+            running += c.take_inflight_delta();
+            assert_eq!(running, c.out_bytes() as i64);
+        }
+        assert!(c.is_overloaded());
+
+        // Two stale frames: the older is CoDel-dropped on dequeue, the newer sent.
+        let now = 200_000_000;
+        c.queue(small(98), now - 13_000_000);
+        c.queue(small(99), now - 12_000_000);
+        running += c.take_inflight_delta(); // two +10 enqueues
+        assert_eq!(running, c.out_bytes() as i64);
+        let dropped_before = c.codel_dropped();
+        assert_eq!(c.flush(now), WriteStatus::Drained);
+        assert_eq!(c.codel_dropped(), dropped_before + 1, "older stale frame dropped");
+        running += c.take_inflight_delta(); // −10 (CoDel drop) and −10 (sent)
+        assert_eq!(running, c.out_bytes() as i64, "delta tracks CoDel drop + send");
+        assert_eq!(c.out_bytes(), 0);
     }
 
     // ---- CoDel time-in-queue freshness drop (SP10 §7) -------------------------

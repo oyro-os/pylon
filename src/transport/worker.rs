@@ -251,21 +251,25 @@ pub fn run(mut cfg: WorkerConfig, shutdown: Arc<AtomicBool>) -> std::io::Result<
 
     // SP10 per-worker byte budget + inflight accounting. `inflight_bytes` is this
     // worker's local (non-atomic) view of how many bytes are queued across all of
-    // its connections' out-queues — maintained as the exact SUM of every
-    // connection's `out_bytes()` (recomputed each iteration), so the byte-
-    // accounting invariant ("a byte enqueued is decremented exactly once, on send
-    // XOR drop") holds by construction with no double-decrement risk. It is
-    // mirrored into the shared `inflight_slot` for the `percore_total_inflight_
-    // bytes()` test hook, and drives the graduated shed on the broadcast drain.
+    // its connections' out-queues — maintained INCREMENTALLY: every site that
+    // touches a connection's out-queue folds in that connection's exact signed
+    // `take_inflight_delta()` (queue/flush/drop-head/CoDel), and `remove` subtracts
+    // a closing connection's still-queued bytes. So the byte-accounting invariant
+    // ("a byte enqueued is decremented exactly once, on send XOR drop") holds by
+    // construction and the hot loop is O(work), not O(connections). It is mirrored
+    // into the shared `inflight_slot` for the `percore_total_inflight_bytes()` test
+    // hook, and drives the graduated shed on the broadcast drain.
     let per_worker_budget = cfg.per_worker_budget;
     let inflight_slot = cfg.inflight_slot.clone();
     // SP10 §8: shared PSI budget factor (×1000 fixed-point). `None` ⇒ no backstop.
     let budget_factor = cfg.budget_factor.clone();
     // SP10 §7: CoDel parameters stamped onto every accepted connection.
     let codel = cfg.codel;
-    // Reassigned (to the exact sum of all connections' queued bytes) at the top of
-    // every loop iteration before any read; declared here for loop-outer scope.
-    let mut inflight_bytes: u64;
+    // Running total of queued bytes across all of this worker's connections,
+    // maintained incrementally (see above). Starts at 0 — the slab is empty — and
+    // every connection begins with a 0 out-queue, so the counter is exact from the
+    // first iteration without an initial O(N) sum.
+    let mut inflight_bytes: u64 = 0;
 
     // Worker-local subscription index: which of THIS worker's connections are in
     // each `(app, channel)`. Populated by reconciling `ctx.subscribed` after each
@@ -320,13 +324,25 @@ pub fn run(mut cfg: WorkerConfig, shutdown: Arc<AtomicBool>) -> std::io::Result<
             return Ok(());
         }
 
-        // Recompute this worker's inflight bytes as the exact sum of every
-        // connection's queued bytes (also tells us whether any writes pend, so
-        // the two scans fold into one). This is the byte budget's ground truth.
-        inflight_bytes = conns.iter().map(|(_, e)| e.conn.out_bytes() as u64).sum();
+        // Debug-only cross-check: the incrementally-maintained `inflight_bytes`
+        // must equal the true sum of every connection's queued bytes. Any missed
+        // delta site (a `queue`/`flush`/drop that didn't fold, or a `remove` that
+        // didn't subtract) makes this panic in tests — the SP10 overload flood
+        // (queue + drop-head + CoDel + send all firing) is the hardest case. Free
+        // in release (compiles out under `#[cfg(debug_assertions)]`).
+        debug_assert_eq!(
+            inflight_bytes,
+            conns.iter().map(|(_, e)| e.conn.out_bytes() as u64).sum::<u64>(),
+            "incremental inflight_bytes drifted from the true out_bytes sum",
+        );
+
+        // Mirror the incrementally-maintained total into the shared slot for the
+        // off-hot-path `percore_total_inflight_bytes()` test hook. O(1).
         if let Some(slot) = &inflight_slot {
             slot.store(inflight_bytes, Ordering::Relaxed);
         }
+        // `pending_writes` is just "any bytes still queued", now read off the
+        // incremental counter instead of a fresh O(N) sum.
         let pending_writes = inflight_bytes > 0;
         let timeout = if did_work || pending_writes {
             Some(Duration::from_millis(0))
@@ -384,7 +400,7 @@ pub fn run(mut cfg: WorkerConfig, shutdown: Arc<AtomicBool>) -> std::io::Result<
 
                     // A peer hangup / error: tear down regardless of r/w intent.
                     if event.is_error() || event.is_read_closed() || event.is_write_closed() {
-                        remove(&poll, &mut conns, key, &mut local_subs, &mut sid_to_token, &mut wheel);
+                        remove(&poll, &mut conns, key, &mut local_subs, &mut sid_to_token, &mut wheel, &mut inflight_bytes);
                         continue;
                     }
 
@@ -399,17 +415,25 @@ pub fn run(mut cfg: WorkerConfig, shutdown: Arc<AtomicBool>) -> std::io::Result<
                         }
                         match handle_readable(&poll, &mut conns, key, &cfg, now_ns) {
                             Action::Close => {
-                                remove(&poll, &mut conns, key, &mut local_subs, &mut sid_to_token, &mut wheel);
+                                remove(&poll, &mut conns, key, &mut local_subs, &mut sid_to_token, &mut wheel, &mut inflight_bytes);
                                 continue;
                             }
                             Action::Handoff(prefix) => {
                                 // A REST handoff is not a WS session; drop its
-                                // (spurious) wheel entry so it can't fire later.
+                                // (spurious) wheel entry so it can't fire later. A
+                                // REST head queued nothing, so any folded delta is
+                                // 0; fold anyway so a removed conn never leaks.
+                                fold_delta(&mut conns, key, &mut inflight_bytes);
                                 wheel.remove(key);
                                 handoff_rest(&poll, &mut conns, key, &cfg, prefix);
                                 continue;
                             }
                             Action::Keep => {
+                                // INCREMENTAL INFLIGHT: the readable path queued
+                                // replies (handshake 101 / established / dispatched
+                                // frames / pong) and flushed; fold this connection's
+                                // net delta into the running total.
+                                fold_delta(&mut conns, key, &mut inflight_bytes);
                                 // A subscribe/unsubscribe in this readable batch
                                 // may have changed channel membership; reconcile
                                 // this connection's worker-local subscription
@@ -428,11 +452,14 @@ pub fn run(mut cfg: WorkerConfig, shutdown: Arc<AtomicBool>) -> std::io::Result<
                         }
                     }
 
-                    if event.is_writable()
-                        && conns.contains(key)
-                        && handle_writable(&poll, &mut conns, key, now_ns) == Action::Close
-                    {
-                        remove(&poll, &mut conns, key, &mut local_subs, &mut sid_to_token, &mut wheel);
+                    if event.is_writable() && conns.contains(key) {
+                        let action = handle_writable(&poll, &mut conns, key, now_ns);
+                        // INCREMENTAL INFLIGHT: the flush sent bytes out; fold the
+                        // (negative) delta before any close so the count is exact.
+                        fold_delta(&mut conns, key, &mut inflight_bytes);
+                        if action == Action::Close {
+                            remove(&poll, &mut conns, key, &mut local_subs, &mut sid_to_token, &mut wheel, &mut inflight_bytes);
+                        }
                     }
                 }
             }
@@ -459,10 +486,10 @@ pub fn run(mut cfg: WorkerConfig, shutdown: Arc<AtomicBool>) -> std::io::Result<
             ) {
                 work = true;
             }
-            // Re-sync from the exact post-drain sum (the drain enqueued/dropped
-            // and then flushed, sending bytes out): recompute so the counter and
-            // the test hook never transiently over-report above the true total.
-            inflight_bytes = conns.iter().map(|(_, e)| e.conn.out_bytes() as u64).sum();
+            // `inflight_bytes` is maintained incrementally THROUGH the drain (each
+            // enqueue folds its net delta; each post-drain flush folds its sent
+            // bytes; internal closes subtract their queued bytes), so no O(N)
+            // re-sum is needed. Mirror the up-to-date total into the test hook.
             if let Some(slot) = &inflight_slot {
                 slot.store(inflight_bytes, Ordering::Relaxed);
             }
@@ -490,6 +517,7 @@ pub fn run(mut cfg: WorkerConfig, shutdown: Arc<AtomicBool>) -> std::io::Result<
                 &mut local_subs,
                 &mut sid_to_token,
                 &mut wheel,
+                &mut inflight_bytes,
                 now_ns,
             )
         {
@@ -509,6 +537,9 @@ pub fn run(mut cfg: WorkerConfig, shutdown: Arc<AtomicBool>) -> std::io::Result<
                 match due {
                     Due::Ping(key) => {
                         if queue_ping(&poll, &mut conns, key, now_ns) {
+                            // INCREMENTAL INFLIGHT: the ping was queued + flushed;
+                            // fold this connection's net delta into the total.
+                            fold_delta(&mut conns, key, &mut inflight_bytes);
                             // Ping queued: arm the pong-timeout close deadline.
                             wheel.mark_ping_sent(key, now_ms);
                             work = true;
@@ -520,7 +551,11 @@ pub fn run(mut cfg: WorkerConfig, shutdown: Arc<AtomicBool>) -> std::io::Result<
                     }
                     Due::Close4201(key) => {
                         send_close_4201(&poll, &mut conns, key, now_ns);
-                        remove(&poll, &mut conns, key, &mut local_subs, &mut sid_to_token, &mut wheel);
+                        // INCREMENTAL INFLIGHT: the 4201 close frame was queued +
+                        // flushed; fold the net delta before `remove` subtracts any
+                        // bytes still queued on the connection being torn down.
+                        fold_delta(&mut conns, key, &mut inflight_bytes);
+                        remove(&poll, &mut conns, key, &mut local_subs, &mut sid_to_token, &mut wheel, &mut inflight_bytes);
                         work = true;
                     }
                 }
@@ -1060,6 +1095,7 @@ fn drain_all_sessions(
     local_subs: &mut HashMap<(String, String), HashSet<SocketId>>,
     sid_to_token: &mut HashMap<SocketId, usize>,
     wheel: &mut TimerWheel,
+    inflight_bytes: &mut u64,
     now_ns: u64,
 ) -> bool {
     let keys: Vec<usize> = conns
@@ -1074,8 +1110,13 @@ fn drain_all_sessions(
         }
         let result = drain_session(poll, &mut conns[key], now_ns);
         wrote_any |= result.wrote;
+        // INCREMENTAL INFLIGHT: `drain_session` queued mailbox events and flushed;
+        // fold this connection's net delta (queued minus sent/dropped) into the
+        // running total whether or not it closes (a closing conn's REMAINING
+        // queued bytes are then subtracted by `remove`).
+        fold_delta(conns, key, inflight_bytes);
         if result.action == Action::Close {
-            remove(poll, conns, key, local_subs, sid_to_token, wheel);
+            remove(poll, conns, key, local_subs, sid_to_token, wheel, inflight_bytes);
             continue;
         }
         // A `subscribed` change made during this mailbox drain (a `SubscriptionError`
@@ -1199,6 +1240,22 @@ fn handoff_rest(
     }
 }
 
+/// INCREMENTAL INFLIGHT accounting: fold connection `key`'s accumulated
+/// `out_bytes` delta into the worker's running `inflight_bytes`, bringing the
+/// counter back in step with that connection's queued bytes after a touch
+/// (`handle_readable`/`handle_writable`/`queue_ping`/…). A no-op (delta 0) when
+/// the connection didn't change or no longer exists. `wrapping_add` because the
+/// delta is signed: a net send/drop folds a negative delta. O(1) — this is what
+/// replaces the per-iteration O(connections) re-sum.
+fn fold_delta(conns: &mut slab::Slab<Entry>, key: usize, inflight_bytes: &mut u64) {
+    if let Some(entry) = conns.get_mut(key) {
+        let delta = entry.conn.take_inflight_delta();
+        if delta != 0 {
+            *inflight_bytes = inflight_bytes.wrapping_add(delta as u64);
+        }
+    }
+}
+
 /// Remove a connection: drop it from the worker's sharded-broadcast indexes,
 /// run the protocol on-close hook (dispatch only), decrement the app's
 /// connection counter, deregister its socket, and drop the slab entry.
@@ -1207,6 +1264,7 @@ fn handoff_rest(
 /// broadcasts `on_close` fans out (member_removed / subscription_count) can no
 /// longer route back to this very connection, and so a concurrent broadcast
 /// drain never targets a slab slot that is about to vanish.
+#[allow(clippy::too_many_arguments)]
 fn remove(
     poll: &Poll,
     conns: &mut slab::Slab<Entry>,
@@ -1214,12 +1272,21 @@ fn remove(
     local_subs: &mut HashMap<(String, String), HashSet<SocketId>>,
     sid_to_token: &mut HashMap<SocketId, usize>,
     wheel: &mut TimerWheel,
+    inflight_bytes: &mut u64,
 ) {
     // SP11 §4: drop the connection from the liveness wheel BEFORE the slab slot
     // (and thus its token) can be recycled by a future accept, so a new
     // connection on the same token never inherits a stale timer.
     wheel.remove(key);
     if let Some(mut entry) = conns.try_remove(key) {
+        // INCREMENTAL INFLIGHT: a removed connection's still-queued bytes leave
+        // the worker total. Fold its outstanding delta up to date, then subtract
+        // its current `out_bytes` so the running counter doesn't leak upward over
+        // the worker's lifetime. (After the fold the connection's contribution to
+        // `inflight_bytes` is exactly `out_bytes`, so subtracting it zeroes it.)
+        *inflight_bytes = inflight_bytes
+            .wrapping_add(entry.conn.take_inflight_delta() as u64)
+            .wrapping_sub(entry.conn.out_bytes() as u64);
         if let Some(mut session) = entry.session.take() {
             deindex_connection(&session, local_subs, sid_to_token);
             futures_executor::block_on(session.ctx.on_close());
@@ -1420,15 +1487,14 @@ fn drain_broadcasts(
             // SP10: the per-connection queue is byte-bounded drop-head — it never
             // rejects. A slow consumer simply loses its OLDEST queued frame(s)
             // (freshest-wins, at-most-once), keeping memory bounded without
-            // closing the connection or stalling the fast path. Track the net
-            // byte delta (enqueue minus any drop-head eviction) into the live
-            // inflight counter so the band stays accurate within this drain.
-            let before = entry.conn.out_bytes();
+            // closing the connection or stalling the fast path. Fold the net byte
+            // delta (enqueue minus any drop-head eviction) into the live inflight
+            // counter via the `take_inflight_delta` choke point so the band stays
+            // accurate within this drain — and so the post-drain flush's send delta
+            // (taken below) composes correctly without double-counting.
             let _dropped = entry.conn.queue(msg.frame.clone(), now_ns);
-            let after = entry.conn.out_bytes();
-            *inflight_bytes = inflight_bytes
-                .saturating_add(after as u64)
-                .saturating_sub(before as u64);
+            *inflight_bytes =
+                inflight_bytes.wrapping_add(entry.conn.take_inflight_delta() as u64);
             touched.insert(token);
         }
     }
@@ -1441,13 +1507,20 @@ fn drain_broadcasts(
             continue;
         }
         if let Some(entry) = conns.get_mut(token) {
-            if flush_and_arm(poll, entry, now_ns) == Action::Close {
+            let action = flush_and_arm(poll, entry, now_ns);
+            // INCREMENTAL INFLIGHT: the flush sent bytes out (negative delta); fold
+            // it into the running total so it reflects the post-send queue depth.
+            *inflight_bytes =
+                inflight_bytes.wrapping_add(entry.conn.take_inflight_delta() as u64);
+            if action == Action::Close {
                 to_close.push(token);
             }
         }
     }
+    // Closing connections subtract their still-queued bytes inside `remove`, so the
+    // running total never leaks upward when a backpressured peer is torn down.
     for token in to_close {
-        remove(poll, conns, token, local_subs, sid_to_token, wheel);
+        remove(poll, conns, token, local_subs, sid_to_token, wheel, inflight_bytes);
     }
     wrote
 }
