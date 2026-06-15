@@ -24,7 +24,7 @@ use crate::server::config::ServerConfig;
 use crate::webhook::event::WebhookEvent;
 use crate::webhook::WebhookHandle;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::thread::JoinHandle;
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::UnboundedSender;
@@ -427,6 +427,15 @@ pub struct ClusterBridge {
     /// and one `node_id` are what make cross-node self-dedup correct, so the bridge and the
     /// REST plane MUST share this same instance — never a second adapter.
     adapter: Arc<RedisAdapter>,
+    /// The deferred `WebhookHandle` the drain loop fires occupied/vacated/member_added/
+    /// cache_miss through. Set EXACTLY ONCE by [`ClusterBridge::attach_webhooks`], which
+    /// runs after the webhook dispatcher exists (breaking the
+    /// webhooks→adapter→bridge→webhooks startup cycle). The drain loop reads it via
+    /// `get()`: before `attach_webhooks` no WS connections exist, so no `ClusterCmd`s
+    /// arrive and a `None` read is impossible in practice — but the loop handles `None`
+    /// as a clean no-op (never a panic). Shared (`Arc`) so the runtime thread's drain
+    /// loop and `attach_webhooks` see the same cell.
+    webhooks: Arc<OnceLock<WebhookHandle>>,
     /// Set on `Drop` to break the drain loop; the loop also exits if the command channel
     /// closes (all `ClusterHandle`s dropped).
     shutdown: Arc<AtomicBool>,
@@ -446,6 +455,25 @@ impl ClusterBridge {
     /// correct self-dedup; this never creates a second adapter.
     pub fn adapter(&self) -> Arc<dyn Adapter> {
         self.adapter.clone()
+    }
+
+    /// Attach the webhook dispatcher AFTER it has been built. This breaks the
+    /// webhooks→adapter→bridge→webhooks startup cycle: `start` builds the node's
+    /// `RedisAdapter` (which the occupancy source the dispatcher needs reads through),
+    /// and only once the dispatcher exists does the caller hand its [`WebhookHandle`]
+    /// back here. It (1) sets the deferred `OnceLock` the drain loop fires
+    /// occupied/vacated/member_added/cache_miss through, and (2) starts the Redis sweeper
+    /// with the SAME handle (the sweeper deferral `main.rs` did inline before SP11), so
+    /// sweep-driven and command-driven vacated webhooks share one dispatcher.
+    ///
+    /// Idempotent on the `OnceLock` (a second call is ignored); call it exactly once per
+    /// bridge, right after spawning the dispatcher.
+    pub fn attach_webhooks(&self, webhooks: WebhookHandle) {
+        // Start the sweeper on the node's single `RedisAdapter` with this handle.
+        self.adapter.start_sweeper(webhooks.clone());
+        // Publish the handle to the drain loop. `set` returns `Err` only on a second
+        // call; ignore it (the first handle stays authoritative).
+        let _ = self.webhooks.set(webhooks);
     }
 }
 
@@ -475,15 +503,19 @@ impl Drop for ClusterBridge {
 pub fn start(
     cfg: &ServerConfig,
     local: Arc<LocalAdapter>,
-    webhooks: WebhookHandle,
     apps: Arc<dyn AppManager>,
 ) -> anyhow::Result<ClusterBridge> {
     let (tx, mut rx) = mpsc::channel::<ClusterCmd>(CMD_CHANNEL_CAPACITY);
     let shutdown = Arc::new(AtomicBool::new(false));
 
+    // The deferred webhook cell: empty until `attach_webhooks` runs (after the dispatcher
+    // is built). Shared with the runtime thread's drain loop so it sees the handle once set.
+    let webhooks: Arc<OnceLock<WebhookHandle>> = Arc::new(OnceLock::new());
+
     // Owned copy moved into the runtime thread (the caller keeps its borrow).
     let cfg = cfg.clone();
     let thread_shutdown = shutdown.clone();
+    let thread_webhooks = webhooks.clone();
 
     // Startup handshake: the runtime thread connects fred asynchronously, but `start` is
     // sync and must return a usable handle or the connect error. A one-shot std channel
@@ -523,10 +555,11 @@ pub fn start(
                     }
                 };
 
-                // The sweeper needs the `WebhookHandle`; start it now that the adapter is
-                // up. We keep our OWN clone of `webhooks` to fire occupied/vacated from the
-                // drain loop, and hand a second clone to the sweeper.
-                adapter.start_sweeper(webhooks.clone());
+                // The sweeper + the drain loop's occupied/vacated webhooks both need the
+                // `WebhookHandle`, but it may not exist yet (the dispatcher's occupancy
+                // source reads through THIS adapter, so the dispatcher is built AFTER this
+                // returns ready). Both are deferred to `ClusterBridge::attach_webhooks`,
+                // which starts the sweeper and publishes the handle to `thread_webhooks`.
 
                 // Report ready with the node's single adapter so `start` can build the live
                 // handle (from its `node_id`) and the bridge can expose it to the REST plane.
@@ -557,7 +590,8 @@ pub fn start(
                         // Idle tick: loop back and re-check the shutdown flag.
                         Err(_) => continue,
                         Ok(Some(cmd)) => {
-                            handle_cmd(&adapter, &local_for_loop, &apps, &webhooks, cmd).await;
+                            handle_cmd(&adapter, &local_for_loop, &apps, &thread_webhooks, cmd)
+                                .await;
                         }
                     }
                 }
@@ -587,6 +621,7 @@ pub fn start(
     Ok(ClusterBridge {
         handle,
         adapter,
+        webhooks,
         shutdown,
         thread: Some(thread),
     })
@@ -601,7 +636,7 @@ async fn handle_cmd(
     adapter: &RedisAdapter,
     local: &Arc<LocalAdapter>,
     apps: &Arc<dyn AppManager>,
-    webhooks: &WebhookHandle,
+    webhooks: &OnceLock<WebhookHandle>,
     cmd: ClusterCmd,
 ) {
     match cmd {
@@ -657,10 +692,12 @@ async fn handle_cmd(
             }
             // Single cluster-wide channel_occupied on the cluster 0→1 edge.
             if occupied && a.has_channel_occupied_webhooks {
-                webhooks.enqueue(WebhookEvent::ChannelOccupied {
-                    app: app.to_string(),
-                    channel: channel.to_string(),
-                });
+                if let Some(wh) = webhooks.get() {
+                    wh.enqueue(WebhookEvent::ChannelOccupied {
+                        app: app.to_string(),
+                        channel: channel.to_string(),
+                    });
+                }
             }
             // Cache channels: replay the CLUSTER-wide last event (Redis-backed) straight
             // to the joining connection's mailbox — or signal a miss. The worker's handler
@@ -682,10 +719,12 @@ async fn handle_cmd(
                     }
                     None => {
                         if a.has_cache_miss_webhooks {
-                            webhooks.enqueue(WebhookEvent::CacheMiss {
-                                app: app.to_string(),
-                                channel: channel.to_string(),
-                            });
+                            if let Some(wh) = webhooks.get() {
+                                wh.enqueue(WebhookEvent::CacheMiss {
+                                    app: app.to_string(),
+                                    channel: channel.to_string(),
+                                });
+                            }
                         }
                         let _ = mailbox.send(ServerEvent::CacheMiss {
                             channel: channel.to_string(),
@@ -728,10 +767,12 @@ async fn handle_cmd(
             }
             // Single cluster-wide channel_vacated on the cluster 1→0 edge.
             if vacated && a.has_channel_vacated_webhooks {
-                webhooks.enqueue(WebhookEvent::ChannelVacated {
-                    app: app.to_string(),
-                    channel: channel.to_string(),
-                });
+                if let Some(wh) = webhooks.get() {
+                    wh.enqueue(WebhookEvent::ChannelVacated {
+                        app: app.to_string(),
+                        channel: channel.to_string(),
+                    });
+                }
             }
         }
         ClusterCmd::PresenceSubscribe {
@@ -800,19 +841,23 @@ async fn handle_cmd(
                     )
                     .await;
                 if a.has_member_added_webhooks {
-                    webhooks.enqueue(WebhookEvent::MemberAdded {
-                        app: app.to_string(),
-                        channel: channel.to_string(),
-                        user_id: member.user_id.clone(),
-                    });
+                    if let Some(wh) = webhooks.get() {
+                        wh.enqueue(WebhookEvent::MemberAdded {
+                            app: app.to_string(),
+                            channel: channel.to_string(),
+                            user_id: member.user_id.clone(),
+                        });
+                    }
                 }
             }
             // Single cluster-wide channel_occupied on the cluster 0→1 edge.
             if occupied && a.has_channel_occupied_webhooks {
-                webhooks.enqueue(WebhookEvent::ChannelOccupied {
-                    app: app.to_string(),
-                    channel: channel.to_string(),
-                });
+                if let Some(wh) = webhooks.get() {
+                    wh.enqueue(WebhookEvent::ChannelOccupied {
+                        app: app.to_string(),
+                        channel: channel.to_string(),
+                    });
+                }
             }
         }
         ClusterCmd::PresenceLeave {
@@ -863,19 +908,23 @@ async fn handle_cmd(
                     )
                     .await;
                 if a.has_member_removed_webhooks {
-                    webhooks.enqueue(WebhookEvent::MemberRemoved {
-                        app: app.to_string(),
-                        channel: channel.to_string(),
-                        user_id: user_id.clone(),
-                    });
+                    if let Some(wh) = webhooks.get() {
+                        wh.enqueue(WebhookEvent::MemberRemoved {
+                            app: app.to_string(),
+                            channel: channel.to_string(),
+                            user_id: user_id.clone(),
+                        });
+                    }
                 }
             }
             // Single cluster-wide channel_vacated on the cluster 1→0 edge.
             if vacated && a.has_channel_vacated_webhooks {
-                webhooks.enqueue(WebhookEvent::ChannelVacated {
-                    app: app.to_string(),
-                    channel: channel.to_string(),
-                });
+                if let Some(wh) = webhooks.get() {
+                    wh.enqueue(WebhookEvent::ChannelVacated {
+                        app: app.to_string(),
+                        channel: channel.to_string(),
+                    });
+                }
             }
         }
         ClusterCmd::Signin {

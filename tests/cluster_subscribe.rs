@@ -195,8 +195,9 @@ fn start_node(prefix: &str, apps: Arc<dyn AppManager>) -> Node {
     let cfg = redis_test_config(prefix);
     let local = Arc::new(LocalAdapter::new(Arc::new(Registry::new())));
     let (webhooks, transport) = recording_webhooks(apps.clone());
-    let bridge = bridge::start(&cfg, local.clone(), webhooks, apps)
+    let bridge = bridge::start(&cfg, local.clone(), apps)
         .expect("ClusterBridge::start must connect to the test Redis and report ready");
+    bridge.attach_webhooks(webhooks);
     Node {
         bridge,
         local,

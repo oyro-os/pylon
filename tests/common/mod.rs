@@ -313,8 +313,11 @@ pub async fn spawn_percore_cluster(prefix: &str) -> (SocketAddr, ClusterNodeGuar
     // Start the bridge: builds the node's single `RedisAdapter` sharing `local`,
     // on its own runtime. `start` is sync (it owns its runtime thread) and returns
     // once Redis is connected, or panics here with a clear message if it isn't.
-    let bridge = bridge::start(&config, local.clone(), webhooks.clone(), apps.clone())
+    // Webhooks are attached AFTER start (deferred, mirroring `main.rs`): this sets the
+    // drain loop's handle AND starts the Redis sweeper with it.
+    let bridge = bridge::start(&config, local.clone(), apps.clone())
         .expect("ClusterBridge::start must connect to the test Redis and report ready");
+    bridge.attach_webhooks(webhooks.clone());
 
     // REST plane: drives the node's `RedisAdapter` (full async; blocking on Redis
     // is fine on the tokio runtime) for cluster-wide channel reads + REST publishes.
