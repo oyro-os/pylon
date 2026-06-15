@@ -114,12 +114,16 @@ pub struct WorkerConfig {
 
 /// The per-worker half of the sharded broadcast plumbing handed to [`run`].
 pub struct BroadcastWiring {
-    /// Inbound broadcast hand-offs from the sink (the matching `Sender` lives in
-    /// `slot.tx`). Drained on the [`BCAST_WAKER`] event and once per loop.
+    /// Inbound broadcast hand-offs from the sink (the matching `SyncSender` lives
+    /// in `slot.tx`). Drained on the [`BCAST_WAKER`] event and once per loop.
     pub rx: std::sync::mpsc::Receiver<crate::transport::fanout::BroadcastMsg>,
     /// This worker's sink slot; its `waker` `OnceLock` is filled at startup with
     /// a `Waker` built from this worker's own `Poll` registry.
     pub slot: Arc<crate::transport::fanout::WorkerSlot>,
+    /// The sink-shared saturation flag. After this worker fully drains its
+    /// broadcast inbox to empty (so the bounded hand-off has headroom again), it
+    /// clears this flag, letting the publish-admission path resume accepting.
+    pub saturated: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// Worker behaviour for inbound frames.
@@ -208,6 +212,8 @@ pub fn run(mut cfg: WorkerConfig, shutdown: Arc<AtomicBool>) -> std::io::Result<
         }
         None => None,
     };
+    // The sink-shared saturation flag, cleared after each full broadcast drain.
+    let saturated = broadcast.as_ref().map(|w| w.saturated.clone());
 
     // Worker-local subscription index: which of THIS worker's connections are in
     // each `(app, channel)`. Populated by reconciling `ctx.subscribed` after each
@@ -332,6 +338,13 @@ pub fn run(mut cfg: WorkerConfig, shutdown: Arc<AtomicBool>) -> std::io::Result<
         if let Some(rx) = broadcast_rx {
             if drain_broadcasts(&poll, &mut conns, rx, &mut local_subs, &mut sid_to_token) {
                 work = true;
+            }
+            // `drain_broadcasts` empties the bounded hand-off inbox (its
+            // `while rx.try_recv()` loop runs to `Empty`), so the channel now has
+            // headroom: clear the sink's saturation flag. The publish-admission
+            // path (Phase 2) thereby resumes accepting once delivery catches up.
+            if let Some(sat) = &saturated {
+                sat.store(false, Ordering::Relaxed);
             }
         }
 

@@ -24,7 +24,7 @@ use crate::server::config::ServerConfig;
 use crate::webhook::WebhookHandle;
 use dashmap::DashMap;
 use fanout::{BroadcastSink, WorkerSlot};
-use std::sync::atomic::{AtomicBool, AtomicUsize};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize};
 use std::sync::Arc;
 use tokio::sync::mpsc::UnboundedSender;
 use worker::{BroadcastWiring, DispatchEnv, Mode, WorkerConfig};
@@ -102,6 +102,11 @@ pub fn run_percore(
     // which fills the slot's `Waker` `OnceLock` at startup. When `local` is
     // `None` (no concrete adapter to install on), broadcasts use the legacy
     // mailbox path and workers get no inbox.
+    // Bounded broadcast hand-off capacity (frames) per worker (SP10): the
+    // publish→workers channel is bounded so a publish flood that outruns delivery
+    // is dropped at the hand-off rather than buffered unbounded (the SP9 hang).
+    let handoff_cap = fanout::DEFAULT_BROADCAST_HANDOFF_CAP;
+
     let mut wirings: Vec<Option<BroadcastWiring>> = Vec::with_capacity(worker_count);
     if let Some(local) = &local {
         // One shared `Arc<WorkerSlot>` per worker: the sink and the worker both
@@ -110,20 +115,31 @@ pub fn run_percore(
         let mut slots: Vec<Arc<WorkerSlot>> = Vec::with_capacity(worker_count);
         let mut receivers = Vec::with_capacity(worker_count);
         for _ in 0..worker_count {
-            let (tx, rx) = std::sync::mpsc::channel();
+            // Bounded hand-off: `sync_channel(cap)` → publisher `try_send` drops
+            // on full instead of growing memory without limit.
+            let (tx, rx) = std::sync::mpsc::sync_channel(handoff_cap);
             slots.push(Arc::new(WorkerSlot {
                 tx,
                 waker: std::sync::OnceLock::new(),
+                dropped: AtomicU64::new(0),
             }));
             receivers.push(rx);
         }
+        // Sink-shared saturation flag: set by the publisher on a full hand-off,
+        // cleared by each worker after it drains its inbox to empty.
+        let saturated = Arc::new(AtomicBool::new(false));
         let sink = BroadcastSink {
             workers: Arc::new(slots.clone()),
+            saturated: saturated.clone(),
         };
         // Install BEFORE spawning workers so the very first broadcast routes here.
         local.set_broadcast_sink(sink);
         for (slot, rx) in slots.into_iter().zip(receivers) {
-            wirings.push(Some(BroadcastWiring { rx, slot }));
+            wirings.push(Some(BroadcastWiring {
+                rx,
+                slot,
+                saturated: saturated.clone(),
+            }));
         }
     } else {
         for _ in 0..worker_count {
