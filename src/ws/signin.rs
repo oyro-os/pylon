@@ -45,16 +45,26 @@ impl ConnectionContext {
         });
         // Watchlist: notify watchers if this signin brought the user online,
         // then register this connection's own watchlist and snapshot who's online.
-        if outcome.first_for_user {
+        //
+        // Clustered: the bridge owns the cluster-wide online edge — it notifies THIS
+        // node's local watchers AND publishes WatchOnline to remote nodes, both keyed on
+        // the CLUSTER `first_for_user` (not the node-local `outcome.first_for_user`, which
+        // would fire on the wrong edge and reach only local watchers). The handler MUST
+        // NOT emit the node-local notify here.
+        if !self.clustered && outcome.first_for_user {
             self.notify_watchers(&user.id, "online").await;
         }
         let watched = self.capped_watchlist(&user.watchlist);
         if !watched.is_empty() {
+            // Always fire the watch (in cluster mode this fires the cluster Watch cmd, which
+            // SUBSCRIBEs the per-user watch channels + sends the CLUSTER online snapshot via
+            // the mailbox). The RETURNED `online` is the node-local set; in cluster mode it
+            // is ignored (the bridge sends the authoritative cluster snapshot).
             let online = self
                 .adapter
                 .watch(&self.app.id, self.handle(), watched)
                 .await;
-            if !online.is_empty() {
+            if !self.clustered && !online.is_empty() {
                 self.send_self(ServerEvent::WatchlistEvents {
                     events: vec![crate::protocol::event::WatchlistChange {
                         name: "online".to_string(),

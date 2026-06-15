@@ -111,6 +111,50 @@ pub enum ClusterCmd {
         socket_id: SocketId,
         node_last: bool,
     },
+    /// User signin: record the cluster-wide USER_SIGNIN refcount + the node-local
+    /// `usermsg` subscribe-on-first, and — on the cluster-wide first connection for this
+    /// user — publish `WatchOnline` (REMOTE watchers) AND notify THIS node's LOCAL
+    /// watchers directly (the publish self-dedups on the origin, so its own local
+    /// watchers must be notified here). `node_first` is the worker's node-local 0→1
+    /// edge (from `LocalAdapter::signin_user`). Maps to [`RedisAdapter::cluster_signin`].
+    Signin {
+        app: Arc<str>,
+        user_id: String,
+        socket_id: SocketId,
+        node_first: bool,
+    },
+    /// User signout: record the cluster-wide USER_SIGNOUT refcount + the node-local
+    /// `usermsg` unsubscribe-on-last, and — on the cluster-wide last connection for this
+    /// user — publish `WatchOffline` (REMOTE watchers) AND notify THIS node's LOCAL
+    /// watchers directly. `node_last` is the worker's node-local 1→0 edge (from
+    /// `LocalAdapter::signout_user`). Maps to [`RedisAdapter::cluster_signout`].
+    Signout {
+        app: Arc<str>,
+        user_id: String,
+        socket_id: SocketId,
+        node_last: bool,
+    },
+    /// Register this connection's watchlist cluster-wide: SUBSCRIBE the per-user `watch`
+    /// Redis channel for every `newly_watched` user (node-local 0→1 watcher edges) and
+    /// send the CLUSTER-wide initial online snapshot back to the joining connection's
+    /// `mailbox` as `watchlist_events { online }`. The worker's `ClusterAdapter::watch`
+    /// returns the NODE-LOCAL online set, which the handler ignores in cluster mode — the
+    /// authoritative cluster snapshot is sent here. Maps to [`RedisAdapter::cluster_watch`].
+    Watch {
+        app: Arc<str>,
+        socket_id: SocketId,
+        watched: Vec<String>,
+        newly_watched: Vec<String>,
+        mailbox: UnboundedSender<ServerEvent>,
+    },
+    /// Drop this connection's watchlist cluster-wide: UNSUBSCRIBE the per-user `watch`
+    /// Redis channel for every `no_longer_watched` user (node-local 1→0 watcher edges).
+    /// Maps to [`RedisAdapter::cluster_unwatch`].
+    Unwatch {
+        app: Arc<str>,
+        socket_id: SocketId,
+        no_longer_watched: Vec<String>,
+    },
 }
 
 /// Cheap-clone handle a percore worker uses to fire [`ClusterCmd`]s at the bridge. `Send +
@@ -276,6 +320,97 @@ impl ClusterHandle {
             }
         }
     }
+
+    /// Fire a cluster Signin at the bridge. NON-BLOCKING, drop-on-full/closed exactly
+    /// like [`publish`](ClusterHandle::publish). A dropped Signin at most costs this
+    /// connection its cluster online edge (the WatchOnline publish + the usermsg
+    /// subscribe); the node-local signin already succeeded on the worker.
+    pub fn signin(&self, app: Arc<str>, user_id: String, socket_id: SocketId, node_first: bool) {
+        let cmd = ClusterCmd::Signin {
+            app,
+            user_id,
+            socket_id,
+            node_first,
+        };
+        match self.tx.try_send(cmd) {
+            Ok(()) => {}
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                tracing::debug!("cluster bridge channel full; dropping cross-node signin");
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                tracing::debug!("cluster bridge gone; dropping cross-node signin");
+            }
+        }
+    }
+
+    /// Fire a cluster Signout at the bridge. NON-BLOCKING, drop-on-full/closed exactly
+    /// like [`publish`](ClusterHandle::publish).
+    pub fn signout(&self, app: Arc<str>, user_id: String, socket_id: SocketId, node_last: bool) {
+        let cmd = ClusterCmd::Signout {
+            app,
+            user_id,
+            socket_id,
+            node_last,
+        };
+        match self.tx.try_send(cmd) {
+            Ok(()) => {}
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                tracing::debug!("cluster bridge channel full; dropping cross-node signout");
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                tracing::debug!("cluster bridge gone; dropping cross-node signout");
+            }
+        }
+    }
+
+    /// Fire a cluster Watch at the bridge. NON-BLOCKING, drop-on-full/closed exactly
+    /// like [`publish`](ClusterHandle::publish). A dropped Watch at most costs this
+    /// connection its cross-node online/offline transitions + its cluster initial
+    /// online snapshot; the node-local watch already succeeded on the worker.
+    pub fn watch(
+        &self,
+        app: Arc<str>,
+        socket_id: SocketId,
+        watched: Vec<String>,
+        newly_watched: Vec<String>,
+        mailbox: UnboundedSender<ServerEvent>,
+    ) {
+        let cmd = ClusterCmd::Watch {
+            app,
+            socket_id,
+            watched,
+            newly_watched,
+            mailbox,
+        };
+        match self.tx.try_send(cmd) {
+            Ok(()) => {}
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                tracing::debug!("cluster bridge channel full; dropping cross-node watch");
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                tracing::debug!("cluster bridge gone; dropping cross-node watch");
+            }
+        }
+    }
+
+    /// Fire a cluster Unwatch at the bridge. NON-BLOCKING, drop-on-full/closed exactly
+    /// like [`publish`](ClusterHandle::publish).
+    pub fn unwatch(&self, app: Arc<str>, socket_id: SocketId, no_longer_watched: Vec<String>) {
+        let cmd = ClusterCmd::Unwatch {
+            app,
+            socket_id,
+            no_longer_watched,
+        };
+        match self.tx.try_send(cmd) {
+            Ok(()) => {}
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                tracing::debug!("cluster bridge channel full; dropping cross-node unwatch");
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                tracing::debug!("cluster bridge gone; dropping cross-node unwatch");
+            }
+        }
+    }
 }
 
 /// Owns the dedicated tokio runtime (on its own OS thread) that hosts the bridge's
@@ -374,6 +509,10 @@ pub fn start(
             };
 
             runtime.block_on(async move {
+                // Keep our own clone of the workers' `LocalAdapter` BEFORE it is moved into
+                // the adapter: the drain loop needs it to notify THIS node's local watchers
+                // on the cluster online/offline edges (the `Signin` / `Signout` arms).
+                let local_for_loop = local.clone();
                 // Connect the adapter sharing the workers' `LocalAdapter`. On failure, hand
                 // the error back so `start` returns `Err` instead of hanging.
                 let adapter = match RedisAdapter::with_local(&cfg, local).await {
@@ -418,7 +557,7 @@ pub fn start(
                         // Idle tick: loop back and re-check the shutdown flag.
                         Err(_) => continue,
                         Ok(Some(cmd)) => {
-                            handle_cmd(&adapter, &apps, &webhooks, cmd).await;
+                            handle_cmd(&adapter, &local_for_loop, &apps, &webhooks, cmd).await;
                         }
                     }
                 }
@@ -460,6 +599,7 @@ pub fn start(
 /// the single cluster-wide `channel_occupied` / `channel_vacated`).
 async fn handle_cmd(
     adapter: &RedisAdapter,
+    local: &Arc<LocalAdapter>,
     apps: &Arc<dyn AppManager>,
     webhooks: &WebhookHandle,
     cmd: ClusterCmd,
@@ -738,6 +878,88 @@ async fn handle_cmd(
                 });
             }
         }
+        ClusterCmd::Signin {
+            app,
+            user_id,
+            socket_id,
+            node_first,
+        } => {
+            // Cluster half: USER_SIGNIN refcount + usermsg subscribe-on-first + the app
+            // index + the WatchOnline publish on the cluster 0→1 edge (REMOTE watchers).
+            // Returns the cluster-wide `first_for_user`.
+            let first = adapter
+                .cluster_signin(&app, &user_id, &socket_id, node_first)
+                .await;
+            // On the cluster-wide first connection for this user, notify THIS node's
+            // LOCAL watchers directly — the WatchOnline publish self-dedups on the origin
+            // node, so the recv loop will NOT re-deliver it here.
+            if first {
+                notify_local_watchers(local, &app, &user_id, "online").await;
+            }
+        }
+        ClusterCmd::Signout {
+            app,
+            user_id,
+            socket_id,
+            node_last,
+        } => {
+            // Cluster half: USER_SIGNOUT refcount + usermsg unsubscribe-on-last + the
+            // WatchOffline publish on the cluster 1→0 edge (REMOTE watchers). Returns the
+            // cluster-wide `last_for_user`.
+            let last = adapter
+                .cluster_signout(&app, &user_id, &socket_id, node_last)
+                .await;
+            if last {
+                notify_local_watchers(local, &app, &user_id, "offline").await;
+            }
+        }
+        ClusterCmd::Watch {
+            app,
+            socket_id: _,
+            watched,
+            newly_watched,
+            mailbox,
+        } => {
+            // SUBSCRIBE each newly-watched user's watch Redis channel (so this node sees
+            // their cluster online/offline transitions) + compute the CLUSTER-wide initial
+            // online snapshot. Send the snapshot back to the joining connection's mailbox.
+            // A closed mailbox `send` returns `Err` — a safe no-op (the connection is gone).
+            let online = adapter.cluster_watch(&app, &watched, &newly_watched).await;
+            if !online.is_empty() {
+                let _ = mailbox.send(ServerEvent::WatchlistEvents {
+                    events: vec![crate::protocol::event::WatchlistChange {
+                        name: "online".to_string(),
+                        user_ids: online,
+                    }],
+                });
+            }
+        }
+        ClusterCmd::Unwatch {
+            app,
+            socket_id: _,
+            no_longer_watched,
+        } => {
+            // UNSUBSCRIBE the per-user watch Redis channels for the users whose node-local
+            // watcher set just went 1→0 here.
+            adapter.cluster_unwatch(&app, &no_longer_watched).await;
+        }
+    }
+}
+
+/// Push a single-change `watchlist_events` frame to every LOCAL connection on this node
+/// that is watching `user_id`. Mirrors the pub/sub receive loop's `WatchOnline` /
+/// `WatchOffline` arm EXACTLY: this is the origin node's side of a cluster online/offline
+/// transition (the cross-node `WatchOnline` publish self-dedups on the origin, so its own
+/// local watchers must be notified here). `name` is `"online"` or `"offline"`.
+async fn notify_local_watchers(local: &LocalAdapter, app: &str, user_id: &str, name: &str) {
+    let ev = ServerEvent::WatchlistEvents {
+        events: vec![crate::protocol::event::WatchlistChange {
+            name: name.to_string(),
+            user_ids: vec![user_id.to_string()],
+        }],
+    };
+    for h in local.watchers_of(app, user_id).await {
+        let _ = h.mailbox.send(ev.clone());
     }
 }
 

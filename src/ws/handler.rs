@@ -193,7 +193,11 @@ impl ConnectionContext {
                 .adapter
                 .signout_user(&self.app.id, &user.id, &self.socket_id)
                 .await;
-            if outcome.last_for_user {
+            // Clustered: the bridge notifies local watchers + publishes WatchOffline on the
+            // CLUSTER last-for-user edge (computed in `cluster_signout`). The handler must
+            // NOT emit the node-local notify — `outcome.last_for_user` here is the
+            // node-local edge, which is the wrong signal cross-node.
+            if !self.clustered && outcome.last_for_user {
                 self.notify_watchers(&user.id, "offline").await;
             }
         }

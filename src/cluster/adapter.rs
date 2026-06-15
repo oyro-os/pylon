@@ -20,9 +20,15 @@
 //!   ONLY the Redis publish, so there is no double local delivery and self-dedup stops the
 //!   origin re-receiving its own frame.
 //!
-//! Presence CAPACITY enforcement, cache, signin/watchlist are LATER tasks (3.4b / 3.5):
-//! those methods delegate straight to `local` for now (see the per-method notes). They are
-//! not exercised by this task's tests.
+//! Signin/watchlist follow the same split: `signin_user` / `signout_user` / `watch` /
+//! `unwatch` do the node-LOCAL half synchronously and fire the cluster edge at the bridge
+//! (`Signin` / `Signout` / `Watch` / `Unwatch`), which owns the cluster-wide online
+//! refcount, the `WatchOnline` / `WatchOffline` publish (REMOTE watchers) + the LOCAL
+//! watcher notify, and the cluster-wide initial online snapshot. `send_to_user` /
+//! `terminate_user` are NEVER called on the worker path (they are REST/admin ops driven by
+//! the node's `RedisAdapter` via `bridge.adapter()`); the worker methods delegate to
+//! `local` only as a non-cluster fallback. Presence CAPACITY enforcement and cache stay
+//! node-local per the per-method notes.
 
 use crate::adapter::local::LocalAdapter;
 use crate::adapter::Adapter;
@@ -189,8 +195,22 @@ impl Adapter for ClusterAdapter {
         user_id: &str,
         handle: ConnectionHandle,
     ) -> UserJoinOutcome {
-        // Cluster signin/online edges are layered in by Task 3.5; node-local for now.
-        self.local.signin_user(app, user_id, handle).await
+        // Capture the socket id BEFORE `handle` is moved into the local adapter — the
+        // bridge needs it for the cluster USER_SIGNIN binding token.
+        let socket_id = handle.socket_id.clone();
+        // Node-local signin (synchronous) — `first_for_user` here is the NODE-local 0→1
+        // edge, which drives the bridge's usermsg subscribe-on-first. The cluster-wide
+        // online edge (WatchOnline publish + local-watcher notify) is computed on the
+        // bridge, NOT from this node-local outcome.
+        let out = self.local.signin_user(app, user_id, handle).await;
+        let node_first = out.first_for_user;
+        self.handle.signin(
+            Arc::from(app),
+            user_id.to_string(),
+            socket_id,
+            node_first,
+        );
+        out
     }
 
     async fn signout_user(
@@ -199,8 +219,18 @@ impl Adapter for ClusterAdapter {
         user_id: &str,
         socket_id: &SocketId,
     ) -> UserLeaveOutcome {
-        // Cluster signout/offline edges are layered in by Task 3.5; node-local for now.
-        self.local.signout_user(app, user_id, socket_id).await
+        // Node-local signout (synchronous) — `last_for_user` here is the NODE-local 1→0
+        // edge (drives the bridge's usermsg unsubscribe-on-last). The cluster-wide offline
+        // edge is computed on the bridge.
+        let out = self.local.signout_user(app, user_id, socket_id).await;
+        let node_last = out.last_for_user;
+        self.handle.signout(
+            Arc::from(app),
+            user_id.to_string(),
+            socket_id.clone(),
+            node_last,
+        );
+        out
     }
 
     async fn is_user_online(&self, app: &str, user_id: &str) -> bool {
@@ -224,13 +254,32 @@ impl Adapter for ClusterAdapter {
         handle: ConnectionHandle,
         watched: Vec<String>,
     ) -> Vec<String> {
-        // Cluster watchlist is layered in by Task 3.5; node-local for now.
-        self.local.watch(app, handle, watched).await
+        // Capture the socket id + mailbox BEFORE `handle` is moved into the local adapter.
+        // The mailbox lets the bridge send the CLUSTER-wide initial online snapshot
+        // straight to this connection.
+        let socket_id = handle.socket_id.clone();
+        let mailbox = handle.mailbox.clone();
+        // Record watchers node-locally + learn which users this node now NEWLY watches
+        // (the 0→1 watcher edges that drive the bridge's per-user watch Redis SUBSCRIBE).
+        let (online, newly) = self.local.watch_edges(app, handle, watched.clone());
+        self.handle.watch(
+            Arc::from(app),
+            socket_id,
+            watched,
+            newly,
+            mailbox,
+        );
+        // Return the NODE-LOCAL online set. The handler ignores it in cluster mode — the
+        // authoritative CLUSTER online snapshot is sent by the bridge via the mailbox.
+        online
     }
 
     async fn unwatch(&self, app: &str, socket_id: &SocketId) {
-        // Cluster watchlist is layered in by Task 3.5; node-local for now.
-        self.local.unwatch(app, socket_id).await
+        // Drop this connection's watch state node-locally + learn the users whose LOCAL
+        // watcher set dropped to empty here (1→0), which the bridge UNSUBSCRIBEs.
+        let gone = self.local.unwatch_edges(app, socket_id);
+        self.handle
+            .unwatch(Arc::from(app), socket_id.clone(), gone);
     }
 
     async fn watchers_of(&self, app: &str, user_id: &str) -> Vec<ConnectionHandle> {
