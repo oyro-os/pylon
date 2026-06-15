@@ -17,6 +17,7 @@ use crate::adapter::redis::RedisAdapter;
 use crate::adapter::Adapter;
 use crate::app::AppManager;
 use crate::channel::kind::{AuthKind, ChannelInfo};
+use crate::connection::handle::Mailbox;
 use crate::presence::member::PresenceMember;
 use crate::protocol::event::ServerEvent;
 use crate::protocol::socket_id::SocketId;
@@ -27,7 +28,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::thread::JoinHandle;
 use tokio::sync::mpsc;
-use tokio::sync::mpsc::UnboundedSender;
 
 /// Bound on the worker→bridge control-plane channel. A full channel drops the command (see
 /// [`ClusterHandle::publish`]); sized generously so only a sustained bridge stall — never a
@@ -69,7 +69,7 @@ pub enum ClusterCmd {
         app: Arc<str>,
         channel: Arc<str>,
         socket_id: SocketId,
-        mailbox: UnboundedSender<ServerEvent>,
+        mailbox: Mailbox,
         node_first: bool,
     },
     /// Remove cluster-wide membership for `(app, channel, socket_id)` and, on the
@@ -95,7 +95,7 @@ pub enum ClusterCmd {
         channel: Arc<str>,
         member: PresenceMember,
         socket_id: SocketId,
-        mailbox: UnboundedSender<ServerEvent>,
+        mailbox: Mailbox,
         node_first: bool,
     },
     /// Presence-channel leave: remove cluster-wide membership + the presence refcount,
@@ -145,7 +145,7 @@ pub enum ClusterCmd {
         socket_id: SocketId,
         watched: Vec<String>,
         newly_watched: Vec<String>,
-        mailbox: UnboundedSender<ServerEvent>,
+        mailbox: Mailbox,
     },
     /// Drop this connection's watchlist cluster-wide: UNSUBSCRIBE the per-user `watch`
     /// Redis channel for every `no_longer_watched` user (node-local 1→0 watcher edges).
@@ -211,7 +211,7 @@ impl ClusterHandle {
         app: Arc<str>,
         channel: Arc<str>,
         socket_id: SocketId,
-        mailbox: UnboundedSender<ServerEvent>,
+        mailbox: Mailbox,
         node_first: bool,
     ) {
         let cmd = ClusterCmd::Subscribe {
@@ -269,7 +269,7 @@ impl ClusterHandle {
         channel: Arc<str>,
         member: PresenceMember,
         socket_id: SocketId,
-        mailbox: UnboundedSender<ServerEvent>,
+        mailbox: Mailbox,
         node_first: bool,
     ) {
         let cmd = ClusterCmd::PresenceSubscribe {
@@ -373,7 +373,7 @@ impl ClusterHandle {
         socket_id: SocketId,
         watched: Vec<String>,
         newly_watched: Vec<String>,
-        mailbox: UnboundedSender<ServerEvent>,
+        mailbox: Mailbox,
     ) {
         let cmd = ClusterCmd::Watch {
             app,

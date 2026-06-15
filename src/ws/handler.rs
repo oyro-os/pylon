@@ -2,7 +2,7 @@
 
 use crate::adapter::Adapter;
 use crate::app::App;
-use crate::connection::handle::ConnectionHandle;
+use crate::connection::handle::{ConnectionHandle, Mailbox, MailboxNotify};
 use crate::protocol::command::ClientCommand;
 use crate::protocol::event::ServerEvent;
 use crate::protocol::socket_id::SocketId;
@@ -37,6 +37,14 @@ pub struct ConnectionContext {
     /// (single-node) percore path and in tests, where the handler keeps its
     /// node-local emits.
     pub clustered: bool,
+    /// The worker's mailbox notifier inputs (dirty-token queue + `MAILBOX_WAKER`)
+    /// plus this connection's slab token, used by [`handle`](Self::handle) to build
+    /// a WAKING [`Mailbox`] so a cross-connection send marks this connection dirty
+    /// and nudges the worker to drain it — instead of relying on the O(N) idle scan.
+    /// `None` when no worker is wired (unit tests that build a `ConnectionContext`
+    /// directly): the resulting `Mailbox` then forwards `send` with no wake, which
+    /// is correct because those tests `try_recv` the matching receiver directly.
+    pub mailbox_notify: Option<MailboxNotify>,
 }
 
 impl ConnectionContext {
@@ -51,7 +59,10 @@ impl ConnectionContext {
     pub(in crate::ws) fn handle(&self) -> ConnectionHandle {
         ConnectionHandle {
             socket_id: self.socket_id.clone(),
-            mailbox: self.self_tx.clone(),
+            // A WAKING mailbox: a cross-connection `send` marks this connection
+            // dirty + wakes its worker (when `mailbox_notify` is wired), so the
+            // worker drains exactly this connection and never scans idle ones.
+            mailbox: Mailbox::new(self.self_tx.clone(), self.mailbox_notify.clone()),
         }
     }
 

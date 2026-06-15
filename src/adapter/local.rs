@@ -270,7 +270,7 @@ mod tests {
                 "c",
                 ConnectionHandle {
                     socket_id: SocketId::generate(),
-                    mailbox: tx,
+                    mailbox: crate::connection::handle::Mailbox::new(tx, None),
                 },
                 None,
             )
@@ -298,7 +298,7 @@ mod tests {
                 "presence-x",
                 ConnectionHandle {
                     socket_id: SocketId::generate(),
-                    mailbox: tx,
+                    mailbox: crate::connection::handle::Mailbox::new(tx, None),
                 },
                 Some(PresenceMember {
                     user_id: "u1".into(),
@@ -397,7 +397,7 @@ mod tests {
                 "u",
                 ConnectionHandle {
                     socket_id: s1,
-                    mailbox: tx1,
+                    mailbox: crate::connection::handle::Mailbox::new(tx1, None),
                 },
             )
             .await;
@@ -407,7 +407,7 @@ mod tests {
                 "u",
                 ConnectionHandle {
                     socket_id: s2,
-                    mailbox: tx2,
+                    mailbox: crate::connection::handle::Mailbox::new(tx2, None),
                 },
             )
             .await;
@@ -427,7 +427,7 @@ mod tests {
                 "u",
                 ConnectionHandle {
                     socket_id: s.clone(),
-                    mailbox: tx,
+                    mailbox: crate::connection::handle::Mailbox::new(tx, None),
                 },
             )
             .await;

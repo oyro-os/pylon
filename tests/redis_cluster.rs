@@ -170,7 +170,7 @@ async fn redis_sub_lifecycle_tracks_channels() {
     let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
     let handle = ConnectionHandle {
         socket_id: socket_id.clone(),
-        mailbox: tx,
+        mailbox: pylon::connection::handle::Mailbox::new(tx, None),
     };
 
     // Before any subscribe, B must NOT be tracking the msg channel.
@@ -230,7 +230,7 @@ async fn subscribe_socket(
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let handle = ConnectionHandle {
         socket_id: socket_id.clone(),
-        mailbox: tx,
+        mailbox: pylon::connection::handle::Mailbox::new(tx, None),
     };
     adapter.subscribe(TEST_APP, channel, handle, None).await;
     (socket_id, rx)
@@ -350,7 +350,7 @@ fn fake_handle() -> (SocketId, ConnectionHandle) {
     let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
     let handle = ConnectionHandle {
         socket_id: socket_id.clone(),
-        mailbox: tx,
+        mailbox: pylon::connection::handle::Mailbox::new(tx, None),
     };
     (socket_id, handle)
 }
@@ -778,7 +778,7 @@ fn presence_handle(
     let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
     let handle = ConnectionHandle {
         socket_id: socket_id.clone(),
-        mailbox: tx,
+        mailbox: pylon::connection::handle::Mailbox::new(tx, None),
     };
     let member = pylon::presence::member::PresenceMember {
         user_id: user_id.into(),
@@ -1156,7 +1156,7 @@ fn recording_handle() -> (
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let handle = ConnectionHandle {
         socket_id: socket_id.clone(),
-        mailbox: tx,
+        mailbox: pylon::connection::handle::Mailbox::new(tx, None),
     };
     (socket_id, handle, rx)
 }

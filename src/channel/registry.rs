@@ -144,7 +144,7 @@ mod tests {
         (
             ConnectionHandle {
                 socket_id: SocketId::generate(),
-                mailbox: tx,
+                mailbox: crate::connection::handle::Mailbox::new(tx, None),
             },
             rx,
         )

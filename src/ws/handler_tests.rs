@@ -74,6 +74,7 @@ fn ctx(app: App) -> (ConnectionContext, mpsc::UnboundedReceiver<ServerEvent>) {
         presence_membership: std::collections::HashMap::new(),
         saturated: None,
         clustered: false,
+        mailbox_notify: None,
         client_event_rate: crate::ws::rate::RateWindow::new(0),
     };
     (c, rx)
@@ -307,6 +308,7 @@ async fn presence_unsubscribe_broadcasts_member_removed_to_others() {
             presence_membership: std::collections::HashMap::new(),
             saturated: None,
             clustered: false,
+            mailbox_notify: None,
             client_event_rate: crate::ws::rate::RateWindow::new(0),
         };
         (c, rx)
@@ -468,6 +470,7 @@ async fn client_event_on_encrypted_channel_is_dropped() {
             presence_membership: std::collections::HashMap::new(),
             saturated: None,
             clustered: false,
+            mailbox_notify: None,
             client_event_rate: crate::ws::rate::RateWindow::new(0),
         };
         (c, rx)
@@ -670,6 +673,7 @@ async fn presence_over_member_cap_errors() {
             presence_membership: std::collections::HashMap::new(),
             saturated: None,
             clustered: false,
+            mailbox_notify: None,
             client_event_rate: crate::ws::rate::RateWindow::new(0),
         };
         (c, rx)
@@ -835,6 +839,7 @@ async fn subscribe_emits_channel_occupied_then_close_emits_vacated() {
         presence_membership: std::collections::HashMap::new(),
         saturated: None,
         clustered: false,
+        mailbox_notify: None,
         client_event_rate: crate::ws::rate::RateWindow::new(0),
     };
 
@@ -908,6 +913,7 @@ async fn rapid_subscribe_unsubscribe_in_window_emits_nothing() {
         presence_membership: std::collections::HashMap::new(),
         saturated: None,
         clustered: false,
+        mailbox_notify: None,
         client_event_rate: crate::ws::rate::RateWindow::new(0),
     };
 
@@ -963,6 +969,7 @@ async fn presence_first_and_last_emit_member_added_then_removed() {
         presence_membership: std::collections::HashMap::new(),
         saturated: None,
         clustered: false,
+        mailbox_notify: None,
         client_event_rate: crate::ws::rate::RateWindow::new(0),
     };
 
@@ -1043,6 +1050,7 @@ async fn client_event_on_presence_includes_user_id_webhook() {
         presence_membership: std::collections::HashMap::new(),
         saturated: None,
         clustered: false,
+        mailbox_notify: None,
         client_event_rate: crate::ws::rate::RateWindow::new(0),
     };
     c.dispatch(crate::protocol::command::ClientCommand::Subscribe {
@@ -1101,6 +1109,7 @@ async fn client_event_on_private_omits_user_id_webhook() {
         presence_membership: std::collections::HashMap::new(),
         saturated: None,
         clustered: false,
+        mailbox_notify: None,
         client_event_rate: crate::ws::rate::RateWindow::new(0),
     };
     c.dispatch(crate::protocol::command::ClientCommand::Subscribe {
@@ -1157,6 +1166,7 @@ async fn client_event_webhook_gated_off_when_app_lacks_it() {
         presence_membership: std::collections::HashMap::new(),
         saturated: None,
         clustered: false,
+        mailbox_notify: None,
         client_event_rate: crate::ws::rate::RateWindow::new(0),
     };
     c.dispatch(crate::protocol::command::ClientCommand::Subscribe {
@@ -1211,6 +1221,7 @@ async fn cache_channel_miss_emits_cache_miss_webhook() {
         presence_membership: std::collections::HashMap::new(),
         saturated: None,
         clustered: false,
+        mailbox_notify: None,
         client_event_rate: crate::ws::rate::RateWindow::new(0),
     };
     // public cache channel: no auth, miss on first subscribe.
@@ -1538,6 +1549,7 @@ async fn relayed_client_event_frame(
             presence_membership: std::collections::HashMap::new(),
             saturated: None,
             clustered: false,
+            mailbox_notify: None,
             client_event_rate: crate::ws::rate::RateWindow::new(0),
         };
         (c, rx)
@@ -1615,6 +1627,7 @@ async fn client_event_oversize_name_returns_4301_and_does_not_broadcast() {
             presence_membership: std::collections::HashMap::new(),
             saturated: None,
             clustered: false,
+            mailbox_notify: None,
             client_event_rate: crate::ws::rate::RateWindow::new(100), // generous budget
         };
         (c, rx)
@@ -1691,6 +1704,7 @@ async fn client_event_rate_limit_returns_4301_and_drops() {
         presence_membership: std::collections::HashMap::new(),
         saturated: None,
         clustered: false,
+        mailbox_notify: None,
         client_event_rate: crate::ws::rate::RateWindow::new(3),
     };
 
@@ -1708,6 +1722,7 @@ async fn client_event_rate_limit_returns_4301_and_drops() {
         presence_membership: std::collections::HashMap::new(),
         saturated: None,
         clustered: false,
+        mailbox_notify: None,
         client_event_rate: crate::ws::rate::RateWindow::new(0),
     };
 

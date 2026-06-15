@@ -199,6 +199,7 @@ mod tests {
             presence_membership: std::collections::HashMap::new(),
             saturated: None,
             clustered: false,
+            mailbox_notify: None,
             client_event_rate: crate::ws::rate::RateWindow::new(0),
         };
         (c, rx)

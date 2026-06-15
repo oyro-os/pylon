@@ -20,7 +20,7 @@ fn bench_fanout(c: &mut Criterion) {
                 "c",
                 ConnectionHandle {
                     socket_id: SocketId::generate(),
-                    mailbox: tx,
+                    mailbox: pylon::connection::handle::Mailbox::new(tx, None),
                 },
                 None,
             );

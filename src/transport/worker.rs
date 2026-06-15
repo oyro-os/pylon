@@ -41,6 +41,7 @@
 
 use crate::adapter::Adapter;
 use crate::app::AppManager;
+use crate::connection::handle::MailboxNotify;
 use crate::protocol::command::ClientCommand;
 use crate::protocol::event::ServerEvent;
 use crate::protocol::socket_id::SocketId;
@@ -65,10 +66,31 @@ use tokio::sync::mpsc;
 /// `usize` is guaranteed never to collide with a connection token.
 const LISTENER: Token = Token(usize::MAX);
 
-/// Reserved token for this worker's broadcast-inbox [`mio::Waker`]. One below
-/// [`LISTENER`]; slab keys grow from 0 so neither reserved value can collide
-/// with a connection token.
-const BCAST_WAKER: Token = Token(usize::MAX - 1);
+/// Test-hooks instrumentation: a monotonic count of how many connection
+/// mailboxes the SELECTIVE drain has visited across this process's workers.
+/// Bumped once per session the selective drain touches. A test asserts this stays
+/// tiny (≈ the number of ACTIVE connections) even with many idle connections,
+/// proving idle connections are never scanned. Behind `test-hooks` so it is free
+/// in release builds.
+#[cfg(any(test, feature = "test-hooks"))]
+pub static SELECTIVE_DRAIN_VISITS: AtomicU64 = AtomicU64::new(0);
+
+/// Test-hooks accessor: the cumulative number of connection mailboxes the
+/// Waker-driven selective drain has visited (see [`SELECTIVE_DRAIN_VISITS`]).
+#[cfg(any(test, feature = "test-hooks"))]
+pub fn percore_selective_drain_visits() -> u64 {
+    SELECTIVE_DRAIN_VISITS.load(Ordering::Relaxed)
+}
+
+/// Reserved token for this worker's single [`mio::Waker`]. One below [`LISTENER`];
+/// slab keys grow from 0 so neither reserved value can collide with a connection
+/// token. mio allows exactly ONE active `Waker` per `Poll`, so this single waker
+/// serves BOTH wake sources — the broadcast sink nudging a drain, and a
+/// cross-connection [`Mailbox::send`](crate::connection::handle::Mailbox) marking a
+/// connection dirty (cluster follow-up, `send_to_user`, `notify_watchers`, …). A
+/// wake on this token only unblocks the poll; the post-loop broadcast + selective
+/// mailbox drains then run and figure out what actually needs delivering.
+const WORKER_WAKER: Token = Token(usize::MAX - 1);
 
 /// Shared, `Arc`-cloneable bundle of the `AppState` pieces a [`Mode::Dispatch`]
 /// worker needs to build a [`ConnectionContext`] per connection.
@@ -230,24 +252,42 @@ pub fn run(mut cfg: WorkerConfig, shutdown: Arc<AtomicBool>) -> std::io::Result<
     poll.registry()
         .register(&mut listener, LISTENER, Interest::READABLE)?;
 
+    // This worker's SINGLE `mio::Waker` (mio allows exactly one active per `Poll`).
+    // Shared by both wake sources: the broadcast sink and the selective mailbox
+    // drain. A wake only unblocks the poll; the post-loop drains then run.
+    let worker_waker = Arc::new(mio::Waker::new(poll.registry(), WORKER_WAKER)?);
+
     // Per-core sharded broadcast plumbing (SP9). Take the wiring out of `cfg`
-    // (the `Receiver` is not `Sync`, so it can't stay borrowed); build this
-    // worker's own `Waker` on the reserved token and publish it into the sink
-    // slot so the publisher can nudge us to drain. `None` ⇒ no broadcast inbox
-    // (echo workers / single-worker parity harness): broadcasts route via the
-    // legacy mailbox path, drained by `drain_all_sessions` as before.
+    // (the `Receiver` is not `Sync`, so it can't stay borrowed); publish the shared
+    // worker `Waker` into the sink slot so the publisher can nudge us to drain.
+    // `None` ⇒ no broadcast inbox (echo workers / single-worker parity harness):
+    // broadcasts route via the legacy registry mailbox path, which now also wakes
+    // through `Mailbox::send` and is drained by `drain_dirty_sessions`.
     let broadcast = cfg.broadcast.take();
     let broadcast_rx = match &broadcast {
         Some(w) => {
-            let waker = Arc::new(mio::Waker::new(poll.registry(), BCAST_WAKER)?);
             // The slot is created with an empty `OnceLock`; this is its only set.
-            let _ = w.slot.waker.set(waker);
+            let _ = w.slot.waker.set(worker_waker.clone());
             Some(&w.rx)
         }
         None => None,
     };
     // The sink-shared saturation flag, cleared after each full broadcast drain.
     let saturated = broadcast.as_ref().map(|w| w.saturated.clone());
+
+    // Waker-driven SELECTIVE mailbox drain: a per-worker dirty-token channel.
+    // Every CROSS-connection delivery routes through `Mailbox::send`, which pushes
+    // the target connection's slab token onto `dirty_tx` and wakes `worker_waker`.
+    // We then drain ONLY those tokens' sessions — idle connections are never
+    // visited (O(dirty), not O(N)). On a dispatch worker the shared waker `Arc` +
+    // `dirty_tx` are cloned into each session's `ctx.mailbox_notify` at
+    // `establish_session`; echo workers never stamp one, so `dirty_rx` stays empty
+    // and the selective drain is a no-op `try_recv` each iteration.
+    let (dirty_tx, dirty_rx) = std::sync::mpsc::channel::<usize>();
+    let mailbox_waker = worker_waker;
+    // Reused dirty-token set: drained from `dirty_rx` each iteration and deduped
+    // (a connection may be marked dirty several times before we drain it).
+    let mut dirty_set: HashSet<usize> = HashSet::new();
 
     // SP10 per-worker byte budget + inflight accounting. `inflight_bytes` is this
     // worker's local (non-atomic) view of how many bytes are queued across all of
@@ -301,7 +341,8 @@ pub fn run(mut cfg: WorkerConfig, shutdown: Arc<AtomicBool>) -> std::io::Result<
     // connection still has buffered writes), poll non-blocking so cross-worker
     // mailbox deliveries drain promptly under load; when idle, block up to 50ms
     // (which also bounds how long `shutdown` goes unchecked) to avoid spinning.
-    // TODO(followup): Waker-based selective drain for low-latency idle cross-worker delivery.
+    // A cross-connection mailbox send no longer waits for this idle poll: it wakes
+    // the `MAILBOX_WAKER` and the selective drain delivers it on the next pass.
     let mut did_work = true;
     let dispatch = matches!(cfg.mode, Mode::Dispatch(_));
     // Total connections this worker has accepted — logged at shutdown so an
@@ -386,9 +427,11 @@ pub fn run(mut cfg: WorkerConfig, shutdown: Arc<AtomicBool>) -> std::io::Result<
                 LISTENER => {
                     accepted_total += accept_ready(&poll, &mut listener, &mut conns, &cfg, codel);
                 }
-                // The broadcast `Waker` only exists to unblock the poll so the
-                // post-loop drain runs promptly; no per-event work here.
-                BCAST_WAKER => {}
+                // The single worker `Waker` only exists to unblock the poll so the
+                // post-loop drains (broadcast + selective mailbox) run promptly; the
+                // dirty tokens / broadcast messages were already queued by the waker
+                // source (`Mailbox::send` / the sink). No per-event work here.
+                WORKER_WAKER => {}
                 token => {
                     let key = token.0;
                     // The connection may have been removed earlier in this same
@@ -413,7 +456,15 @@ pub fn run(mut cfg: WorkerConfig, shutdown: Arc<AtomicBool>) -> std::io::Result<
                         if liveness {
                             wheel.touch(key, now_ms);
                         }
-                        match handle_readable(&poll, &mut conns, key, &cfg, now_ns) {
+                        match handle_readable(
+                            &poll,
+                            &mut conns,
+                            key,
+                            &cfg,
+                            now_ns,
+                            &dirty_tx,
+                            &mailbox_waker,
+                        ) {
                             Action::Close => {
                                 remove(&poll, &mut conns, key, &mut local_subs, &mut sid_to_token, &mut wheel, &mut inflight_bytes);
                                 continue;
@@ -502,18 +553,23 @@ pub fn run(mut cfg: WorkerConfig, shutdown: Arc<AtomicBool>) -> std::io::Result<
             }
         }
 
-        // Draining every Open dispatch connection once per loop iteration is how
-        // a DIRECT send queued onto a connection's mailbox (subscription_succeeded,
-        // member rosters, send_to_user, terminate, …) — which had no readiness
-        // event of its own — is flushed without waiting for that peer to speak.
-        // (Channel broadcasts now go through `drain_broadcasts` above when a sink
-        // is wired; the legacy registry mailbox path still uses this drain.)
-        // `drain_all_sessions` reports whether it actually wrote anything so the
-        // adaptive timeout stays tight under load.
+        // SELECTIVE mailbox drain. A DIRECT send queued onto a connection's mailbox
+        // (subscription_succeeded, member rosters, send_to_user, terminate,
+        // notify_watchers, cluster follow-ups) had no readiness event of its own, so
+        // `Mailbox::send` pushed that connection's slab token onto `dirty_rx` and woke
+        // `MAILBOX_WAKER`. Drain `dirty_rx` into the reused (deduped) `dirty_set` and
+        // drain ONLY those connections' mailboxes; idle connections are never visited
+        // (O(dirty), not O(N)). When truly idle `dirty_rx` is empty, so this is O(1).
+        // (Channel broadcasts go through `drain_broadcasts` above when a sink is wired;
+        // the legacy registry mailbox path also routes through `Mailbox::send`, so its
+        // sends mark their targets dirty and are drained here too.) Returns whether it
+        // wrote anything so the adaptive poll stays tight under load.
         if dispatch
-            && drain_all_sessions(
+            && drain_dirty_sessions(
                 &poll,
                 &mut conns,
+                &dirty_rx,
+                &mut dirty_set,
                 &mut local_subs,
                 &mut sid_to_token,
                 &mut wheel,
@@ -673,22 +729,45 @@ fn accept_ready(
 }
 
 /// Handle a readable event: either advance the handshake or process frames.
+///
+/// `dirty_tx` + `mailbox_waker` are this worker's selective-drain notifier inputs;
+/// on handshake completion they are stamped (with this connection's slab `key` as
+/// the token) into the new session's `ctx.mailbox_notify`, so a later
+/// cross-connection `Mailbox::send` marks this connection dirty and wakes the worker.
+#[allow(clippy::too_many_arguments)]
 fn handle_readable(
     poll: &Poll,
     conns: &mut slab::Slab<Entry>,
     key: usize,
     cfg: &WorkerConfig,
     now_ns: u64,
+    dirty_tx: &std::sync::mpsc::Sender<usize>,
+    mailbox_waker: &Arc<mio::Waker>,
 ) -> Action {
     let entry = &mut conns[key];
     match entry.conn.state {
-        ConnState::Handshaking => handle_handshake(poll, entry, cfg, now_ns),
+        ConnState::Handshaking => {
+            handle_handshake(poll, entry, key, cfg, now_ns, dirty_tx, mailbox_waker)
+        }
         ConnState::Open | ConnState::Closing => handle_frames(poll, entry, cfg, now_ns),
     }
 }
 
 /// Accumulate request-head bytes and, once complete, complete the WS upgrade.
-fn handle_handshake(poll: &Poll, entry: &mut Entry, cfg: &WorkerConfig, now_ns: u64) -> Action {
+///
+/// `key` is this connection's slab token; `dirty_tx` + `mailbox_waker` are the
+/// worker's selective-drain notifier inputs, stamped (with `key`) into the new
+/// session's `ctx.mailbox_notify` so cross-connection sends wake the worker.
+#[allow(clippy::too_many_arguments)]
+fn handle_handshake(
+    poll: &Poll,
+    entry: &mut Entry,
+    key: usize,
+    cfg: &WorkerConfig,
+    now_ns: u64,
+    dirty_tx: &std::sync::mpsc::Sender<usize>,
+    mailbox_waker: &Arc<mio::Waker>,
+) -> Action {
     // Pull all available bytes into the head-accumulation buffer (`inbuf`).
     if drain_into(&mut entry.conn, &mut entry.inbuf) == ReadOutcome::Closed {
         return Action::Close;
@@ -711,7 +790,15 @@ fn handle_handshake(poll: &Poll, entry: &mut Entry, cfg: &WorkerConfig, now_ns: 
             // unsupported protocol 4007, over-capacity 4004) emit the `pusher:error`
             // frame + a WS Close carrying the error code.
             if let Mode::Dispatch(env) = &cfg.mode {
-                match establish_session(env, &path) {
+                // Stamp this connection's slab token + the worker's notifier inputs
+                // into the session so a cross-connection `Mailbox::send` marks this
+                // connection dirty and wakes the worker's selective drain.
+                let notify = MailboxNotify {
+                    token: key,
+                    dirty: dirty_tx.clone(),
+                    waker: mailbox_waker.clone(),
+                };
+                match establish_session(env, &path, notify) {
                     Ok(session) => {
                         let established = ServerEvent::ConnectionEstablished {
                             socket_id: session.ctx.socket_id.clone(),
@@ -767,7 +854,11 @@ struct Reject {
 /// rejection (unsupported protocol → 4007, unknown app → 4001, over capacity →
 /// 4004), carrying the `pusher:error` + the codec to encode it — so the caller
 /// emits the error frame then a WS Close.
-fn establish_session(env: &Arc<DispatchEnv>, path: &str) -> Result<Session, Reject> {
+fn establish_session(
+    env: &Arc<DispatchEnv>,
+    path: &str,
+    notify: MailboxNotify,
+) -> Result<Session, Reject> {
     use crate::protocol::error::PusherError;
     let (key, protocol) = parse_app_path(path);
 
@@ -821,6 +912,10 @@ fn establish_session(env: &Arc<DispatchEnv>, path: &str) -> Result<Session, Reje
         // edges to the bridge (so the handler suppresses its node-local emits);
         // the not-yet-clustered percore path keeps the node-local handler emits.
         clustered: env.clustered,
+        // The worker's selective-drain notifier (this connection's slab token +
+        // the dirty queue + the MAILBOX_WAKER). `ctx.handle()` builds a WAKING
+        // `Mailbox` from it, so cross-connection sends wake the worker.
+        mailbox_notify: Some(notify),
     };
 
     Ok(Session {
@@ -1083,31 +1178,59 @@ fn drain_session(poll: &Poll, entry: &mut Entry, now_ns: u64) -> DrainResult {
     }
 }
 
-/// Drain every Open dispatch connection's mailbox once. Connections that request
-/// a close (or whose write fails) are torn down. Called once per loop iteration
-/// so a broadcast queued onto a peer's mailbox is delivered even when that peer
-/// produced no readiness event of its own. Returns `true` if any connection
-/// actually wrote a queued event (used to keep the adaptive poll tight).
+/// Waker-driven SELECTIVE mailbox drain: visit ONLY the connections whose mailbox
+/// actually received a cross-connection send this round, instead of scanning every
+/// Open connection. `dirty_rx` carries the slab tokens that `Mailbox::send` pushed
+/// (one per cross-connection delivery); they are drained into the reused, deduped
+/// `dirty_set` (a connection marked dirty several times is drained once) and only
+/// those connections' mailboxes are drained. Idle connections are never visited —
+/// O(dirty), not O(N); when no dirty tokens are pending this is an O(1) empty
+/// `try_recv`.
+///
+/// A token whose slab entry is gone, closed, or not yet a session is skipped (a
+/// reused slab slot is harmless: `drain_session` only delivers that connection's
+/// own queued events and is idempotent, so no generation guard is needed).
+/// Connections that request a close (or whose write fails) are torn down. A
+/// `subscribed` change during the drain (a `SubscriptionError` — e.g. the bridge's
+/// cluster-wide presence-capacity reject) is reconciled into the worker-local
+/// delivery index, exactly as the old per-iteration scan did, but only for the
+/// dirty connection. Returns `true` if any connection actually wrote a queued
+/// event (keeps the adaptive poll tight).
 #[allow(clippy::too_many_arguments)]
-fn drain_all_sessions(
+fn drain_dirty_sessions(
     poll: &Poll,
     conns: &mut slab::Slab<Entry>,
+    dirty_rx: &std::sync::mpsc::Receiver<usize>,
+    dirty_set: &mut HashSet<usize>,
     local_subs: &mut HashMap<(String, String), HashSet<SocketId>>,
     sid_to_token: &mut HashMap<SocketId, usize>,
     wheel: &mut TimerWheel,
     inflight_bytes: &mut u64,
     now_ns: u64,
 ) -> bool {
-    let keys: Vec<usize> = conns
-        .iter()
-        .filter(|(_, e)| e.session.is_some() && e.conn.state == ConnState::Open)
-        .map(|(k, _)| k)
-        .collect();
+    // Drain the dirty-token queue into the reused set (dedup). Cheap + O(1) when
+    // empty (the idle case). The set is cleared at the end so it never grows
+    // unbounded across iterations.
+    dirty_set.clear();
+    while let Ok(tok) = dirty_rx.try_recv() {
+        dirty_set.insert(tok);
+    }
+    if dirty_set.is_empty() {
+        return false;
+    }
+
     let mut wrote_any = false;
-    for key in keys {
-        if !conns.contains(key) {
-            continue;
+    for &key in dirty_set.iter() {
+        // The token may be stale: the connection closed since it was marked dirty,
+        // or its slab slot is vacant/recycled. Skip anything that isn't an Open
+        // session — draining a recycled slot would be a no-op anyway, but skipping
+        // avoids touching an unrelated connection.
+        match conns.get(key) {
+            Some(e) if e.session.is_some() && e.conn.state == ConnState::Open => {}
+            _ => continue,
         }
+        #[cfg(any(test, feature = "test-hooks"))]
+        SELECTIVE_DRAIN_VISITS.fetch_add(1, Ordering::Relaxed);
         let result = drain_session(poll, &mut conns[key], now_ns);
         wrote_any |= result.wrote;
         // INCREMENTAL INFLIGHT: `drain_session` queued mailbox events and flushed;
@@ -1123,7 +1246,7 @@ fn drain_all_sessions(
         // removed a channel — e.g. the bridge's cluster-wide presence-capacity reject)
         // must propagate to the worker-local delivery index so the rejected connection
         // stops receiving that channel's broadcasts. Gated on an actual change so the
-        // idle path stays O(visited), not O(N-channels) per connection: only the rare
+        // path stays O(visited), not O(N-channels) per connection: only the rare
         // rejected connection pays the two-set-diff reconcile.
         if result.subs_changed {
             if let Some(entry) = conns.get_mut(key) {
@@ -1133,6 +1256,7 @@ fn drain_all_sessions(
             }
         }
     }
+    dirty_set.clear();
     wrote_any
 }
 

@@ -9,7 +9,6 @@ use crate::protocol::socket_id::SocketId;
 use rayon::prelude::*;
 use serde_json::Value;
 use std::collections::HashMap;
-use tokio::sync::mpsc::UnboundedSender;
 
 /// Above this subscriber count, `broadcast` fans the per-mailbox enqueue out
 /// across the rayon pool; at or below it the serial loop is cheaper than the
@@ -172,19 +171,20 @@ impl ChannelState {
             }
             return;
         }
-        let targets: Vec<&UnboundedSender<ServerEvent>> = self
+        let targets: Vec<&crate::connection::handle::Mailbox> = self
             .subscribers
             .iter()
             .filter(|(sid, _)| Some(*sid) != except)
             .map(|(_, sub)| &sub.handle.mailbox)
             .collect();
         // Chunk the fan-out so each rayon job does a meaningful batch of sends
-        // (a single `UnboundedSender::send` is ~tens of ns; per-element rayon
-        // dispatch would otherwise dominate). The frame `Arc` is cloned once per
-        // batch closure entry and once per send.
+        // (a single `Mailbox::send` is ~tens of ns; per-element rayon dispatch
+        // would otherwise dominate). The frame `Arc` is cloned once per batch
+        // closure entry and once per send. Each `send` also marks its target dirty
+        // + wakes that connection's worker (when the mailbox is wired).
         targets.par_chunks(SEND_CHUNK).for_each(|chunk| {
-            for tx in chunk {
-                let _ = tx.send(ServerEvent::Raw(frame.clone()));
+            for mb in chunk {
+                let _ = mb.send(ServerEvent::Raw(frame.clone()));
             }
         });
     }
@@ -199,7 +199,7 @@ mod tests {
         let (tx, _rx) = mpsc::unbounded_channel();
         ConnectionHandle {
             socket_id: SocketId::generate(),
-            mailbox: tx,
+            mailbox: crate::connection::handle::Mailbox::new(tx, None),
         }
     }
 
@@ -208,7 +208,7 @@ mod tests {
         (
             ConnectionHandle {
                 socket_id: SocketId::generate(),
-                mailbox: tx,
+                mailbox: crate::connection::handle::Mailbox::new(tx, None),
             },
             rx,
         )
