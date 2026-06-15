@@ -67,6 +67,58 @@ pub enum ConnError {
     Protocol(&'static str),
 }
 
+/// CoDel time-in-queue freshness parameters (SP10 §7). folly's controlled-delay
+/// rule applied on **dequeue**: track the minimum sojourn (time-in-queue) over
+/// each `interval`; if that interval-minimum stays above `target`, the queue is
+/// "overloaded" and we drop any frame whose sojourn exceeds `2 × target` instead
+/// of sending stale data. A `target_ns` of `0` disables CoDel entirely (pure
+/// drop-head behaviour — every queued frame is sent regardless of age).
+#[derive(Debug, Clone, Copy)]
+pub struct CodelParams {
+    /// Acceptable standing sojourn (ns). folly default 5 ms. `0` disables CoDel.
+    pub target_ns: u64,
+    /// Window (ns) over which the minimum sojourn is tracked. folly default 100 ms.
+    pub interval_ns: u64,
+}
+
+impl CodelParams {
+    /// folly defaults: 5 ms target, 100 ms interval.
+    pub const DEFAULT: CodelParams = CodelParams {
+        target_ns: 5_000_000,
+        interval_ns: 100_000_000,
+    };
+
+    /// A disabled CoDel overlay (`target_ns == 0`): [`Connection::flush`] skips
+    /// the sojourn check entirely, so behaviour is pure drop-head.
+    pub const DISABLED: CodelParams = CodelParams {
+        target_ns: 0,
+        interval_ns: 100_000_000,
+    };
+
+    /// Whether the CoDel overlay is active (a non-zero target).
+    fn enabled(&self) -> bool {
+        self.target_ns != 0
+    }
+}
+
+/// Per-connection CoDel control state (folly's algorithm). Tracks the minimum
+/// sojourn seen so far in the current interval and whether the queue is currently
+/// in the "overloaded" regime in which stale frames are dropped on dequeue.
+#[derive(Debug, Clone, Copy, Default)]
+struct CodelState {
+    /// Minimum sojourn (ns) observed so far in the current interval; `None`
+    /// before the first dequeue of an interval.
+    interval_min: Option<u64>,
+    /// Monotonic time (ns) at which the current interval ends; `0` before the
+    /// first dequeue ever (the first dequeue opens the first interval).
+    interval_end: u64,
+    /// Whether the queue is currently overloaded — set when an interval closes
+    /// with `interval_min > target`, cleared when one closes with
+    /// `interval_min <= target`. While `true`, frames with `sojourn > 2*target`
+    /// are dropped on dequeue.
+    overloaded: bool,
+}
+
 /// A single non-blocking WebSocket connection.
 pub struct Connection {
     /// The non-blocking client socket. `pub` so the worker can register it with
@@ -75,23 +127,34 @@ pub struct Connection {
     /// Current lifecycle state.
     pub state: ConnState,
     /// Pending outbound frames (pre-encoded bytes, shared via `Arc` for
-    /// encode-once fan-out). The front element is the one currently being
-    /// written, possibly partially (see `out_cursor`).
-    out: VecDeque<Arc<[u8]>>,
+    /// encode-once fan-out) paired with the monotonic enqueue time (ns since the
+    /// owning worker's epoch) used for CoDel sojourn computation on dequeue. The
+    /// front element is the one currently being written, possibly partially (see
+    /// `out_cursor`).
+    out: VecDeque<(Arc<[u8]>, u64)>,
     /// Byte offset into `out.front()` already written (partial-write resume
     /// point).
     out_cursor: usize,
     /// Total bytes still queued across all of `out` (drives the high-water
-    /// backpressure check without walking the deque).
+    /// backpressure check without walking the deque). Counts only the `Arc`
+    /// payload lengths, never the per-frame timestamp.
     out_bytes: usize,
     /// Backpressure threshold: if queuing a frame would push `out_bytes` over
     /// this, the frame is rejected and the caller closes.
     high_water: usize,
+    /// CoDel freshness parameters (target / interval). `target_ns == 0` disables.
+    codel: CodelParams,
+    /// CoDel control state (interval minimum sojourn + overloaded flag).
+    codel_state: CodelState,
+    /// Count of frames dropped by CoDel on dequeue for being stale (sojourn
+    /// `> 2 * target` while overloaded). Distinct from drop-head evictions.
+    codel_dropped: u64,
 }
 
 impl Connection {
     /// Wrap a freshly-accepted non-blocking socket. Starts in
-    /// [`ConnState::Handshaking`] with empty queues.
+    /// [`ConnState::Handshaking`] with empty queues and CoDel disabled (the
+    /// worker sets real parameters via [`Connection::set_codel`]).
     pub fn new(stream: mio::net::TcpStream, high_water: usize) -> Self {
         Connection {
             stream,
@@ -100,7 +163,23 @@ impl Connection {
             out_cursor: 0,
             out_bytes: 0,
             high_water,
+            codel: CodelParams::DISABLED,
+            codel_state: CodelState::default(),
+            codel_dropped: 0,
         }
+    }
+
+    /// Install this connection's CoDel freshness parameters. Called once by the
+    /// worker right after accept so every connection inherits the worker's
+    /// (config-derived) target/interval. `target_ns == 0` leaves CoDel disabled.
+    pub fn set_codel(&mut self, codel: CodelParams) {
+        self.codel = codel;
+    }
+
+    /// Total frames this connection has dropped on dequeue for staleness (CoDel).
+    /// Read by the worker to fold into its codel-dropped counter.
+    pub fn codel_dropped(&self) -> u64 {
+        self.codel_dropped
     }
 
     /// Consume the connection and return ownership of its underlying socket.
@@ -135,7 +214,11 @@ impl Connection {
     ///
     /// Returns the number of frames dropped. The appended frame still needs a
     /// [`flush`](Self::flush) (or a writable event) to actually go out.
-    pub fn queue(&mut self, frame: Arc<[u8]>) -> usize {
+    ///
+    /// `now_ns` is the monotonic enqueue time (ns since the worker's epoch),
+    /// stamped onto the frame so [`flush`](Self::flush) can compute its sojourn
+    /// (time-in-queue) for the CoDel freshness check on dequeue.
+    pub fn queue(&mut self, frame: Arc<[u8]>, now_ns: u64) -> usize {
         let flen = frame.len();
         let mut dropped = 0;
         // The frame currently mid-write (front when out_cursor>0) is "locked"; the
@@ -143,12 +226,12 @@ impl Connection {
         let locked = if self.out_cursor > 0 { 1 } else { 0 };
         while self.out_bytes + flen > self.high_water && self.out.len() > locked {
             // Remove the oldest droppable frame.
-            let victim = self.out.remove(locked).expect("len checked");
+            let (victim, _ts) = self.out.remove(locked).expect("len checked");
             self.out_bytes -= victim.len();
             dropped += 1;
         }
         self.out_bytes += flen;
-        self.out.push_back(frame);
+        self.out.push_back((frame, now_ns));
         dropped
     }
 
@@ -164,8 +247,20 @@ impl Connection {
     ///   writable interest.
     /// * [`WriteStatus::Closed`] — write error or a zero-length write (peer
     ///   gone); close.
-    pub fn flush(&mut self) -> WriteStatus {
-        while let Some(front) = self.out.front() {
+    ///
+    /// `now_ns` is the monotonic dequeue time (ns since the worker's epoch). With
+    /// CoDel enabled (`target_ns != 0`), each frame's sojourn (`now_ns -
+    /// enqueue_ns`) is checked before it is written: see [`codel_dequeue`].
+    pub fn flush(&mut self, now_ns: u64) -> WriteStatus {
+        loop {
+            // CoDel: before sending the front frame, drop any leading frame that
+            // is too stale to be worth sending (skips the mid-write front). When
+            // this returns, the front is either fresh-enough to send or the queue
+            // is empty.
+            self.codel_dequeue(now_ns);
+            let Some((front, _ts)) = self.out.front() else {
+                break;
+            };
             let buf = &front[self.out_cursor..];
             match self.stream.write(buf) {
                 Ok(0) => {
@@ -195,6 +290,109 @@ impl Connection {
             }
         }
         WriteStatus::Drained
+    }
+
+    /// CoDel freshness check, run on **dequeue** before writing the front frame
+    /// (folly's controlled-delay algorithm).
+    ///
+    /// For each candidate front frame, computes its sojourn (`now_ns -
+    /// enqueue_ns`) and folds it into the running per-interval minimum. When an
+    /// interval (`interval_ns`) closes, the queue enters/leaves the "overloaded"
+    /// regime based on whether that interval's minimum sojourn exceeded `target`.
+    /// While overloaded, any front frame whose sojourn exceeds `2 * target` is
+    /// **dropped** (popped, `out_bytes` decremented, the codel-dropped counter
+    /// bumped) rather than written — so cores always send *fresh* data. Stops at
+    /// the first frame that is kept (or when the queue empties).
+    ///
+    /// Never drops the mid-write front (`out_cursor > 0`): those bytes are already
+    /// partly on the wire, and splicing them out would corrupt the peer's stream.
+    /// A `target_ns` of `0` disables the overlay entirely (pure drop-head).
+    fn codel_dequeue(&mut self, now_ns: u64) {
+        if !self.codel.enabled() {
+            return;
+        }
+        let two_target = self.codel.target_ns.saturating_mul(2);
+        loop {
+            let Some(&(_, enqueue_ns)) = self.out.front() else {
+                // Empty queue: no item is standing in line. Do NOT fold a sample
+                // (folly's algorithm samples real dequeues only), but let the
+                // overloaded flag age out if the interval has since closed with no
+                // sample — a backlog that fully drained is, by definition, fresh.
+                self.codel_age_empty(now_ns);
+                return;
+            };
+            let sojourn = now_ns.saturating_sub(enqueue_ns);
+            // Fold this real dequeue's sojourn into the interval minimum and (when
+            // the window closes) update the overloaded flag.
+            self.codel_note_interval(now_ns, sojourn);
+
+            // The mid-write front is locked: it is already partly on the wire and
+            // must be sent to completion, stale or not.
+            if self.out_cursor > 0 {
+                return;
+            }
+            // FRESHEST-WINS invariant: never CoDel-drop the LAST remaining frame.
+            // When a slow consumer's whole backlog is stale, CoDel skips straight
+            // past the old frames to the NEWEST one — maximally fresh — but the
+            // newest itself is always kept and sent. So even a fully-stale queue
+            // still delivers its freshest frame, exactly like drop-head's
+            // freshest-wins (drop-head evicts the oldest; CoDel here drops stale
+            // leading frames, but both always preserve the newest).
+            if self.codel_state.overloaded && sojourn > two_target && self.out.len() > 1 {
+                // Stale frame (and not the last one) in the overloaded regime:
+                // drop it and look at the next one (which may also be stale).
+                let (victim, _ts) = self.out.pop_front().expect("front checked");
+                self.out_bytes -= victim.len();
+                self.codel_dropped += 1;
+                continue;
+            }
+            // Fresh enough, not overloaded, or the last remaining (freshest) frame:
+            // keep it; flush writes it.
+            return;
+        }
+    }
+
+    /// Fold one real-dequeue sojourn sample into the current CoDel interval,
+    /// advancing the overloaded flag when the interval window closes. `sojourn`
+    /// is the candidate frame's time-in-queue.
+    fn codel_note_interval(&mut self, now_ns: u64, sojourn: u64) {
+        let interval = self.codel.interval_ns;
+        let target = self.codel.target_ns;
+        let st = &mut self.codel_state;
+        if st.interval_end == 0 {
+            // First sample ever: open the first interval window.
+            st.interval_end = now_ns.saturating_add(interval);
+        }
+        // Track the minimum sojourn seen this interval.
+        st.interval_min = Some(match st.interval_min {
+            Some(m) => m.min(sojourn),
+            None => sojourn,
+        });
+        // Window closed: decide overloaded from the interval minimum, then reset
+        // for the next window. Carry this very sample into the fresh interval so a
+        // window that closes never starts the next one empty.
+        if now_ns >= st.interval_end {
+            let min = st.interval_min.unwrap_or(sojourn);
+            st.overloaded = min > target;
+            st.interval_min = Some(sojourn);
+            st.interval_end = now_ns.saturating_add(interval);
+        }
+    }
+
+    /// Age the overloaded flag when the queue is empty. A queue that has fully
+    /// drained holds no stale frames, so once the current interval window has
+    /// elapsed with the queue empty, the overloaded regime is cleared. Does not
+    /// fold a (spuriously low) sojourn sample into a window that still has queued
+    /// frames being tracked.
+    fn codel_age_empty(&mut self, now_ns: u64) {
+        let st = &mut self.codel_state;
+        if st.interval_end != 0 && now_ns >= st.interval_end {
+            // The window elapsed and the queue is empty: nothing was backed up, so
+            // clear overload and re-arm the window.
+            st.overloaded = false;
+            st.interval_min = None;
+            st.interval_end = now_ns.saturating_add(self.codel.interval_ns);
+        }
     }
 
     /// Read whatever the socket has available and parse every complete frame.
@@ -299,20 +497,30 @@ impl Connection {
     /// First byte of the front (oldest) queued frame.
     #[cfg(test)]
     pub fn peek_front_byte(&self) -> u8 {
-        self.out.front().map(|f| f[0]).unwrap()
+        self.out.front().map(|f| f.0[0]).unwrap()
     }
 
     /// First byte of the back (newest) queued frame.
     #[cfg(test)]
     pub fn peek_back_byte(&self) -> u8 {
-        self.out.back().map(|f| f[0]).unwrap()
+        self.out.back().map(|f| f.0[0]).unwrap()
     }
 
     /// Whether the front frame is the 4 MB "huge" frame the drop-head test
     /// enqueues first (identified by its length), i.e. index 0 is untouched.
     #[cfg(test)]
     pub fn front_is_the_huge_frame(&self) -> bool {
-        self.out.front().map(|f| f.len() == 4_000_000).unwrap_or(false)
+        self.out
+            .front()
+            .map(|f| f.0.len() == 4_000_000)
+            .unwrap_or(false)
+    }
+
+    /// Whether the CoDel overlay is currently in the overloaded (stale-dropping)
+    /// regime. Exposed for the CoDel timeline unit tests.
+    #[cfg(test)]
+    pub fn is_overloaded(&self) -> bool {
+        self.codel_state.overloaded
     }
 }
 
@@ -386,12 +594,12 @@ mod tests {
         expected.extend_from_slice(&f2);
         expected.extend_from_slice(&f3);
 
-        assert_eq!(conn.queue(f1), 0);
-        assert_eq!(conn.queue(f2), 0);
-        assert_eq!(conn.queue(f3), 0);
+        assert_eq!(conn.queue(f1, 0), 0);
+        assert_eq!(conn.queue(f2, 0), 0);
+        assert_eq!(conn.queue(f3, 0), 0);
         assert!(conn.has_pending_writes());
 
-        assert_eq!(conn.flush(), WriteStatus::Drained);
+        assert_eq!(conn.flush(0), WriteStatus::Drained);
         assert!(!conn.has_pending_writes());
         assert_eq!(conn.out_bytes, 0);
 
@@ -421,10 +629,10 @@ mod tests {
         let total = frame_bytes.len();
 
         let mut conn = Connection::new(server, total + 1);
-        assert_eq!(conn.queue(Arc::clone(&frame_bytes)), 0);
+        assert_eq!(conn.queue(Arc::clone(&frame_bytes), 0), 0);
 
         // First flush: the kernel send buffer fills and we stop partway.
-        assert_eq!(conn.flush(), WriteStatus::WouldBlock);
+        assert_eq!(conn.flush(0), WriteStatus::WouldBlock);
         assert!(conn.has_pending_writes());
         let cursor_after_first = conn.out_cursor;
         assert!(
@@ -453,7 +661,7 @@ mod tests {
                     Err(e) => panic!("peer read failed: {e}"),
                 }
             }
-            match conn.flush() {
+            match conn.flush(0) {
                 WriteStatus::Drained => drained = true,
                 WriteStatus::WouldBlock => {
                     if conn.out_cursor > last_cursor {
@@ -503,9 +711,9 @@ mod tests {
         let f = |n: u8| -> std::sync::Arc<[u8]> {
             std::sync::Arc::from(vec![n; 40].into_boxed_slice())
         };
-        assert_eq!(c.queue(f(1)), 0); // returns dropped count = 0
-        assert_eq!(c.queue(f(2)), 0); // out_bytes = 80
-        let dropped = c.queue(f(3)); // 120 > 100 → drop oldest (f(1)) → out = [f2,f3], 80 bytes
+        assert_eq!(c.queue(f(1), 0), 0); // returns dropped count = 0
+        assert_eq!(c.queue(f(2), 0), 0); // out_bytes = 80
+        let dropped = c.queue(f(3), 0); // 120 > 100 → drop oldest (f(1)) → out = [f2,f3], 80 bytes
         assert_eq!(dropped, 1);
         assert_eq!(c.out_bytes(), 80);
         assert_eq!(c.queued_len(), 2);
@@ -518,14 +726,15 @@ mod tests {
     fn drop_head_never_evicts_the_partially_written_front() {
         let (mio_s, peer) = pair_tiny_sndbuf(); // tiny SO_SNDBUF so flush leaves a partial front
         let mut c = Connection::new(mio_s, 100);
-        c.queue(std::sync::Arc::from(
-            vec![1u8; 4_000_000].into_boxed_slice(),
-        )); // huge → partial write
-        let _ = c.flush(); // out_cursor now > 0 on front
+        c.queue(
+            std::sync::Arc::from(vec![1u8; 4_000_000].into_boxed_slice()),
+            0,
+        ); // huge → partial write
+        let _ = c.flush(0); // out_cursor now > 0 on front
         assert!(c.out_cursor() > 0);
         // queue more small frames past the cap; the mid-write front MUST survive (peer would corrupt otherwise)
         for n in 0..50u8 {
-            let _ = c.queue(std::sync::Arc::from(vec![n; 40].into_boxed_slice()));
+            let _ = c.queue(std::sync::Arc::from(vec![n; 40].into_boxed_slice()), 0);
         }
         assert!(c.out_cursor() > 0, "front still mid-write");
         assert!(c.front_is_the_huge_frame()); // i.e. index 0 is untouched
@@ -533,6 +742,163 @@ mod tests {
         // turn the partial write into a Closed status.
         let _ = peer.peer_addr();
         drop(peer);
+    }
+
+    // ---- CoDel time-in-queue freshness drop (SP10 §7) -------------------------
+
+    // folly defaults used by the deterministic timeline below.
+    const TARGET_NS: u64 = 5_000_000; // 5 ms
+    const INTERVAL_NS: u64 = 100_000_000; // 100 ms
+
+    /// A small frame (10 bytes) tagged by its first byte so we can identify which
+    /// frames the peer received. Small enough that every `flush` write succeeds
+    /// outright (no partial writes), keeping the CoDel timeline deterministic.
+    fn small(tag: u8) -> Arc<[u8]> {
+        Arc::from(vec![tag; 10].into_boxed_slice())
+    }
+
+    /// Drain every byte currently readable on the non-blocking peer, recording the
+    /// first byte (tag) of each 10-byte frame received.
+    fn drain_tags(peer: &mut StdTcpStream, into: &mut Vec<u8>) {
+        let mut chunk = [0u8; 4096];
+        loop {
+            match peer.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(n) => {
+                    // Frames are a fixed 10 bytes; record each frame's tag byte.
+                    let mut i = 0;
+                    while i < n {
+                        into.push(chunk[i]);
+                        i += 10;
+                    }
+                }
+                Err(ref e) if e.kind() == ErrorKind::WouldBlock => break,
+                Err(e) => panic!("peer read failed: {e}"),
+            }
+        }
+    }
+
+    /// (a) Frames whose sojourn stays under `target` are ALL sent — CoDel never
+    /// drops a fresh consumer's frames.
+    #[test]
+    fn codel_sends_all_fresh_frames() {
+        let (server, mut peer) = pair();
+        peer.set_nonblocking(true).unwrap();
+        let mut c = Connection::new(server, 1 << 20);
+        c.set_codel(CodelParams {
+            target_ns: TARGET_NS,
+            interval_ns: INTERVAL_NS,
+        });
+
+        let mut got = Vec::new();
+        // Enqueue and flush 200 frames, each with sojourn = 1 ms (< target). Span
+        // several interval boundaries (now climbs to ~600 ms): the interval
+        // minimum is always 1 ms ≤ target, so `overloaded` never sets and nothing
+        // drops.
+        for k in 0..200u8 {
+            let now = (k as u64) * 3_000_000; // 3 ms apart → ~600 ms total
+            let enqueue = now.saturating_sub(1_000_000); // sojourn = 1 ms
+            assert_eq!(c.queue(small(k), enqueue), 0);
+            assert_eq!(c.flush(now), WriteStatus::Drained);
+            drain_tags(&mut peer, &mut got);
+        }
+
+        assert_eq!(c.codel_dropped(), 0, "no fresh frame should be dropped");
+        assert_eq!(got.len(), 200, "every fresh frame was delivered");
+        assert_eq!(got, (0..200u8).collect::<Vec<_>>());
+    }
+
+    /// (b)+(c) Once the per-interval minimum sojourn exceeds `target`, the queue
+    /// enters the overloaded regime and drops frames whose sojourn > 2×target on
+    /// dequeue; when latency recovers below `target`, dropping stops and frames
+    /// flow again.
+    #[test]
+    fn codel_drops_stale_when_overloaded_then_recovers() {
+        let (server, mut peer) = pair();
+        peer.set_nonblocking(true).unwrap();
+        let mut c = Connection::new(server, 1 << 20);
+        c.set_codel(CodelParams {
+            target_ns: TARGET_NS,
+            interval_ns: INTERVAL_NS,
+        });
+        let mut got = Vec::new();
+
+        // ── Phase 1: drive one full interval with every sojourn = 6 ms (> target
+        // 5 ms but < 2×target 10 ms, so these are SENT, not dropped). This makes
+        // the interval minimum 6 ms; crossing the interval boundary flips the
+        // queue into the overloaded regime. tag bytes 0..=20.
+        for k in 0..=20u8 {
+            let now = (k as u64 + 1) * 6_000_000; // 6,12,…,126 ms → spans 100 ms
+            let enqueue = now - 6_000_000; // sojourn = 6 ms for every frame
+            assert_eq!(c.queue(small(k), enqueue), 0);
+            assert_eq!(c.flush(now), WriteStatus::Drained);
+            drain_tags(&mut peer, &mut got);
+        }
+        // All 6-ms-sojourn frames were sent (sojourn < 2×target); none dropped yet.
+        assert_eq!(c.codel_dropped(), 0);
+        assert_eq!(got.len(), 21);
+        assert!(c.is_overloaded(), "interval min 6 ms > target ⇒ overloaded");
+
+        // ── Phase 2: now overloaded. Enqueue TWO stale frames (sojourn 12 ms >
+        // 2×target 10 ms): tag 98 (older) then tag 99 (newest). On dequeue the
+        // OLDER one is DROPPED (counter up, its bytes reclaimed) but the NEWEST is
+        // KEPT and sent — CoDel never drops the last/freshest frame, so
+        // freshest-wins still holds even when the whole backlog is stale.
+        let now = 200_000_000; // 200 ms (within the next interval)
+        let before_dropped = c.codel_dropped();
+        let before_got = got.len();
+        c.queue(small(98), now - 13_000_000); // older stale frame, sojourn 13 ms
+        c.queue(small(99), now - 12_000_000); // newest stale frame, sojourn 12 ms
+        assert_eq!(c.out_bytes(), 20);
+        assert_eq!(c.flush(now), WriteStatus::Drained);
+        drain_tags(&mut peer, &mut got);
+        assert_eq!(c.codel_dropped(), before_dropped + 1, "older stale frame dropped");
+        assert_eq!(c.out_bytes(), 0, "queue fully drained (one dropped, one sent)");
+        assert_eq!(got.len(), before_got + 1, "the freshest frame still reached peer");
+        assert_eq!(*got.last().unwrap(), 99, "freshest-wins: newest frame delivered");
+
+        // ── Phase 3: latency recovers. Drive a full interval with sojourn = 1 ms
+        // (< target). The interval minimum is now 1 ms ≤ target, so crossing the
+        // boundary clears `overloaded`; a subsequent stale frame is no longer
+        // dropped — it flows. tag bytes 100..=130 (1 ms sojourn, sent).
+        let base = 300_000_000u64; // 300 ms
+        for k in 0..=30u8 {
+            let now = base + (k as u64) * 5_000_000; // 5 ms apart → spans 150 ms
+            let enqueue = now - 1_000_000; // sojourn 1 ms
+            c.queue(small(100 + k), enqueue);
+            assert_eq!(c.flush(now), WriteStatus::Drained);
+            drain_tags(&mut peer, &mut got);
+        }
+        assert!(!c.is_overloaded(), "interval min 1 ms ≤ target ⇒ recovered");
+        let recovered_sent = got.len();
+        assert_eq!(c.codel_dropped(), before_dropped + 1, "no new drops once fresh");
+
+        // A frame that WOULD have been dropped while overloaded (sojourn 12 ms) is
+        // now sent, because the queue recovered.
+        let now = 500_000_000;
+        c.queue(small(200), now - 12_000_000);
+        assert_eq!(c.flush(now), WriteStatus::Drained);
+        drain_tags(&mut peer, &mut got);
+        assert_eq!(c.codel_dropped(), before_dropped + 1, "recovered ⇒ no drop");
+        assert_eq!(got.len(), recovered_sent + 1, "the once-stale frame flowed");
+        assert_eq!(*got.last().unwrap(), 200);
+    }
+
+    /// `target_ns == 0` disables CoDel: even a wildly stale frame is sent (pure
+    /// drop-head behaviour, the Phase-1/2 invariant).
+    #[test]
+    fn codel_disabled_sends_even_stale_frames() {
+        let (server, mut peer) = pair();
+        peer.set_nonblocking(true).unwrap();
+        let mut c = Connection::new(server, 1 << 20); // CoDel disabled by default
+        let mut got = Vec::new();
+
+        // A frame 1 full second stale, flushed with CoDel off → still sent.
+        c.queue(small(7), 0);
+        assert_eq!(c.flush(1_000_000_000), WriteStatus::Drained);
+        drain_tags(&mut peer, &mut got);
+        assert_eq!(c.codel_dropped(), 0);
+        assert_eq!(got, vec![7]);
     }
 
     // ---- read_frames parses a masked client frame ----------------------------

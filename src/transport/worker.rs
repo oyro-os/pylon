@@ -55,9 +55,9 @@ use mio::net::TcpListener;
 use mio::{Events, Interest, Poll, Token};
 use std::collections::{HashMap, HashSet};
 use std::io::{ErrorKind, Read};
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 
 /// Reserved token for the listener. Slab keys grow from 0, so the maximum
@@ -117,6 +117,14 @@ pub struct WorkerConfig {
     /// `percore_total_inflight_bytes()` test hook can sum across workers. `None`
     /// for echo/test workers without budget accounting.
     pub inflight_slot: Option<Arc<AtomicU64>>,
+    /// SP10 §7: CoDel time-in-queue freshness parameters, stamped onto every
+    /// connection at accept. `target_ns == 0` disables CoDel (pure drop-head).
+    pub codel: crate::transport::conn::CodelParams,
+    /// SP10 §8: shared PSI budget factor (fixed-point ×1000, 1000 = full budget).
+    /// A control-plane loop shrinks it under real memory pressure; the worker reads
+    /// it (relaxed) when computing its effective shed budget — never reads PSI
+    /// inline. `None` ⇒ no backstop (factor pinned at 1.0).
+    pub budget_factor: Option<Arc<AtomicU32>>,
     /// Per-core SHARDED broadcast wiring (SP9). `Some` for percore dispatch
     /// workers: the inbound side of this worker's broadcast inbox (paired with
     /// the `Sender` held in the sink) plus the slot whose `waker` `OnceLock` this
@@ -240,6 +248,10 @@ pub fn run(mut cfg: WorkerConfig, shutdown: Arc<AtomicBool>) -> std::io::Result<
     // bytes()` test hook, and drives the graduated shed on the broadcast drain.
     let per_worker_budget = cfg.per_worker_budget;
     let inflight_slot = cfg.inflight_slot.clone();
+    // SP10 §8: shared PSI budget factor (×1000 fixed-point). `None` ⇒ no backstop.
+    let budget_factor = cfg.budget_factor.clone();
+    // SP10 §7: CoDel parameters stamped onto every accepted connection.
+    let codel = cfg.codel;
     // Reassigned (to the exact sum of all connections' queued bytes) at the top of
     // every loop iteration before any read; declared here for loop-outer scope.
     let mut inflight_bytes: u64;
@@ -266,6 +278,12 @@ pub fn run(mut cfg: WorkerConfig, shutdown: Arc<AtomicBool>) -> std::io::Result<
     // Total connections this worker has accepted — logged at shutdown so an
     // operator can confirm SO_REUSEPORT spread accepts across cores.
     let mut accepted_total: u64 = 0;
+
+    // SP10 §7: monotonic epoch for CoDel per-frame enqueue timestamps. A single
+    // `now_ns` is computed at the top of each loop iteration and threaded into
+    // every `queue`/`flush`, so a frame's sojourn is the real wall-clock time it
+    // spent queued ACROSS iterations (enqueue in iter N, flush in iter N+k).
+    let worker_epoch = Instant::now();
 
     loop {
         if shutdown.load(Ordering::SeqCst) {
@@ -299,6 +317,23 @@ pub fn run(mut cfg: WorkerConfig, shutdown: Arc<AtomicBool>) -> std::io::Result<
             return Err(e);
         }
 
+        // SP10 §7: this iteration's monotonic timestamp (ns since the worker
+        // epoch), threaded into every `queue`/`flush` so CoDel measures real
+        // time-in-queue across iterations. Computed once per iteration (cheap;
+        // off the per-frame inner loop).
+        let now_ns = worker_epoch.elapsed().as_nanos() as u64;
+
+        // SP10 §8: this worker's effective byte budget = per_worker_budget scaled
+        // by the shared PSI factor (×1000 fixed-point; 1000 = full). Read once per
+        // iteration (relaxed); the hot path never reads PSI itself.
+        let effective_budget = match &budget_factor {
+            Some(f) => {
+                let factor = f.load(Ordering::Relaxed) as u64;
+                per_worker_budget.saturating_mul(factor) / 1000
+            }
+            None => per_worker_budget,
+        };
+
         // Track whether this iteration accomplished anything worth a tight
         // re-poll: any readiness event, or a non-empty cross-worker drain below.
         let mut work = !events.is_empty();
@@ -306,7 +341,7 @@ pub fn run(mut cfg: WorkerConfig, shutdown: Arc<AtomicBool>) -> std::io::Result<
         for event in events.iter() {
             match event.token() {
                 LISTENER => {
-                    accepted_total += accept_ready(&poll, &mut listener, &mut conns, &cfg);
+                    accepted_total += accept_ready(&poll, &mut listener, &mut conns, &cfg, codel);
                 }
                 // The broadcast `Waker` only exists to unblock the poll so the
                 // post-loop drain runs promptly; no per-event work here.
@@ -327,7 +362,7 @@ pub fn run(mut cfg: WorkerConfig, shutdown: Arc<AtomicBool>) -> std::io::Result<
                     }
 
                     if event.is_readable() {
-                        match handle_readable(&poll, &mut conns, key, &cfg) {
+                        match handle_readable(&poll, &mut conns, key, &cfg, now_ns) {
                             Action::Close => {
                                 remove(&poll, &mut conns, key, &mut local_subs, &mut sid_to_token);
                                 continue;
@@ -357,7 +392,7 @@ pub fn run(mut cfg: WorkerConfig, shutdown: Arc<AtomicBool>) -> std::io::Result<
 
                     if event.is_writable()
                         && conns.contains(key)
-                        && handle_writable(&poll, &mut conns, key) == Action::Close
+                        && handle_writable(&poll, &mut conns, key, now_ns) == Action::Close
                     {
                         remove(&poll, &mut conns, key, &mut local_subs, &mut sid_to_token);
                     }
@@ -378,9 +413,10 @@ pub fn run(mut cfg: WorkerConfig, shutdown: Arc<AtomicBool>) -> std::io::Result<
                 rx,
                 &mut local_subs,
                 &mut sid_to_token,
-                per_worker_budget,
+                effective_budget,
                 &mut inflight_bytes,
                 saturated.as_ref(),
+                now_ns,
             ) {
                 work = true;
             }
@@ -408,7 +444,9 @@ pub fn run(mut cfg: WorkerConfig, shutdown: Arc<AtomicBool>) -> std::io::Result<
         // is wired; the legacy registry mailbox path still uses this drain.)
         // `drain_all_sessions` reports whether it actually wrote anything so the
         // adaptive timeout stays tight under load.
-        if dispatch && drain_all_sessions(&poll, &mut conns, &mut local_subs, &mut sid_to_token) {
+        if dispatch
+            && drain_all_sessions(&poll, &mut conns, &mut local_subs, &mut sid_to_token, now_ns)
+        {
             work = true;
         }
 
@@ -436,6 +474,7 @@ fn accept_ready(
     listener: &mut TcpListener,
     conns: &mut slab::Slab<Entry>,
     cfg: &WorkerConfig,
+    codel: crate::transport::conn::CodelParams,
 ) -> u64 {
     let mut accepted = 0;
     loop {
@@ -452,8 +491,10 @@ fn accept_ready(
                     tracing::debug!(error = %e, "failed to register accepted socket");
                     continue;
                 }
+                let mut conn = Connection::new(stream, cfg.high_water);
+                conn.set_codel(codel);
                 entry.insert(Entry {
-                    conn: Connection::new(stream, cfg.high_water),
+                    conn,
                     inbuf: BytesMut::new(),
                     token: Token(key),
                     session: None,
@@ -477,16 +518,17 @@ fn handle_readable(
     conns: &mut slab::Slab<Entry>,
     key: usize,
     cfg: &WorkerConfig,
+    now_ns: u64,
 ) -> Action {
     let entry = &mut conns[key];
     match entry.conn.state {
-        ConnState::Handshaking => handle_handshake(poll, entry, cfg),
-        ConnState::Open | ConnState::Closing => handle_frames(poll, entry, cfg),
+        ConnState::Handshaking => handle_handshake(poll, entry, cfg, now_ns),
+        ConnState::Open | ConnState::Closing => handle_frames(poll, entry, cfg, now_ns),
     }
 }
 
 /// Accumulate request-head bytes and, once complete, complete the WS upgrade.
-fn handle_handshake(poll: &Poll, entry: &mut Entry, cfg: &WorkerConfig) -> Action {
+fn handle_handshake(poll: &Poll, entry: &mut Entry, cfg: &WorkerConfig, now_ns: u64) -> Action {
     // Pull all available bytes into the head-accumulation buffer (`inbuf`).
     if drain_into(&mut entry.conn, &mut entry.inbuf) == ReadOutcome::Closed {
         return Action::Close;
@@ -497,7 +539,7 @@ fn handle_handshake(poll: &Poll, entry: &mut Entry, cfg: &WorkerConfig) -> Actio
         HeadResult::WsUpgrade { key: ws_key, path } => {
             let response = handshake::accept_response(&ws_key).into_boxed_slice();
             // Drop-head queue never rejects; the 101 response always enqueues.
-            let _ = entry.conn.queue(Arc::from(response));
+            let _ = entry.conn.queue(Arc::from(response), now_ns);
             // A browser never sends data frames before the 101, so any bytes
             // after the head would be a protocol error anyway; clearing is safe.
             entry.inbuf.clear();
@@ -518,14 +560,16 @@ fn handle_handshake(poll: &Poll, entry: &mut Entry, cfg: &WorkerConfig) -> Actio
                         let text = session.codec.encode(&established);
                         let mut out = BytesMut::new();
                         frame::encode_text(&mut out, text.as_bytes());
-                        let _ = entry.conn.queue(Arc::from(out.to_vec().into_boxed_slice()));
+                        let _ = entry
+                            .conn
+                            .queue(Arc::from(out.to_vec().into_boxed_slice()), now_ns);
                         entry.session = Some(session);
                     }
                     None => return Action::Close,
                 }
             }
 
-            flush_and_arm(poll, entry)
+            flush_and_arm(poll, entry, now_ns)
         }
         // A plain-HTTP request (a Pusher REST publish): hand the connection off
         // to the tokio/axum plane. We have read *all* currently-available bytes
@@ -612,7 +656,7 @@ fn parse_app_path(path: &str) -> (String, Option<String>) {
 }
 
 /// Read and process every complete frame currently buffered, per [`Mode`].
-fn handle_frames(poll: &Poll, entry: &mut Entry, cfg: &WorkerConfig) -> Action {
+fn handle_frames(poll: &Poll, entry: &mut Entry, cfg: &WorkerConfig, now_ns: u64) -> Action {
     let frames = {
         // Split the borrow so `inbuf` (the read remainder) and `conn` can be
         // borrowed at once via a temporary swap-out of the buffer.
@@ -628,26 +672,30 @@ fn handle_frames(poll: &Poll, entry: &mut Entry, cfg: &WorkerConfig) -> Action {
     };
 
     match &cfg.mode {
-        Mode::Echo => echo_frames(poll, entry, frames),
-        Mode::Dispatch(_) => dispatch_frames(poll, entry, frames),
+        Mode::Echo => echo_frames(poll, entry, frames, now_ns),
+        Mode::Dispatch(_) => dispatch_frames(poll, entry, frames, now_ns),
     }
 }
 
 /// [`Mode::Echo`]: re-encode every data frame back, answer pings with pongs.
-fn echo_frames(poll: &Poll, entry: &mut Entry, frames: Vec<frame::Frame>) -> Action {
+fn echo_frames(poll: &Poll, entry: &mut Entry, frames: Vec<frame::Frame>, now_ns: u64) -> Action {
     let mut wrote = false;
     for f in frames {
         match f.opcode {
             OpCode::Text | OpCode::Binary | OpCode::Continuation => {
                 let mut out = BytesMut::new();
                 frame::encode(&mut out, f.fin, f.opcode, &f.payload);
-                let _ = entry.conn.queue(Arc::from(out.to_vec().into_boxed_slice()));
+                let _ = entry
+                    .conn
+                    .queue(Arc::from(out.to_vec().into_boxed_slice()), now_ns);
                 wrote = true;
             }
             OpCode::Ping => {
                 let mut out = BytesMut::new();
                 frame::encode(&mut out, true, OpCode::Pong, &f.payload);
-                let _ = entry.conn.queue(Arc::from(out.to_vec().into_boxed_slice()));
+                let _ = entry
+                    .conn
+                    .queue(Arc::from(out.to_vec().into_boxed_slice()), now_ns);
                 wrote = true;
             }
             // A peer pong is unsolicited noise here; ignore it.
@@ -657,7 +705,7 @@ fn echo_frames(poll: &Poll, entry: &mut Entry, frames: Vec<frame::Frame>) -> Act
     }
 
     if wrote {
-        flush_and_arm(poll, entry)
+        flush_and_arm(poll, entry, now_ns)
     } else {
         Action::Keep
     }
@@ -666,7 +714,12 @@ fn echo_frames(poll: &Poll, entry: &mut Entry, frames: Vec<frame::Frame>) -> Act
 /// [`Mode::Dispatch`]: decode each Text frame to a [`ClientCommand`] and drive
 /// `ctx.dispatch`, answer pings with pongs, close on a Close frame, then drain
 /// this connection's mailbox so any self-directed replies go out.
-fn dispatch_frames(poll: &Poll, entry: &mut Entry, frames: Vec<frame::Frame>) -> Action {
+fn dispatch_frames(
+    poll: &Poll,
+    entry: &mut Entry,
+    frames: Vec<frame::Frame>,
+    now_ns: u64,
+) -> Action {
     for f in frames {
         match f.opcode {
             OpCode::Text => {
@@ -692,7 +745,9 @@ fn dispatch_frames(poll: &Poll, entry: &mut Entry, frames: Vec<frame::Frame>) ->
             OpCode::Ping => {
                 let mut out = BytesMut::new();
                 frame::encode(&mut out, true, OpCode::Pong, &f.payload);
-                let _ = entry.conn.queue(Arc::from(out.to_vec().into_boxed_slice()));
+                let _ = entry
+                    .conn
+                    .queue(Arc::from(out.to_vec().into_boxed_slice()), now_ns);
             }
             OpCode::Pong => {}
             // Binary/Continuation are not part of the Pusher protocol; ignore.
@@ -704,7 +759,7 @@ fn dispatch_frames(poll: &Poll, entry: &mut Entry, frames: Vec<frame::Frame>) ->
     // Drain this connection's mailbox: dispatch may have enqueued self-directed
     // replies (subscription_succeeded, pong, errors) plus the adapter may have
     // fanned a broadcast onto it.
-    drain_session(poll, entry).0
+    drain_session(poll, entry, now_ns).0
 }
 
 /// Run one command through the (async) protocol handler synchronously.
@@ -717,7 +772,7 @@ fn dispatch_command(session: &mut Session, cmd: ClientCommand) {
 /// WebSocket Close frame and ends the connection. Returns the resulting
 /// [`Action`] (`Close` if a close was requested or a write failed) plus whether
 /// anything was actually written (so the loop's adaptive poll stays tight).
-fn drain_session(poll: &Poll, entry: &mut Entry) -> (Action, bool) {
+fn drain_session(poll: &Poll, entry: &mut Entry, now_ns: u64) -> (Action, bool) {
     let Some(session) = entry.session.as_mut() else {
         return (Action::Keep, false);
     };
@@ -732,7 +787,9 @@ fn drain_session(poll: &Poll, entry: &mut Entry) -> (Action, bool) {
                 frame_body.extend_from_slice(&code.to_be_bytes());
                 frame_body.extend_from_slice(reason.as_bytes());
                 frame::encode(&mut out, true, OpCode::Close, &frame_body);
-                let _ = entry.conn.queue(Arc::from(out.to_vec().into_boxed_slice()));
+                let _ = entry
+                    .conn
+                    .queue(Arc::from(out.to_vec().into_boxed_slice()), now_ns);
                 wrote = true;
                 close_after = true;
                 break;
@@ -741,13 +798,15 @@ fn drain_session(poll: &Poll, entry: &mut Entry) -> (Action, bool) {
                 let text = session.codec.encode(&other);
                 let mut out = BytesMut::new();
                 frame::encode_text(&mut out, text.as_bytes());
-                let _ = entry.conn.queue(Arc::from(out.to_vec().into_boxed_slice()));
+                let _ = entry
+                    .conn
+                    .queue(Arc::from(out.to_vec().into_boxed_slice()), now_ns);
                 wrote = true;
             }
         }
     }
 
-    if wrote && flush_and_arm(poll, entry) == Action::Close {
+    if wrote && flush_and_arm(poll, entry, now_ns) == Action::Close {
         return (Action::Close, wrote);
     }
     if close_after {
@@ -767,6 +826,7 @@ fn drain_all_sessions(
     conns: &mut slab::Slab<Entry>,
     local_subs: &mut HashMap<(String, String), HashSet<SocketId>>,
     sid_to_token: &mut HashMap<SocketId, usize>,
+    now_ns: u64,
 ) -> bool {
     let keys: Vec<usize> = conns
         .iter()
@@ -778,7 +838,7 @@ fn drain_all_sessions(
         if !conns.contains(key) {
             continue;
         }
-        let (action, wrote) = drain_session(poll, &mut conns[key]);
+        let (action, wrote) = drain_session(poll, &mut conns[key], now_ns);
         wrote_any |= wrote;
         if action == Action::Close {
             remove(poll, conns, key, local_subs, sid_to_token);
@@ -788,9 +848,9 @@ fn drain_all_sessions(
 }
 
 /// Handle a writable event: flush and, when drained, drop writable interest.
-fn handle_writable(poll: &Poll, conns: &mut slab::Slab<Entry>, key: usize) -> Action {
+fn handle_writable(poll: &Poll, conns: &mut slab::Slab<Entry>, key: usize, now_ns: u64) -> Action {
     let entry = &mut conns[key];
-    flush_and_arm(poll, entry)
+    flush_and_arm(poll, entry, now_ns)
 }
 
 /// Flush the outbound queue and reconcile writable interest with what remains.
@@ -798,10 +858,10 @@ fn handle_writable(poll: &Poll, conns: &mut slab::Slab<Entry>, key: usize) -> Ac
 /// * [`WriteStatus::Drained`] → re-arm `READABLE`-only (drop `WRITABLE`).
 /// * [`WriteStatus::WouldBlock`] → add `WRITABLE` so we get a writable event.
 /// * [`WriteStatus::Closed`] → close.
-fn flush_and_arm(poll: &Poll, entry: &mut Entry) -> Action {
+fn flush_and_arm(poll: &Poll, entry: &mut Entry, now_ns: u64) -> Action {
     // Read the token before the mutable stream borrow below.
     let token = entry.token;
-    match entry.conn.flush() {
+    match entry.conn.flush(now_ns) {
         WriteStatus::Drained => {
             if poll
                 .registry()
@@ -1034,7 +1094,7 @@ fn should_skip(band: ShedBand, out_bytes: usize, high_water: usize) -> bool {
 /// applying the SP10 graduated shed (§6) against this worker's byte budget.
 ///
 /// For each message: classify the current [`ShedBand`] from `inflight_bytes /
-/// per_worker_budget`; in `Saturated` (≥100%) the whole broadcast is dropped and
+/// effective_budget`; in `Saturated` (≥100%) the whole broadcast is dropped and
 /// the sink flagged; otherwise, for each subscriber (skipping `except`), the
 /// already-WS-framed `frame` is `queue`d (an `Arc` bump — never re-encoded)
 /// UNLESS the band says to skip a backed-up subscriber. `inflight_bytes` is kept
@@ -1042,6 +1102,10 @@ fn should_skip(band: ShedBand, out_bytes: usize, high_water: usize) -> bool {
 /// any drop-head eviction) so the band tightens as the worker fills within a
 /// single drain. Connections that backpressure-close are torn down. Returns
 /// `true` if any frame was queued.
+///
+/// `effective_budget` is the per-worker budget already scaled by the PSI factor
+/// (§8); `now_ns` is this iteration's monotonic timestamp, stamped onto every
+/// enqueued frame for the CoDel sojourn check (§7).
 #[allow(clippy::too_many_arguments)]
 fn drain_broadcasts(
     poll: &Poll,
@@ -1049,9 +1113,10 @@ fn drain_broadcasts(
     rx: &std::sync::mpsc::Receiver<crate::transport::fanout::BroadcastMsg>,
     local_subs: &mut HashMap<(String, String), HashSet<SocketId>>,
     sid_to_token: &mut HashMap<SocketId, usize>,
-    per_worker_budget: u64,
+    effective_budget: u64,
     inflight_bytes: &mut u64,
     saturated: Option<&Arc<AtomicBool>>,
+    now_ns: u64,
 ) -> bool {
     let mut touched: HashSet<usize> = HashSet::new();
     // Connections that backpressured during delivery; closed after the drain so
@@ -1068,7 +1133,7 @@ fn drain_broadcasts(
             // grows within this drain, so once the worker crosses 100% mid-fan-out
             // it stops enqueueing for the remaining subscribers of this very
             // broadcast — the budget is never blown past by a single large channel.
-            let band = shed_band(*inflight_bytes, per_worker_budget);
+            let band = shed_band(*inflight_bytes, effective_budget);
             if band == ShedBand::Saturated {
                 // ≥100%: never enqueue past the budget. Flag saturation so the
                 // publish-admission path 503s; skip enqueueing this subscriber.
@@ -1105,7 +1170,7 @@ fn drain_broadcasts(
             // byte delta (enqueue minus any drop-head eviction) into the live
             // inflight counter so the band stays accurate within this drain.
             let before = entry.conn.out_bytes();
-            let _dropped = entry.conn.queue(msg.frame.clone());
+            let _dropped = entry.conn.queue(msg.frame.clone(), now_ns);
             let after = entry.conn.out_bytes();
             *inflight_bytes = inflight_bytes
                 .saturating_add(after as u64)
@@ -1122,7 +1187,7 @@ fn drain_broadcasts(
             continue;
         }
         if let Some(entry) = conns.get_mut(token) {
-            if flush_and_arm(poll, entry) == Action::Close {
+            if flush_and_arm(poll, entry, now_ns) == Action::Close {
                 to_close.push(token);
             }
         }
@@ -1165,6 +1230,8 @@ mod tests {
                     broadcast: None,
                     per_worker_budget: 0,
                     inflight_slot: None,
+                    codel: crate::transport::conn::CodelParams::DISABLED,
+                    budget_factor: None,
                 },
                 sd,
             )

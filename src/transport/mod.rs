@@ -25,7 +25,7 @@ use crate::server::resources;
 use crate::webhook::WebhookHandle;
 use dashmap::DashMap;
 use fanout::{BroadcastSink, WorkerSlot};
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize};
 use std::sync::Arc;
 use tokio::sync::mpsc::UnboundedSender;
 use worker::{BroadcastWiring, DispatchEnv, Mode, WorkerConfig};
@@ -219,6 +219,16 @@ pub fn run_percore(
         }
     }
 
+    // SP10 §7: CoDel freshness parameters, shared by every connection on every
+    // worker (config-derived; `target_ms == 0` disables → pure drop-head).
+    let codel = config.codel_params();
+
+    // SP10 §8: shared PSI budget factor (×1000 fixed-point, 1000 = full). The
+    // control-plane loop that shrinks it under real memory pressure is wired in
+    // the PSI-backstop task; here it is created (and pinned at full) so the
+    // workers read a precomputed value off the hot path.
+    let budget_factor = Arc::new(AtomicU32::new(1000));
+
     let mut handles = Vec::with_capacity(worker_count);
     for (i, wiring) in wirings.into_iter().enumerate() {
         let cfg = WorkerConfig {
@@ -231,6 +241,8 @@ pub fn run_percore(
             broadcast: wiring,
             per_worker_budget,
             inflight_slot: Some(inflight_slots[i].clone()),
+            codel,
+            budget_factor: Some(budget_factor.clone()),
         };
         let shutdown = shutdown.clone();
         let core = core_ids.get(i % core_ids.len().max(1)).copied();

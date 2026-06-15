@@ -90,6 +90,13 @@ pub struct ServerConfig {
     /// Capacity (frames) of each worker's bounded broadcast hand-off channel.
     /// `PYLON_BROADCAST_HANDOFF_CAP` (default 1024).
     pub broadcast_handoff_cap: usize,
+    /// CoDel freshness target in milliseconds (§7): a frame whose time-in-queue
+    /// (sojourn) exceeds `2 ×` this while the queue is overloaded is dropped on
+    /// dequeue. `PYLON_CODEL_TARGET_MS` (default 5). `0` disables CoDel.
+    pub codel_target_ms: u64,
+    /// CoDel interval in milliseconds (§7): the window over which the minimum
+    /// sojourn is tracked. `PYLON_CODEL_INTERVAL_MS` (default 100).
+    pub codel_interval_ms: u64,
 }
 
 impl Default for ServerConfig {
@@ -136,6 +143,8 @@ impl Default for ServerConfig {
             perconn_queue_min_bytes: 256 << 10,
             perconn_queue_max_bytes: 8 << 20,
             broadcast_handoff_cap: crate::transport::fanout::DEFAULT_BROADCAST_HANDOFF_CAP,
+            codel_target_ms: 5,
+            codel_interval_ms: 100,
         }
     }
 }
@@ -334,7 +343,28 @@ impl ServerConfig {
                 c.broadcast_handoff_cap = p;
             }
         }
+        if let Ok(v) = std::env::var("PYLON_CODEL_TARGET_MS") {
+            if let Ok(p) = v.parse() {
+                c.codel_target_ms = p;
+            }
+        }
+        if let Ok(v) = std::env::var("PYLON_CODEL_INTERVAL_MS") {
+            if let Ok(p) = v.parse() {
+                c.codel_interval_ms = p;
+            }
+        }
         c
+    }
+
+    /// Resolve the CoDel parameters for the percore transport. A `codel_target_ms`
+    /// of `0` yields the disabled overlay (pure drop-head); the interval is
+    /// clamped to a sane minimum so a misconfigured `0` interval can't divide the
+    /// window to nothing.
+    pub fn codel_params(&self) -> crate::transport::conn::CodelParams {
+        crate::transport::conn::CodelParams {
+            target_ns: self.codel_target_ms.saturating_mul(1_000_000),
+            interval_ns: self.codel_interval_ms.max(1).saturating_mul(1_000_000),
+        }
     }
 
     /// Resolve the percore total memory budget (bytes): the explicit
@@ -424,6 +454,17 @@ mod tests {
         assert_eq!(c.perconn_queue_min_bytes, 256 << 10);
         assert_eq!(c.perconn_queue_max_bytes, 8 << 20);
         assert_eq!(c.broadcast_handoff_cap, 1024);
+        // SP10 §7 CoDel defaults.
+        assert_eq!(c.codel_target_ms, 5);
+        assert_eq!(c.codel_interval_ms, 100);
+        // codel_params() folds ms → ns with the folly defaults.
+        let p = c.codel_params();
+        assert_eq!(p.target_ns, 5_000_000);
+        assert_eq!(p.interval_ns, 100_000_000);
+        // target_ms = 0 ⇒ disabled overlay (target_ns == 0).
+        let mut off = c.clone();
+        off.codel_target_ms = 0;
+        assert_eq!(off.codel_params().target_ns, 0);
     }
 
     #[test]
@@ -446,6 +487,21 @@ mod tests {
         std::env::remove_var("PYLON_PERCONN_QUEUE_MIN_BYTES");
         std::env::remove_var("PYLON_PERCONN_QUEUE_MAX_BYTES");
         std::env::remove_var("PYLON_BROADCAST_HANDOFF_CAP");
+    }
+
+    #[test]
+    fn sp10_codel_env_overrides_apply() {
+        std::env::set_var("PYLON_CODEL_TARGET_MS", "0"); // disables CoDel
+        std::env::set_var("PYLON_CODEL_INTERVAL_MS", "250");
+        let c = ServerConfig::from_env();
+        assert_eq!(c.codel_target_ms, 0);
+        assert_eq!(c.codel_interval_ms, 250);
+        // target_ms 0 ⇒ disabled overlay; interval still folds to ns.
+        let p = c.codel_params();
+        assert_eq!(p.target_ns, 0);
+        assert_eq!(p.interval_ns, 250_000_000);
+        std::env::remove_var("PYLON_CODEL_TARGET_MS");
+        std::env::remove_var("PYLON_CODEL_INTERVAL_MS");
     }
 
     #[test]

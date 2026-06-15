@@ -93,6 +93,8 @@ async fn spawn(config: ServerConfig) -> Harness {
                 broadcast: None,
                 per_worker_budget: 0,
                 inflight_slot: None,
+                codel: pylon::transport::conn::CodelParams::DEFAULT,
+                budget_factor: None,
             },
             sd,
         )
