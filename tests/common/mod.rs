@@ -238,6 +238,20 @@ impl Drop for ClusterNodeGuard {
 ///
 /// Two nodes spawned on the SAME `prefix` form a 2-node cluster over one Redis.
 pub async fn spawn_percore_cluster(prefix: &str) -> (SocketAddr, ClusterNodeGuard) {
+    // The default cluster node uses the standard config (no override applied).
+    spawn_percore_cluster_with(prefix, |_| {}).await
+}
+
+/// As [`spawn_percore_cluster`] but lets the caller mutate the node's
+/// [`ServerConfig`] before the bridge/worker are built — e.g. to inject a small
+/// `max_presence_members` so a test can hit the cluster-wide presence capacity
+/// cap. The `adapter`/`redis_url`/`redis_prefix`/`bind`/`port`/`workers` fields
+/// are set by the harness AFTER `with` runs, so an override can't clobber the
+/// cluster wiring; everything else (the limits) is the caller's to tune.
+pub async fn spawn_percore_cluster_with(
+    prefix: &str,
+    with: impl FnOnce(&mut ServerConfig),
+) -> (SocketAddr, ClusterNodeGuard) {
     // The single shared LocalAdapter: the bridge's RedisAdapter shares it (so the
     // pub/sub recv loop's `local.broadcast(Raw)` shards remote frames to this
     // node's workers), the REST plane reads the saturation flag off it, and the
@@ -250,14 +264,15 @@ pub async fn spawn_percore_cluster(prefix: &str) -> (SocketAddr, ClusterNodeGuar
         l.local_addr().unwrap().port()
     };
 
+    // Start from the default config and let the caller tune the limits BEFORE the
+    // harness stamps the cluster wiring on top (so an override can't break it).
+    let mut config = ServerConfig::default();
+    with(&mut config);
     // Redis adapter config forced onto the percore single-worker transport on the
     // free port, sharing `prefix` so sibling nodes see the same keys.
-    let mut config = ServerConfig {
-        adapter: "redis".into(),
-        redis_url: cluster_test_redis_url(),
-        redis_prefix: prefix.into(),
-        ..ServerConfig::default()
-    };
+    config.adapter = "redis".into();
+    config.redis_url = cluster_test_redis_url();
+    config.redis_prefix = prefix.into();
     config.bind = "127.0.0.1".into();
     config.port = port;
     config.workers = 1;

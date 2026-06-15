@@ -948,8 +948,10 @@ fn dispatch_frames(
 
     // Drain this connection's mailbox: dispatch may have enqueued self-directed
     // replies (subscription_succeeded, pong, errors) plus the adapter may have
-    // fanned a broadcast onto it.
-    drain_session(poll, entry, now_ns).0
+    // fanned a broadcast onto it. The readable path reconciles this connection's
+    // membership after a `Keep` (see the `Action::Keep` arm in `run`), so any
+    // `subscribed` change a drained `SubscriptionError` made here is picked up there.
+    drain_session(poll, entry, now_ns).action
 }
 
 /// Run one command through the (async) protocol handler synchronously.
@@ -957,18 +959,45 @@ fn dispatch_command(session: &mut Session, cmd: ClientCommand) {
     futures_executor::block_on(session.ctx.dispatch(cmd));
 }
 
+/// Outcome of a [`drain_session`] call: the resulting [`Action`], whether any frame
+/// was written (keeps the adaptive poll tight), and whether `ctx.subscribed` changed
+/// during the drain (a `SubscriptionError` removed a channel) so the caller can
+/// reconcile this connection's worker-local subscription index.
+struct DrainResult {
+    action: Action,
+    wrote: bool,
+    subs_changed: bool,
+}
+
 /// Drain every queued [`ServerEvent`] from this connection's mailbox: encode and
 /// queue each as a Text frame, except [`ServerEvent::Close`] which becomes a
-/// WebSocket Close frame and ends the connection. Returns the resulting
-/// [`Action`] (`Close` if a close was requested or a write failed) plus whether
-/// anything was actually written (so the loop's adaptive poll stays tight).
-fn drain_session(poll: &Poll, entry: &mut Entry, now_ns: u64) -> (Action, bool) {
+/// WebSocket Close frame and ends the connection. Returns a [`DrainResult`]: the
+/// resulting [`Action`] (`Close` if a close was requested or a write failed),
+/// whether anything was actually written (so the loop's adaptive poll stays tight),
+/// and whether `ctx.subscribed` changed during the drain.
+///
+/// A [`ServerEvent::SubscriptionError`] means the subscription did NOT take (the
+/// cluster-wide presence-capacity reject fired on the bridge, or any auth/validation
+/// failure): the channel must NOT remain in `ctx.subscribed` / `presence_membership`.
+/// So before encoding the frame (which is still sent to the client unchanged) the
+/// channel is removed from both. This is safe for ALL subscription errors: the
+/// auth-failure cases (non-cluster) never inserted the channel (the handler returns
+/// early), so the remove is a harmless no-op; the cluster-capacity reject DID
+/// inline-join the channel, so the remove reverses it — paired with the caller's
+/// post-drain `reconcile_membership` (run when `subs_changed`), the connection is
+/// fully deindexed from delivery.
+fn drain_session(poll: &Poll, entry: &mut Entry, now_ns: u64) -> DrainResult {
     let Some(session) = entry.session.as_mut() else {
-        return (Action::Keep, false);
+        return DrainResult {
+            action: Action::Keep,
+            wrote: false,
+            subs_changed: false,
+        };
     };
 
     let mut close_after = false;
     let mut wrote = false;
+    let mut subs_changed = false;
     while let Ok(ev) = session.rx.try_recv() {
         match ev {
             ServerEvent::Close { code, reason } => {
@@ -985,6 +1014,17 @@ fn drain_session(poll: &Poll, entry: &mut Entry, now_ns: u64) -> (Action, bool) 
                 break;
             }
             other => {
+                // A subscription error means the subscription did not take: drop the
+                // channel from this connection's protocol state BEFORE encoding the
+                // (unchanged) frame, so it is not left a member. No-op when the channel
+                // was never inserted (the non-cluster auth-failure cases return early in
+                // the handler before any insert).
+                if let ServerEvent::SubscriptionError { channel, .. } = &other {
+                    if session.ctx.subscribed.remove(channel) {
+                        subs_changed = true;
+                    }
+                    session.ctx.presence_membership.remove(channel);
+                }
                 let text = session.codec.encode(&other);
                 let mut out = BytesMut::new();
                 frame::encode_text(&mut out, text.as_bytes());
@@ -996,13 +1036,15 @@ fn drain_session(poll: &Poll, entry: &mut Entry, now_ns: u64) -> (Action, bool) 
         }
     }
 
-    if wrote && flush_and_arm(poll, entry, now_ns) == Action::Close {
-        return (Action::Close, wrote);
-    }
-    if close_after {
-        (Action::Close, wrote)
+    let action = if (wrote && flush_and_arm(poll, entry, now_ns) == Action::Close) || close_after {
+        Action::Close
     } else {
-        (Action::Keep, wrote)
+        Action::Keep
+    };
+    DrainResult {
+        action,
+        wrote,
+        subs_changed,
     }
 }
 
@@ -1030,10 +1072,24 @@ fn drain_all_sessions(
         if !conns.contains(key) {
             continue;
         }
-        let (action, wrote) = drain_session(poll, &mut conns[key], now_ns);
-        wrote_any |= wrote;
-        if action == Action::Close {
+        let result = drain_session(poll, &mut conns[key], now_ns);
+        wrote_any |= result.wrote;
+        if result.action == Action::Close {
             remove(poll, conns, key, local_subs, sid_to_token, wheel);
+            continue;
+        }
+        // A `subscribed` change made during this mailbox drain (a `SubscriptionError`
+        // removed a channel — e.g. the bridge's cluster-wide presence-capacity reject)
+        // must propagate to the worker-local delivery index so the rejected connection
+        // stops receiving that channel's broadcasts. Gated on an actual change so the
+        // idle path stays O(visited), not O(N-channels) per connection: only the rare
+        // rejected connection pays the two-set-diff reconcile.
+        if result.subs_changed {
+            if let Some(entry) = conns.get_mut(key) {
+                if let Some(session) = entry.session.as_mut() {
+                    reconcile_membership(session, key, local_subs, sid_to_token);
+                }
+            }
         }
     }
     wrote_any

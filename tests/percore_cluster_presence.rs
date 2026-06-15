@@ -28,7 +28,7 @@ mod common;
 
 use common::{
     auth_token, connect, established_socket_id, next_event_named, next_json, send_json,
-    spawn_percore_cluster, Ws,
+    spawn_percore_cluster, spawn_percore_cluster_with, Ws,
 };
 use serde_json::{json, Value};
 use std::net::SocketAddr;
@@ -216,5 +216,133 @@ async fn cross_node_presence_member_removed_single_emit() {
     assert_eq!(
         removed, 1,
         "u1 on A must receive EXACTLY ONE cross-node member_removed for u2 (got {removed})"
+    );
+}
+
+/// Connect a WS presence client to `addr` as `user_id`, drain its
+/// `connection_established`, send the presence subscribe for `channel`, and return
+/// the live socket plus the FIRST `subscription_succeeded`-or-`subscription_error`
+/// frame that arrives (bounded per-frame). Unlike [`connect_presence`] this does NOT
+/// assume the subscribe succeeds — the cluster-wide capacity gate may reject it with
+/// `pusher:subscription_error`.
+async fn connect_presence_outcome(
+    addr: SocketAddr,
+    channel: &str,
+    user_id: &str,
+    user_info: Value,
+) -> (Ws, Value) {
+    let mut ws = connect(addr, "?protocol=7").await;
+    let sid = established_socket_id(&mut ws).await;
+    let channel_data = json!({ "user_id": user_id, "user_info": user_info }).to_string();
+    send_json(
+        &mut ws,
+        json!({
+            "event": "pusher:subscribe",
+            "data": {
+                "channel": channel,
+                "auth": auth_token(&sid, channel, Some(&channel_data)),
+                "channel_data": channel_data
+            }
+        }),
+    )
+    .await;
+    let outcome = next_subscription_outcome(&mut ws).await;
+    (ws, outcome)
+}
+
+/// Read frames (bounded per frame) until either `subscription_succeeded` or
+/// `subscription_error` arrives; returns that frame. Skips interleaved noise
+/// (`subscription_count`, member events) the way the other helpers do.
+async fn next_subscription_outcome(ws: &mut Ws) -> Value {
+    loop {
+        let f = next_json(ws).await;
+        let ev = f["event"].as_str().unwrap_or("");
+        if ev == "pusher_internal:subscription_succeeded" || ev == "pusher:subscription_error" {
+            return f;
+        }
+    }
+}
+
+/// The cluster-wide presence member CAP is enforced ACROSS nodes. With
+/// `max_presence_members = 2`: u1 on node A (ok) + u2 on node B (ok) fills the
+/// channel cluster-wide; u3 on either node must be REJECTED with a
+/// `pusher:subscription_error` (`status 4004`, "Presence channel is full") and must
+/// NOT enter the cluster roster. The rejected connection must also NOT subsequently
+/// receive presence broadcasts for the channel (the worker deindexed it).
+#[tokio::test]
+async fn cross_node_presence_capacity_enforced() {
+    let prefix = random_prefix();
+    // Inject a small cluster-wide cap of 2 members on BOTH nodes.
+    let (addr_a, _guard_a) =
+        spawn_percore_cluster_with(&prefix, |c| c.max_presence_members = 2).await;
+    let (addr_b, _guard_b) =
+        spawn_percore_cluster_with(&prefix, |c| c.max_presence_members = 2).await;
+
+    let channel = "presence-cap";
+
+    // u1 joins on A (ok, cluster count → 1) and settles.
+    let (mut ws_a, succ_a) =
+        connect_presence_outcome(addr_a, channel, "u1", json!({"name":"Ann"})).await;
+    assert_eq!(
+        succ_a["event"], "pusher_internal:subscription_succeeded",
+        "u1 must be admitted on node A"
+    );
+    assert_eq!(roster_of(&succ_a)["count"], 1, "u1 starts alone");
+
+    // u2 joins on B (ok, cluster count → 2). Awaiting its cluster roster proves u1's
+    // membership is already committed to Redis, so the cap is now FULL cluster-wide.
+    let (_ws_b, succ_b) =
+        connect_presence_outcome(addr_b, channel, "u2", json!({"name":"Bob"})).await;
+    assert_eq!(
+        succ_b["event"], "pusher_internal:subscription_succeeded",
+        "u2 must be admitted on node B"
+    );
+    assert_eq!(
+        roster_of(&succ_b)["count"],
+        2,
+        "u2's cluster roster must count BOTH users (cap now full)"
+    );
+
+    // Drain u1's member_added for u2 so a later assertion can't confuse it.
+    let added = count_member_added(&mut ws_a, "u2", Duration::from_secs(5)).await;
+    assert_eq!(added, 1, "u1 must first see u2's single member_added");
+
+    // u3 attempts to join on A → cluster cap is FULL (2/2), distinct user → REJECT.
+    let (mut ws_c, outcome_c) =
+        connect_presence_outcome(addr_a, channel, "u3", json!({"name":"Cara"})).await;
+    assert_eq!(
+        outcome_c["event"], "pusher:subscription_error",
+        "u3 must be rejected by the cluster-wide cap"
+    );
+    // `subscription_error` data is a plain OBJECT `{ type, error, status }`.
+    let err = &outcome_c["data"];
+    assert_eq!(err["status"], 4004, "rejection status must be 4004");
+    assert_eq!(
+        err["error"], "Presence channel is full",
+        "rejection message must match the cap error"
+    );
+
+    // u3 must NOT be in the cluster roster: a 4th observer on B sees count == 2.
+    let (_ws_d, succ_d) =
+        connect_presence_outcome(addr_b, channel, "u2", json!({"name":"Bob"})).await;
+    // u2 is already a member (same user_id on a second conn) → admitted, roster still 2.
+    assert_eq!(
+        succ_d["event"], "pusher_internal:subscription_succeeded",
+        "a second conn for the already-present u2 is admitted (not a new distinct user)"
+    );
+    assert_eq!(
+        roster_of(&succ_d)["count"],
+        2,
+        "cluster roster must stay at 2 distinct users — u3 was rejected, never joined"
+    );
+
+    // The rejected u3 must NOT receive presence broadcasts for the channel: trigger a
+    // member event (u1 leaves → member_removed for u1 fans cluster-wide) and confirm u3
+    // does not see it. u3 stays connected; the worker deindexed it on the reject.
+    drop(ws_a);
+    let leaked = count_member_removed(&mut ws_c, "u1", Duration::from_secs(2)).await;
+    assert_eq!(
+        leaked, 0,
+        "rejected u3 must NOT receive presence broadcasts for the channel it was denied"
     );
 }

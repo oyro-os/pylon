@@ -166,25 +166,35 @@ impl ConnectionContext {
                     }
                 }
                 // Enforce the configurable presence member cap (pylon-chosen rejection shape).
-                let current = self
-                    .adapter
-                    .channel(&self.app.id, &channel)
-                    .await
-                    .user_count
-                    .unwrap_or(0);
-                let already_member = self
-                    .adapter
-                    .presence_members(&self.app.id, &channel)
-                    .await
-                    .iter()
-                    .any(|m| m.user_id == member.user_id);
-                if !already_member && current >= self.limits.max_presence_members {
-                    return self.send_subscription_error(
-                        &channel,
-                        "LimitReached",
-                        "Presence channel is full",
-                        4004,
-                    );
+                //
+                // Clustered: the node-LOCAL `user_count` here only sees THIS node's members,
+                // so a per-node check would let a presence channel exceed its cap by
+                // `cap × nodes` across the cluster. The bridge enforces the cap CLUSTER-WIDE
+                // (against the Redis count of record) in `ClusterCmd::PresenceSubscribe`
+                // BEFORE it commits the join, sending the SAME 4004 `subscription_error` and
+                // undoing the inline local join on reject. So skip this node-local check in
+                // cluster mode; the not-yet-clustered path keeps it byte-identical.
+                if !self.clustered {
+                    let current = self
+                        .adapter
+                        .channel(&self.app.id, &channel)
+                        .await
+                        .user_count
+                        .unwrap_or(0);
+                    let already_member = self
+                        .adapter
+                        .presence_members(&self.app.id, &channel)
+                        .await
+                        .iter()
+                        .any(|m| m.user_id == member.user_id);
+                    if !already_member && current >= self.limits.max_presence_members {
+                        return self.send_subscription_error(
+                            &channel,
+                            "LimitReached",
+                            "Presence channel is full",
+                            4004,
+                        );
+                    }
                 }
                 let out = self
                     .adapter
