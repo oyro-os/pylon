@@ -141,7 +141,7 @@ pub async fn spawn_legacy(spec: SpawnSpec) -> SocketAddr {
 /// publishes) work exactly as on legacy.
 ///
 /// Mirrors `main.rs`'s `TransportMode::Percore` branch: build the REST `AppState`
-/// + handoff channel, spawn `rest::serve` on the tokio runtime, then run
+/// plus a handoff channel, spawn `rest::serve` on the tokio runtime, then run
 /// [`pylon::transport::run_percore`] on a dedicated blocking thread. The worker
 /// installs the sharded broadcast sink on the concrete `LocalAdapter` and serves
 /// the full v7 protocol; plain-HTTP connections are handed off to the axum REST
