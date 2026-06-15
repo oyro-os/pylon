@@ -158,6 +158,10 @@ async fn main() -> anyhow::Result<()> {
                     Some(rest_tx),
                     worker_shutdown,
                     local_for_sink,
+                    // The dedicated cluster bridge (SP11 §3.6) wires `clustered:
+                    // true` via its own harness; the standalone `main` percore
+                    // path is not clustered.
+                    false,
                 )
             });
 

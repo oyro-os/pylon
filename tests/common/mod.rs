@@ -30,14 +30,17 @@ use pylon::app::static_file::StaticFileAppManager;
 use pylon::app::AppManager;
 use pylon::auth::signature::channel_signature;
 use pylon::channel::registry::Registry;
+use pylon::cluster::adapter::ClusterAdapter;
+use pylon::cluster::bridge::{self, ClusterBridge};
 use pylon::server::config::ServerConfig;
 use pylon::server::router::{build_router, AppState};
 use pylon::webhook::WebhookHandle;
 use dashmap::DashMap;
 use serde_json::Value;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, AtomicUsize};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::thread::JoinHandle;
 use std::time::Duration;
 use tokio_tungstenite::tungstenite::Message;
 
@@ -208,6 +211,9 @@ pub async fn spawn_percore(spec: SpawnSpec) -> SocketAddr {
             Some(rest_tx),
             worker_shutdown,
             local_for_sink,
+            // Single-node parity harness: not clustered (the cluster harness is
+            // `spawn_percore_cluster`, which passes `true`).
+            false,
         );
     });
     // Keep the worker alive for the whole test process.
@@ -218,6 +224,149 @@ pub async fn spawn_percore(spec: SpawnSpec) -> SocketAddr {
     tokio::time::sleep(Duration::from_millis(200)).await;
 
     format!("127.0.0.1:{port}").parse().unwrap()
+}
+
+/// Test Redis URL for the clustered harness: `PYLON_TEST_REDIS_URL` or the
+/// documented test default (port 6390 — NOT the 6379 production default, so a
+/// real Redis never gets clobbered by a stray run).
+fn cluster_test_redis_url() -> String {
+    std::env::var("PYLON_TEST_REDIS_URL")
+        .unwrap_or_else(|_| "redis://127.0.0.1:6390".to_string())
+}
+
+/// A guard the test holds for the lifetime of a clustered percore node. It owns
+/// the node's [`ClusterBridge`] (whose `Drop` joins its dedicated Redis runtime
+/// thread) plus the worker thread + its shutdown flag. The node MUST stay alive
+/// for the whole test — dropping the bridge tears down Redis, so a test keeps the
+/// guard in scope until its assertions are done.
+///
+/// On `Drop` it signals the worker thread to stop (so a test that finishes early
+/// doesn't leak a spinning worker), then drops the bridge (which joins its
+/// runtime). The worker thread itself is detached after the shutdown signal —
+/// joining it would block on its 50ms poll cadence and serialize teardown; the OS
+/// reclaims it at process exit, matching how `spawn_percore` leaks its worker.
+pub struct ClusterNodeGuard {
+    bridge: Option<ClusterBridge>,
+    shutdown: Arc<AtomicBool>,
+    worker: Option<JoinHandle<()>>,
+}
+
+impl Drop for ClusterNodeGuard {
+    fn drop(&mut self) {
+        // Stop the worker loop, then drop the bridge (its `Drop` joins the Redis
+        // runtime thread). Order matters only in that the worker no longer fires
+        // commands at a torn-down bridge.
+        self.shutdown.store(true, Ordering::SeqCst);
+        self.bridge.take();
+        // Detach the worker: its loop exits within ~50ms of the shutdown flag, but
+        // we don't block teardown on that — the OS reaps it at process exit.
+        let _ = self.worker.take();
+    }
+}
+
+/// Spawn ONE clustered percore node on `prefix` and return its bound
+/// `127.0.0.1` address plus a [`ClusterNodeGuard`] the test must keep alive.
+///
+/// Mirrors [`spawn_percore`] but for the SP11 clustered path: a single
+/// `LocalAdapter` is shared by (a) the node's [`ClusterBridge`] (which owns the
+/// node's single `RedisAdapter`, sharing this `local`, on its own runtime), (b)
+/// the REST plane's [`AppState`] (driving the `RedisAdapter` directly for
+/// cluster-wide reads/publishes), and (c) the worker fleet's sharded broadcast
+/// sink (installed by `run_percore` when `local` is `Some`). The worker drives a
+/// [`ClusterAdapter`] = `{ local, bridge.handle() }`, so a node-local subscribe
+/// is synchronous and the cross-node edges are fired (never awaited) at the
+/// bridge. `run_percore` is called with `clustered = true`, so each connection's
+/// handler defers the single-emit cluster edges to the bridge.
+///
+/// Two nodes spawned on the SAME `prefix` form a 2-node cluster over one Redis.
+pub async fn spawn_percore_cluster(prefix: &str) -> (SocketAddr, ClusterNodeGuard) {
+    // The single shared LocalAdapter: the bridge's RedisAdapter shares it (so the
+    // pub/sub recv loop's `local.broadcast(Raw)` shards remote frames to this
+    // node's workers), the REST plane reads the saturation flag off it, and the
+    // worker's ClusterAdapter + the sharded sink install on it.
+    let local = Arc::new(LocalAdapter::new(Arc::new(Registry::new())));
+
+    // A free ephemeral port, reserved then released (mirrors `spawn_percore`).
+    let port = {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        l.local_addr().unwrap().port()
+    };
+
+    // Redis adapter config forced onto the percore single-worker transport on the
+    // free port, sharing `prefix` so sibling nodes see the same keys.
+    let mut config = ServerConfig {
+        adapter: "redis".into(),
+        redis_url: cluster_test_redis_url(),
+        redis_prefix: prefix.into(),
+        ..ServerConfig::default()
+    };
+    config.bind = "127.0.0.1".into();
+    config.port = port;
+    config.transport = pylon::server::config::TransportMode::Percore;
+    config.workers = 1;
+
+    let apps: Arc<dyn AppManager> =
+        Arc::new(StaticFileAppManager::from_json(APPS).unwrap());
+    let conn_counts: Arc<DashMap<String, Arc<AtomicUsize>>> = Arc::new(Default::default());
+    let webhooks = WebhookHandle::null();
+
+    // Start the bridge: builds the node's single `RedisAdapter` sharing `local`,
+    // on its own runtime. `start` is sync (it owns its runtime thread) and returns
+    // once Redis is connected, or panics here with a clear message if it isn't.
+    let bridge = bridge::start(&config, local.clone(), webhooks.clone(), apps.clone())
+        .expect("ClusterBridge::start must connect to the test Redis and report ready");
+
+    // REST plane: drives the node's `RedisAdapter` (full async; blocking on Redis
+    // is fine on the tokio runtime) for cluster-wide channel reads + REST publishes.
+    let (rest_tx, rest_rx) =
+        tokio::sync::mpsc::unbounded_channel::<pylon::transport::RestConn>();
+    let rest_state = AppState {
+        config: config.clone(),
+        apps: apps.clone(),
+        adapter: bridge.adapter(),
+        conn_counts: conn_counts.clone(),
+        webhooks: webhooks.clone(),
+        saturated: Some(local.saturation_flag()),
+    };
+    tokio::spawn(pylon::transport::rest::serve(rest_rx, build_router(rest_state)));
+
+    // Worker: a `ClusterAdapter` over the shared `local` + the bridge handle. With
+    // `Some(local)` the sharded sink installs on the SAME `local` the bridge's
+    // RedisAdapter holds, so cross-node received frames shard to this worker.
+    let worker_adapter: Arc<dyn Adapter> =
+        Arc::new(ClusterAdapter::new(local.clone(), bridge.handle()));
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let worker_shutdown = shutdown.clone();
+    let worker_config = config.clone();
+    let worker_apps = apps.clone();
+    let worker_webhooks = webhooks.clone();
+    let worker_local = local.clone();
+    let worker = std::thread::spawn(move || {
+        let _ = pylon::transport::run_percore(
+            worker_config,
+            worker_apps,
+            worker_adapter,
+            conn_counts,
+            worker_webhooks,
+            Some(rest_tx),
+            worker_shutdown,
+            Some(worker_local),
+            // This IS a clustered node: defer the single-emit cluster edges.
+            true,
+        );
+    });
+
+    // Give the worker a moment to bind its SO_REUSEPORT listener before any client
+    // connects (mirrors `spawn_percore`).
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+    let guard = ClusterNodeGuard {
+        bridge: Some(bridge),
+        shutdown,
+        worker: Some(worker),
+    };
+    (addr, guard)
 }
 
 // ── Shared WS client helpers (identical across every WS suite) ──────────────

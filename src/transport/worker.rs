@@ -92,6 +92,13 @@ pub struct DispatchEnv {
     /// `client-*` event is dropped at ingress under saturation. `None` when no
     /// sink is wired (e.g. the redis+percore fallback), so the drop never fires.
     pub saturated: Option<Arc<AtomicBool>>,
+    /// SP11 §3.6: clustering toggle stamped onto every connection's
+    /// [`ConnectionContext`] at session establish. `true` ⇒ this is a clustered
+    /// percore node: the single-emit cluster edges (`subscription_count`,
+    /// `channel_occupied` / `channel_vacated`) are deferred to the bridge, so the
+    /// connection handler suppresses its node-local emits. `false` ⇒ the
+    /// not-yet-clustered percore path keeps the node-local handler emits.
+    pub clustered: bool,
 }
 
 /// Configuration for a single worker event loop.
@@ -779,9 +786,10 @@ fn establish_session(env: &Arc<DispatchEnv>, path: &str) -> Result<Session, Reje
         webhooks: env.webhooks.clone(),
         presence_membership: HashMap::new(),
         saturated: env.saturated.clone(),
-        // Task 3.6 flips this true for the clustered percore path; until then the
-        // not-yet-clustered percore path keeps the node-local handler emits.
-        clustered: false,
+        // SP11 §3.6: the clustered percore node defers the single-emit cluster
+        // edges to the bridge (so the handler suppresses its node-local emits);
+        // the not-yet-clustered percore path keeps the node-local handler emits.
+        clustered: env.clustered,
     };
 
     Ok(Session {

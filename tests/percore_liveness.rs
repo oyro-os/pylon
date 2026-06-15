@@ -80,6 +80,7 @@ async fn spawn(activity_timeout: u32, pong_timeout: u32) -> Harness {
         conn_counts: Arc::new(Default::default()),
         webhooks: pylon::webhook::WebhookHandle::null(),
         saturated: None,
+        clustered: false,
     });
 
     let port = free_port();

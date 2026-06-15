@@ -95,6 +95,13 @@ pub fn run_percore(
     // across workers; `None` (e.g. the deferred redis+percore combo) ⇒ no sink,
     // broadcasts fall back to the legacy registry mailbox path.
     local: Option<Arc<LocalAdapter>>,
+    // SP11 §3.6: clustering toggle for this node. `true` ⇒ a clustered percore
+    // node whose workers defer the single-emit cluster edges to the bridge (the
+    // connection handler suppresses its node-local `subscription_count` /
+    // `channel_occupied` / `channel_vacated`); `false` ⇒ the standalone percore
+    // node keeps the node-local handler emits. Stamped onto every connection's
+    // `ConnectionContext` via the shared `DispatchEnv`.
+    clustered: bool,
 ) -> std::io::Result<()> {
     let addr: std::net::SocketAddr = format!("{}:{}", config.bind, config.port)
         .parse()
@@ -116,6 +123,7 @@ pub fn run_percore(
         conn_counts,
         webhooks,
         saturated: saturated_flag,
+        clustered,
     });
 
     // WS frame cap: bound a single inbound frame's payload. The configured
