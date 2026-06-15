@@ -338,6 +338,255 @@ async fn overload_flood_does_not_hang_and_server_stays_alive() {
     .expect("OVERLOAD HANG: the flood + drain did not complete within the wall");
 }
 
+/// Publish a sequence-numbered frame to `channel`: the data is `"<seq>:<pad>"`
+/// so each frame is large enough (≈ `pad` bytes) that an un-drained slow consumer
+/// backs up past its out-queue cap and drop-head evicts. The leading `<seq>:` is
+/// recovered to verify ordering / freshest-wins.
+async fn publish_seq(
+    port: u16,
+    client: &reqwest::Client,
+    channel: &str,
+    seq: u64,
+    pad: &str,
+) -> u16 {
+    publish(port, client, channel, &format!("{seq}:{pad}")).await
+}
+
+/// Recover the sequence number from a `"<seq>:<pad>"` flood payload.
+fn seq_of(data: &str) -> u64 {
+    data.split_once(':').unwrap().0.parse().unwrap()
+}
+
+/// Task 2.3 — TARGETED SHED + FRESHEST-WINS. On a single-worker percore server
+/// with a tiny budget, flood a channel with sequence-numbered frames. A FAST
+/// subscriber that drains continuously keeps its out-queue empty, so the
+/// graduated shed never skips it — it receives EVERY published frame, in order.
+/// A SLOW subscriber that never reads backs up, so it is shed / drop-headed: it
+/// loses frames, and the frames it DOES end up with are the NEWEST (freshest-wins
+/// drop-head), never a stale prefix.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn overload_targeted_shed_fast_gets_all_slow_gets_freshest() {
+    let _guard = HARNESS_LOCK.lock().await;
+    // One worker so the fast + slow subscriber share the same per-worker budget
+    // (SO_REUSEPORT can't otherwise guarantee colocation). Tiny budget + small
+    // per-conn cap so the slow consumer saturates quickly.
+    let config = ServerConfig {
+        workers: 1,
+        memory_budget_bytes: 1 << 20, // 1 MiB worker budget
+        expected_conns_per_worker: 8,
+        perconn_queue_min_bytes: 16 << 10,
+        perconn_queue_max_bytes: 64 << 10,
+        ..base_config(free_port())
+    };
+    const N_PUB: u64 = 4000;
+    // ≈ 2 KiB per frame so an un-drained slow consumer overflows its 64 KiB cap
+    // (and socket buffers) after a few dozen frames → drop-head evicts the oldest.
+    let pad = "p".repeat(2048);
+
+    let result = tokio::time::timeout(WALL, async {
+        let h = spawn_with(config).await;
+        let channel = "shed-chan";
+
+        // FAST subscriber: subscribed, then drained continuously by a task that
+        // records every sequence number it receives, in arrival order.
+        let mut fast = connect(h.port).await;
+        let est = next_json(&mut fast).await;
+        assert_eq!(est["event"], "pusher:connection_established");
+        subscribe_public(&mut fast, channel).await;
+
+        // SLOW subscriber: subscribed, then NEVER read until after the flood.
+        let mut slow = connect(h.port).await;
+        let est = next_json(&mut slow).await;
+        assert_eq!(est["event"], "pusher:connection_established");
+        subscribe_public(&mut slow, channel).await;
+
+        // Drain the FAST subscriber in the background, collecting sequence numbers.
+        let fast_seqs = Arc::new(std::sync::Mutex::new(Vec::<u64>::new()));
+        let fast_seqs_bg = fast_seqs.clone();
+        let drain_fast = tokio::spawn(async move {
+            loop {
+                match tokio::time::timeout(Duration::from_millis(500), fast.next()).await {
+                    Ok(Some(Ok(Message::Text(t)))) => {
+                        let v: Value = serde_json::from_str(&t).unwrap();
+                        if v["event"] == "flood" {
+                            fast_seqs_bg
+                                .lock()
+                                .unwrap()
+                                .push(seq_of(v["data"].as_str().unwrap()));
+                        }
+                    }
+                    Ok(Some(Ok(_))) => {}
+                    // Idle gap after the flood ended → done draining.
+                    Err(_) => break,
+                    Ok(Some(Err(_))) | Ok(None) => break,
+                }
+            }
+        });
+
+        // Flood the channel with N_PUB sequence-numbered publishes, paced just
+        // enough that the slow consumer backs up but the fast one keeps up.
+        let client = reqwest::Client::new();
+        for seq in 1..=N_PUB {
+            let _ = publish_seq(h.port, &client, channel, seq, &pad).await;
+        }
+
+        // Let the fast drain settle, then collect its received sequence list.
+        tokio::time::sleep(Duration::from_millis(800)).await;
+        let _ = drain_fast.await;
+        let fast_got = fast_seqs.lock().unwrap().clone();
+
+        // FAST: received EVERY published frame, in order, exactly once.
+        assert_eq!(
+            fast_got.len() as u64,
+            N_PUB,
+            "fast subscriber must receive ALL {N_PUB} frames (got {})",
+            fast_got.len()
+        );
+        let expected: Vec<u64> = (1..=N_PUB).collect();
+        assert_eq!(fast_got, expected, "fast subscriber frames out of order / missing");
+
+        // SLOW: drain whatever it managed to queue (drop-head kept the newest).
+        let mut slow_got: Vec<u64> = Vec::new();
+        loop {
+            match tokio::time::timeout(Duration::from_millis(500), slow.next()).await {
+                Ok(Some(Ok(Message::Text(t)))) => {
+                    let v: Value = serde_json::from_str(&t).unwrap();
+                    if v["event"] == "flood" {
+                        slow_got.push(seq_of(v["data"].as_str().unwrap()));
+                    }
+                }
+                Ok(Some(Ok(_))) => {}
+                _ => break,
+            }
+        }
+
+        // TARGETED: the slow subscriber lost frames (was shed) while the fast one
+        // got them all.
+        assert!(
+            (slow_got.len() as u64) < N_PUB,
+            "slow subscriber should have LOST frames (got {} of {N_PUB})",
+            slow_got.len()
+        );
+        assert!(!slow_got.is_empty(), "slow subscriber got nothing at all");
+        // FRESHEST-WINS: the newest frame (N_PUB) survived. drop-head evicts the
+        // OLDEST queued frame for a slow consumer, so the latest data always wins
+        // — the freshest frame must be among those the slow subscriber received.
+        let slow_max = *slow_got.iter().max().unwrap();
+        assert_eq!(
+            slow_max, N_PUB,
+            "slow subscriber missed the NEWEST frame (max seq {slow_max} != {N_PUB}) — \
+             drop-head must keep the freshest"
+        );
+
+        drop(slow);
+        drop(h);
+    })
+    .await;
+    result.expect("targeted-shed test did not complete within the wall");
+}
+
+/// Task 2.3 — 503 ADMISSION. Under a sustained flood that saturates the broadcast
+/// hand-off / per-worker budget, `POST /events` returns 503 (admission control);
+/// once the flood stops and delivery drains, a publish returns 200 again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn overload_publish_returns_503_then_200_after() {
+    let _guard = HARNESS_LOCK.lock().await;
+    // Tiny budget + small hand-off cap so saturation is easy to provoke.
+    let config = ServerConfig {
+        memory_budget_bytes: 2 << 20,
+        expected_conns_per_worker: 50,
+        perconn_queue_min_bytes: 16 << 10,
+        perconn_queue_max_bytes: 64 << 10,
+        broadcast_handoff_cap: 8,
+        ..base_config(free_port())
+    };
+
+    let result = tokio::time::timeout(WALL, async {
+        let h = spawn_with(config).await;
+        let channel = "admit-chan";
+
+        // Many never-reading subscribers so delivery backs up and the pipeline
+        // saturates under the flood.
+        let mut subs: Vec<Ws> = Vec::with_capacity(N_SUBS);
+        for _ in 0..N_SUBS {
+            let mut ws = connect(h.port).await;
+            let est = next_json(&mut ws).await;
+            assert_eq!(est["event"], "pusher:connection_established");
+            subscribe_public(&mut ws, channel).await;
+            subs.push(ws);
+        }
+
+        let client = reqwest::Client::new();
+        let port = h.port;
+        // Flood with a big payload from several publishers; concurrently sample
+        // the publish status. Under saturation at least one must be a 503.
+        let big = "y".repeat(8192);
+        let saw_503 = Arc::new(AtomicBool::new(false));
+        let mut publishers = Vec::new();
+        for _ in 0..8 {
+            let client = client.clone();
+            let payload = big.clone();
+            let saw = saw_503.clone();
+            publishers.push(tokio::spawn(async move {
+                let start = Instant::now();
+                while start.elapsed() < FLOOD {
+                    let status = publish(port, &client, channel, &payload).await;
+                    if status == 503 {
+                        saw.store(true, Ordering::SeqCst);
+                    }
+                }
+            }));
+        }
+        for p in publishers {
+            let _ = p.await;
+        }
+
+        assert!(
+            saw_503.load(Ordering::SeqCst),
+            "under sustained flood, POST /events must return 503 at least once"
+        );
+
+        // After the flood: drain the subscribers so the workers clear saturation,
+        // then a publish to a fresh channel must be accepted (200).
+        for ws in subs.iter_mut() {
+            // Drain a few frames each so out-queues empty and saturation clears.
+            for _ in 0..50 {
+                if tokio::time::timeout(Duration::from_millis(50), ws.next())
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        }
+        // Give the workers a moment to drain inboxes and clear the saturated flag.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        // Retry briefly: the flag clears on the next worker drain cycle.
+        let mut got_200 = false;
+        for _ in 0..40 {
+            let status = publish(h.port, &client, "post-flood-chan", "{\"ok\":1}").await;
+            if status == 200 {
+                got_200 = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert!(got_200, "after the flood, POST /events must return 200 again");
+
+        drop(subs);
+        drop(h);
+    })
+    .await;
+    result.expect("503-admission test did not complete within the wall");
+}
+
+/// Phase 2 gate: under the flood, the total bytes queued across all workers must
+/// never exceed the configured memory budget. With a small explicit budget
+/// (`PYLON_MEMORY_BUDGET_BYTES`), flood publishes to many never-reading
+/// subscribers and sample `percore_total_inflight_bytes()` throughout — it must
+/// stay within the budget (a small per-frame slack for the in-flight enqueue
+/// before the next loop-top recompute / shed kicks in).
 /// Phase 2 gate: under the flood, the total bytes queued across all workers must
 /// never exceed the configured memory budget. With a small explicit budget,
 /// flood publishes to many never-reading subscribers and sample

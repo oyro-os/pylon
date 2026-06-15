@@ -325,6 +325,14 @@ impl ConnectionContext {
             });
             return;
         }
+        // SP10 admission control: under sustained overload the percore broadcast
+        // pipeline is saturated — drop the client-event at ingress (don't
+        // broadcast), the WS analogue of the REST 503. Mirrors the rate-limit
+        // drop path below; silent (no in-band frame) since this is a server-side
+        // shed, not a client-side limit. Off-percore `is_saturated()` is false.
+        if self.is_saturated() {
+            return;
+        }
         // Rate-limit client events: drop + send in-band 4301 if the per-second
         // window is exhausted (Pusher parity: 10 client events/sec/connection).
         if !self.client_event_rate.check() {

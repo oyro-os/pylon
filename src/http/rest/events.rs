@@ -152,6 +152,13 @@ pub async fn post_events(
     body: Bytes,
 ) -> Result<Json<Value>, RestError> {
     let app = authenticate(&state, &app_id, "POST", uri.path(), &params, &body).await?;
+    // SP10 admission control: under sustained overload the percore broadcast
+    // pipeline is saturated — reject the publish (503 + Retry-After) instead of
+    // broadcasting, so the publisher backs off and the fast path is never
+    // throttled. Off-percore `is_saturated()` is always false (no-op).
+    if state.is_saturated() {
+        return Err(RestError::service_unavailable("Server overloaded"));
+    }
     let t: TriggerBody = serde_json::from_slice(&body)
         .map_err(|_| RestError::bad_request("invalid request body"))?;
     if t.data.len() > state.config.max_event_payload_bytes {
@@ -231,6 +238,10 @@ pub async fn post_batch(
     body: Bytes,
 ) -> Result<Json<Value>, RestError> {
     let app = authenticate(&state, &app_id, "POST", uri.path(), &params, &body).await?;
+    // SP10 admission control: reject under saturation (see `post_events`).
+    if state.is_saturated() {
+        return Err(RestError::service_unavailable("Server overloaded"));
+    }
     let b: BatchBody = serde_json::from_slice(&body)
         .map_err(|_| RestError::bad_request("invalid request body"))?;
     if b.batch.is_empty() || b.batch.len() > state.config.max_batch_events {
