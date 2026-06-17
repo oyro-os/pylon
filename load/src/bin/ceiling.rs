@@ -5,12 +5,10 @@
 //! publish rate to their ceilings, then prints a human or JSON report.
 //!
 //! # Ctrl-C / signal note
-//! The ctrl-c handler calls `std::process::exit(130)`, which bypasses Rust's
-//! drop glue.  The PylonChild Drop guard will therefore NOT run on Ctrl-C, so
-//! the child process group may be left alive.  This is an acceptable trade-off
-//! for simplicity; users can `kill -- -<pgid>` or rely on the parent-death
-//! signal on Linux.  A production harness could use a `Arc<Mutex<Option<PylonChild>>>`
-//! shared with the signal handler, but that complexity is out of scope here.
+//! The ctrl-c handler kills the child's process group before exiting, ensuring
+//! proper teardown even though `std::process::exit(130)` bypasses Rust's drop glue.
+//! The PylonChild Drop guard won't run on Ctrl-C, so we explicitly kill the group in
+//! the signal handler.
 
 use anyhow::Result;
 use clap::{Parser, ValueEnum};
@@ -160,11 +158,7 @@ async fn main() -> Result<()> {
     let server_cores = args.server_cores;
 
     // Build taskset CPU list: e.g. server_cores=4 → "0-3"; server_cores=1 → "0-0".
-    let cores_list = if server_cores == 1 {
-        "0-0".to_string()
-    } else {
-        format!("0-{}", server_cores.saturating_sub(1))
-    };
+    let cores_list = format!("0-{}", server_cores.saturating_sub(1));
 
     // 3. Resolve apps path.
     let apps_path = if args.apps_path.is_empty() {
@@ -187,10 +181,16 @@ async fn main() -> Result<()> {
     let url = format!("ws://127.0.0.1:{}/app/app-key", args.port);
     let rest = format!("http://127.0.0.1:{}", args.port);
 
-    // 6. Install Ctrl-C handler (best-effort; see module-level note about Drop).
-    tokio::spawn(async {
+    // 6. Install Ctrl-C handler; kill the child's process group before exiting.
+    let pgid = child.pid();
+    tokio::spawn(async move {
         let _ = tokio::signal::ctrl_c().await;
-        eprintln!("interrupted");
+        eprintln!("interrupted — tearing down pylon child");
+        // Kill the child's process group (negative pid). Drop won't run under process::exit,
+        // so do the teardown explicitly here.
+        let _ = std::process::Command::new("kill")
+            .args(["-TERM", &format!("-{pgid}")])
+            .status();
         std::process::exit(130);
     });
 
