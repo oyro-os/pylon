@@ -157,6 +157,17 @@ pub async fn run(child: &PylonChild, opts: &RateRampOpts) -> TputCeiling {
         )
         .await;
 
+        // Sample CPU at the END of the active publish window (before the settle below),
+        // so cpu_busy_pct reflects load during step_secs, not the idle drain.
+        let (u1, s1) = child.cpu_ticks().unwrap_or((u0, s0));
+
+        // Settle: `publish_openloop` only drained the in-flight HTTP publishes; the
+        // server-side N-way fan-out they triggered is still landing on the subscriber
+        // sockets. Wait for it before counting deliveries, otherwise drop% is
+        // over-reported and the sweep trips `Drops` prematurely — under-reporting the
+        // true throughput ceiling.
+        tokio::time::sleep(Duration::from_millis(800)).await;
+
         // --- post-step measurements ---
         let rec1 = h.counters.received.load(Ordering::Relaxed);
         let delivered = rec1 - rec0;
@@ -172,8 +183,8 @@ pub async fn run(child: &PylonChild, opts: &RateRampOpts) -> TputCeiling {
         let (_, p50_us, p99_us, _, _) = h.lat.summary_us();
         let (p50_ms, p99_ms) = (p50_us / 1000, p99_us / 1000);
 
-        // CPU: delta ticks / USER_HZ / elapsed_secs / server_cores → busy%.
-        let (u1, s1) = child.cpu_ticks().unwrap_or((u0, s0));
+        // CPU: delta ticks / USER_HZ / elapsed_secs / server_cores → busy%
+        // (u1/s1 were sampled at the end of the active window, above).
         let cores_used =
             ((u1 + s1).saturating_sub(u0 + s0)) as f64 / 100.0 / opts.step_secs.max(1) as f64;
         let cpu_busy_pct = if opts.server_cores > 0 {

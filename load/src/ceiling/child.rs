@@ -44,8 +44,9 @@ impl PylonChild {
         let pid = child.id().context("child exited before we could read its PID")?;
         let pgid = pid;
 
-        // Poll until the child is listening or we time out (10 s).
-        let deadline = Instant::now() + Duration::from_secs(10);
+        // Poll until the child is listening or we time out (20 s — debug builds and
+        // loaded candidate servers can be slow to bind).
+        let deadline = Instant::now() + Duration::from_secs(20);
         let addr = format!("127.0.0.1:{}", opts.port);
         loop {
             // Check if the child has already exited.
@@ -60,11 +61,11 @@ impl PylonChild {
             }
 
             if Instant::now() >= deadline {
-                // Send SIGTERM to the group before returning the error.
-                let _ = std::process::Command::new("kill")
-                    .args(["-TERM", &format!("-{pgid}")])
-                    .status();
-                bail!("pylon child did not become ready on {} within 10 s", addr);
+                // Reliably kill the started-but-not-ready child before erroring, so a
+                // failed readiness check never leaks a pylon process.
+                let _ = child.start_kill();
+                let _ = child.try_wait();
+                bail!("pylon child did not become ready on {} within 20 s", addr);
             }
 
             tokio::time::sleep(Duration::from_millis(50)).await;
@@ -94,16 +95,17 @@ impl PylonChild {
 
 impl Drop for PylonChild {
     fn drop(&mut self) {
-        // Kill the entire process group. Best-effort — never panic.
+        // Graceful first: SIGTERM the child by its POSITIVE pid. (The negative
+        // process-group form via the `kill` binary is unreliable on util-linux —
+        // it returns success but does not signal the group across sessions, which
+        // silently leaks the child.) pylon is a single process, so the pid suffices.
         let _ = std::process::Command::new("kill")
-            .args(["-TERM", &format!("-{}", self.pgid)])
+            .args(["-TERM", &self.pgid.to_string()])
             .status();
 
-        // Remove the temp apps file. Best-effort.
-        let _ = std::fs::remove_file(&self.apps_path);
-
-        // Reap the child so /proc/<pid> disappears. We spin-try_wait for up to 2 s
-        // (SIGTERM delivered above; pylon shuts down quickly). Best-effort: never panic.
+        // Reap, escalating to a GUARANTEED SIGKILL via the tokio handle if the child
+        // hasn't exited within 2 s. `start_kill` signals the kernel directly (no CLI
+        // parsing), so it cannot silently no-op. Best-effort: never panic in Drop.
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
         loop {
             match self.child.try_wait() {
@@ -112,10 +114,15 @@ impl Drop for PylonChild {
                 Err(_) => break,      // unexpected error — give up
             }
             if std::time::Instant::now() >= deadline {
+                let _ = self.child.start_kill(); // SIGKILL — guaranteed delivery
+                let _ = self.child.try_wait(); // reap the now-dead child
                 break;
             }
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
+
+        // Remove the temp apps file last. Best-effort.
+        let _ = std::fs::remove_file(&self.apps_path);
     }
 }
 
