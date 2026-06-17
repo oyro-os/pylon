@@ -54,7 +54,7 @@ pub fn should_stop(
     if rss >= mem_ceiling {
         return Some(StopReason::MemCeiling);
     }
-    if connect_failed >= fail_threshold {
+    if fail_threshold > 0 && connect_failed >= fail_threshold {
         return Some(StopReason::ConnectFailures);
     }
     if max_conns > 0 && conns >= max_conns {
@@ -113,7 +113,7 @@ pub async fn run(child: &PylonChild, spec: &BoxSpec, opts: &ConnRampOpts) -> Con
             mem_ceiling,
             connect_failed,
             opts.fail_threshold,
-            total as u64,
+            h.counters.subscribed.load(Ordering::Relaxed),
             opts.max_conns as u64,
         ) {
             stop_reason = reason;
@@ -165,5 +165,11 @@ mod tests {
     #[test]
     fn keeps_going() {
         assert!(should_stop(100, 800, 0, 100, 500, 0).is_none());
+    }
+
+    #[test]
+    fn fail_threshold_zero_disables_failure_stop() {
+        // threshold 0 = disabled; even with failures present, do not stop on failures
+        assert!(should_stop(100, 800, 5, 0, 500, 0).is_none());
     }
 }
