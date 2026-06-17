@@ -36,7 +36,6 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [dev-dependencies]
-# Spawn a real pylon server in-process for the smoke test.
+# Ensures the pylon crate builds alongside these tests. The child-spawning tests
+# (smoke, ceiling_*) exec the separately-built `target/<profile>/pylon` binary.
 pylon = { path = ".." }
-# `axum::serve` the pylon router on a loopback port in the smoke test.
-axum = { version = "0.8", features = ["ws"] }

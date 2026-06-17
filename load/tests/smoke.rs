@@ -1,43 +1,27 @@
-//! Low-N end-to-end smoke test against an in-process pylon. CI-safe.
-use pylon::adapter::local::LocalAdapter;
-use pylon::adapter::Adapter;
-use pylon::app::static_file::StaticFileAppManager;
-use pylon::app::AppManager;
-use pylon::channel::registry::Registry;
-use pylon::server::config::ServerConfig;
-use pylon::server::router::{build_router, AppState};
+//! Low-N end-to-end smoke against a real pylon child (the percore transport — the only
+//! transport since SP11). Confirms the harness's `run_client` subscriber and `Publisher`
+//! deliver every published event to every subscriber (exact `recv == K*P`). CI-safe.
+use pylon_load::ceiling::child::{default_pylon_bin, write_temp_apps, ChildOpts, PylonChild};
+use pylon_load::metrics::{Counters, Latency};
+use pylon_load::pusher::{run_client, stamp_payload, ClientConfig, Publisher};
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use pylon_load::metrics::{Counters, Latency};
-use pylon_load::pusher::{run_client, stamp_payload, ClientConfig, Publisher};
-
-const APPS: &str = r#"[{"name":"T","id":"app","key":"app-key","secret":"app-secret","capacity":1000}]"#;
-
-async fn spawn() -> std::net::SocketAddr {
-    let apps: Arc<dyn AppManager> = Arc::new(StaticFileAppManager::from_json(APPS).unwrap());
-    let adapter: Arc<dyn Adapter> = Arc::new(LocalAdapter::new(Arc::new(Registry::new())));
-    let state = AppState {
-        config: ServerConfig::default(),
-        apps,
-        adapter,
-        conn_counts: Arc::new(Default::default()),
-        webhooks: pylon::webhook::WebhookHandle::null(),
-        // SP10 added the percore saturation flag; this REST-only smoke has no percore
-        // worker, so there is no flag to share.
-        saturated: None,
-    };
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move { axum::serve(listener, build_router(state)).await.unwrap(); });
-    addr
-}
-
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn fanout_smoke_delivers_to_all() {
-    let addr = spawn().await;
-    let url = format!("ws://{addr}/app/app-key");
-    let rest = format!("http://{addr}");
+    let apps = write_temp_apps().unwrap();
+    let opts = ChildOpts {
+        pylon_bin: default_pylon_bin(),
+        port: 7720,
+        workers: 2,
+        cores: "0-1".into(),
+        apps_path: apps,
+    };
+    let child = PylonChild::spawn(&opts).await.expect("spawn pylon child");
+    let url = "ws://127.0.0.1:7720/app/app-key".to_string();
+    let rest = "http://127.0.0.1:7720".to_string();
+
     let epoch = Instant::now();
     let lat = Arc::new(Latency::default());
     let counters = Arc::new(Counters::default());
@@ -47,17 +31,23 @@ async fn fanout_smoke_delivers_to_all() {
     let mut tasks = Vec::new();
     for _ in 0..K {
         let cfg = ClientConfig {
-            url: url.clone(), key: "app-key".into(), secret: "app-secret".into(),
-            channel: "bench".into(), private: false, src_ip: None,
+            url: url.clone(),
+            key: "app-key".into(),
+            secret: "app-secret".into(),
+            channel: "bench".into(),
+            private: false,
+            src_ip: None,
         };
         let (l, c, s) = (lat.clone(), counters.clone(), shutdown.clone());
-        tasks.push(tokio::spawn(async move { let _ = run_client(cfg, epoch, l, c, s).await; }));
+        tasks.push(tokio::spawn(async move {
+            let _ = run_client(cfg, epoch, l, c, s).await;
+        }));
     }
 
-    // wait for all subscribed
+    // wait for all K subscribed
     let start = Instant::now();
-    while counters.subscribed.load(std::sync::atomic::Ordering::Relaxed) < K as u64 {
-        assert!(start.elapsed() < Duration::from_secs(10), "subscribe timeout");
+    while counters.subscribed.load(Ordering::Relaxed) < K as u64 {
+        assert!(start.elapsed() < Duration::from_secs(15), "subscribe timeout");
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
 
@@ -65,17 +55,22 @@ async fn fanout_smoke_delivers_to_all() {
     const P: u64 = 5;
     for seq in 0..P {
         let payload = stamp_payload(seq, epoch.elapsed().as_nanos());
-        pubr.publish("bench", "ev", &payload, pylon_load::pusher::unix_now()).await.unwrap();
-        tokio::time::sleep(Duration::from_millis(20)).await;
+        pubr.publish("bench", "ev", &payload, pylon_load::pusher::unix_now())
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
 
-    let recv = counters.received.load(std::sync::atomic::Ordering::Relaxed);
+    let recv = counters.received.load(Ordering::Relaxed);
     assert_eq!(recv, K as u64 * P, "expected {} got {recv}", K as u64 * P);
     let (count, _p50, _p99, _p999, max) = lat.summary_us();
     assert_eq!(count, K as u64 * P);
     assert!(max < 5_000_000, "max latency {max}µs too high"); // < 5s sanity
 
     shutdown.notify_waiters();
-    for t in tasks { let _ = t.await; }
+    for t in tasks {
+        let _ = t.await;
+    }
+    // child drops here → process group torn down
 }
