@@ -3,6 +3,7 @@
 pub mod auth;
 pub mod channels;
 pub mod events;
+pub mod metrics;
 pub mod users;
 
 use crate::server::router::AppState;
@@ -33,5 +34,6 @@ pub fn merge(router: Router<AppState>, body_limit: usize) -> Router<AppState> {
             post(users::terminate_user_connections),
         )
         .layer(DefaultBodyLimit::max(body_limit));
-    router.merge(rest)
+    let metrics = Router::new().route("/metrics", get(metrics::get_metrics));
+    router.merge(rest).merge(metrics)
 }

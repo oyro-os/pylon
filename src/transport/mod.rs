@@ -33,30 +33,68 @@ use worker::{BroadcastWiring, DispatchEnv, Mode, WorkerConfig};
 
 pub use rest::RestConn;
 
-/// Process-global registry of the live per-core workers' inflight-byte counters,
-/// one `AtomicU64` per worker. Installed by [`run_percore`] (test-hooks builds)
-/// and summed by [`percore_total_inflight_bytes`]. Behind a feature gate so it
-/// adds no surface to release builds.
-#[cfg(any(test, feature = "test-hooks"))]
-static INFLIGHT_SLOTS: std::sync::OnceLock<std::sync::Mutex<Vec<Arc<AtomicU64>>>> =
+/// Process-global registry of live per-core worker metrics. Filled unconditionally
+/// by [`run_percore`] at startup so the `/metrics` handler can read it in production.
+static PERCORE_REGISTRY: std::sync::OnceLock<std::sync::Mutex<PercoreRegistry>> =
     std::sync::OnceLock::new();
 
-/// Test hook (SP10): total bytes queued across ALL per-core workers — the sum of
-/// each worker's local `inflight_bytes` counter (mirrored into a shared
-/// `AtomicU64` slot every loop iteration). Used by the overload flood test to
-/// assert the total stays within the configured memory budget. Returns 0 before
-/// any percore server has installed its slots.
+/// Internal registry holding shared atomics for every per-core worker.
+struct PercoreRegistry {
+    inflight_slots: Vec<Arc<AtomicU64>>,
+    /// Worker slot arcs retained to read `.dropped` (a plain `AtomicU64` embedded
+    /// in the slot struct, owned by the `Arc`). `Empty` when `local` is `None`.
+    worker_slots: Vec<Arc<fanout::WorkerSlot>>,
+    budget_factor: Arc<AtomicU32>,
+    worker_budget_bytes: u64,
+}
+
+/// Snapshot of per-core worker metrics for the `/metrics` handler.
+pub struct PercoreMetricsSnapshot {
+    /// Per-worker inflight bytes (one entry per worker, in order).
+    pub inflight: Vec<u64>,
+    /// Per-worker broadcast drop count (cumulative counter, one per worker).
+    pub dropped: Vec<u64>,
+    /// Sum of all workers' inflight bytes.
+    pub inflight_total: u64,
+    /// Budget factor as a fraction (×1000 fixed-point → 0.0–1.0).
+    pub budget_factor: f64,
+    /// Per-worker memory budget in bytes.
+    pub worker_budget_bytes: u64,
+}
+
+/// Snapshot the current per-core worker metrics. Returns `None` if no percore
+/// fleet has been started (e.g. REST-only test environments).
+pub fn percore_metrics_snapshot() -> Option<PercoreMetricsSnapshot> {
+    use std::sync::atomic::Ordering;
+    let guard = PERCORE_REGISTRY.get()?.lock().unwrap();
+    let inflight: Vec<u64> = guard
+        .inflight_slots
+        .iter()
+        .map(|s| s.load(Ordering::Relaxed))
+        .collect();
+    let dropped: Vec<u64> = guard
+        .worker_slots
+        .iter()
+        .map(|s| s.dropped.load(Ordering::Relaxed))
+        .collect();
+    let inflight_total = inflight.iter().sum();
+    let budget_factor = guard.budget_factor.load(Ordering::Relaxed) as f64 / 1000.0;
+    let worker_budget_bytes = guard.worker_budget_bytes;
+    Some(PercoreMetricsSnapshot {
+        inflight,
+        dropped,
+        inflight_total,
+        budget_factor,
+        worker_budget_bytes,
+    })
+}
+
+/// Test hook (SP10): total bytes queued across ALL per-core workers. Returns 0
+/// before any percore server has installed its slots.
 #[cfg(any(test, feature = "test-hooks"))]
 pub fn percore_total_inflight_bytes() -> u64 {
-    INFLIGHT_SLOTS
-        .get()
-        .map(|m| {
-            m.lock()
-                .unwrap()
-                .iter()
-                .map(|s| s.load(std::sync::atomic::Ordering::Relaxed))
-                .sum()
-        })
+    percore_metrics_snapshot()
+        .map(|s| s.inflight_total)
         .unwrap_or(0)
 }
 
@@ -164,15 +202,6 @@ pub fn run_percore(
     // off-hot-path `percore_total_inflight_bytes()` test hook sums them.
     let inflight_slots: Vec<Arc<AtomicU64>> =
         (0..worker_count).map(|_| Arc::new(AtomicU64::new(0))).collect();
-    #[cfg(any(test, feature = "test-hooks"))]
-    {
-        let mut g = INFLIGHT_SLOTS
-            .get_or_init(|| std::sync::Mutex::new(Vec::new()))
-            .lock()
-            .unwrap();
-        g.clear();
-        g.extend(inflight_slots.iter().cloned());
-    }
 
     // Build the per-core sharded broadcast plumbing: one `(Sender, Receiver)`
     // pair + `WorkerSlot` per worker. The `Sender`s live in the sink (installed
@@ -185,6 +214,9 @@ pub fn run_percore(
     // publish→workers channel is bounded so a publish flood that outruns delivery
     // is dropped at the hand-off rather than buffered unbounded (the SP9 hang).
     let handoff_cap = config.broadcast_handoff_cap;
+
+    // Worker slot arcs retained for the metrics registry (to read `.dropped`).
+    let mut worker_slots_for_metrics: Vec<Arc<WorkerSlot>> = Vec::new();
 
     let mut wirings: Vec<Option<BroadcastWiring>> = Vec::with_capacity(worker_count);
     if let Some(local) = &local {
@@ -204,6 +236,8 @@ pub fn run_percore(
             }));
             receivers.push(rx);
         }
+        // Retain slot arcs for the metrics registry before moving them into wirings.
+        worker_slots_for_metrics.extend(slots.iter().cloned());
         // Sink-shared saturation flag: set by the publisher on a full hand-off
         // OR by a worker that hit ≥100% of its byte budget, cleared by each
         // worker after it drains its inbox to empty. Sourced from the
@@ -260,6 +294,27 @@ pub fn run_percore(
         } else {
             tracing::debug!("PSI backstop requested but unavailable; budget factor pinned");
         }
+    }
+
+    // Fill the global percore metrics registry. Overwrites any prior entry (safe:
+    // `get_or_init` initialises the Mutex once; subsequent runs replace the inner
+    // value so re-runs in tests see fresh slots).
+    {
+        let mut g = PERCORE_REGISTRY
+            .get_or_init(|| std::sync::Mutex::new(PercoreRegistry {
+                inflight_slots: Vec::new(),
+                worker_slots: Vec::new(),
+                budget_factor: budget_factor.clone(),
+                worker_budget_bytes: per_worker_budget,
+            }))
+            .lock()
+            .unwrap();
+        g.inflight_slots.clear();
+        g.inflight_slots.extend(inflight_slots.iter().cloned());
+        g.worker_slots.clear();
+        g.worker_slots.extend(worker_slots_for_metrics.iter().cloned());
+        g.budget_factor = budget_factor.clone();
+        g.worker_budget_bytes = per_worker_budget;
     }
 
     let mut handles = Vec::with_capacity(worker_count);
