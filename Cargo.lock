@@ -1513,7 +1513,6 @@ name = "pylon-load"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "axum",
  "clap",
  "futures-util",
  "hdrhistogram",
