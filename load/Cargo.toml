@@ -13,6 +13,10 @@ path = "src/lib.rs"
 name = "pylon-load"
 path = "src/main.rs"
 
+[[bin]]
+name = "pylon-ceiling"
+path = "src/bin/ceiling.rs"
+
 [dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "time", "signal"] }
 tokio-tungstenite = "0.24"

@@ -3,7 +3,9 @@
 // default fanout path; they are exercised by tests and later SP8 tasks, so allow
 // the not-yet-used public API.
 #![allow(dead_code)]
+#![deny(unsafe_code)]
 
+pub mod ceiling;
 pub mod cli;
 pub mod metrics;
 pub mod pusher;
