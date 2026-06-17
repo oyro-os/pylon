@@ -23,6 +23,9 @@ async fn spawn() -> std::net::SocketAddr {
         adapter,
         conn_counts: Arc::new(Default::default()),
         webhooks: pylon::webhook::WebhookHandle::null(),
+        // SP10 added the percore saturation flag; this REST-only smoke has no percore
+        // worker, so there is no flag to share.
+        saturated: None,
     };
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();

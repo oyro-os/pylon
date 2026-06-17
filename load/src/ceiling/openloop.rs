@@ -56,8 +56,11 @@ pub async fn publish_openloop(
         });
         seq += 1;
     }
-    // let in-flight drain
-    let _ = Arc::clone(&sem).acquire_many_owned(max_inflight as u32).await;
+    // let in-flight drain (clamp the permit count explicitly; max_inflight is small in
+    // practice but the cast must not silently truncate)
+    let _ = Arc::clone(&sem)
+        .acquire_many_owned(u32::try_from(max_inflight).unwrap_or(u32::MAX))
+        .await;
     let att = attempted.load(Ordering::Relaxed);
     let bl = blocked.load(Ordering::Relaxed);
     OpenLoopResult {

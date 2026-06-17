@@ -16,11 +16,44 @@ pub fn parse_mem_total_kb(meminfo: &str) -> Option<u64> {
 }
 
 pub fn parse_physical_cores(cpuinfo: &str) -> Option<usize> {
-    let ids: std::collections::HashSet<&str> = cpuinfo
-        .lines()
-        .filter_map(|l| l.strip_prefix("core id").map(|r| r.trim_start_matches([':', ' ', '\t']).trim()))
-        .collect();
-    if ids.is_empty() { None } else { Some(ids.len()) }
+    // A physical core is unique by (physical id, core id) — `core id` alone is only
+    // unique within a socket, so counting it would undercount on multi-socket machines.
+    // Blocks are delimited by `processor` lines; `physical id` defaults to "0" (single
+    // socket) when the kernel omits it.
+    let val = |l: &str, key: &str| {
+        l.strip_prefix(key)
+            .map(|r| r.trim_start_matches([':', ' ', '\t']).trim().to_string())
+    };
+    let mut pairs: std::collections::HashSet<(String, String)> = std::collections::HashSet::new();
+    let mut phys = String::from("0");
+    let mut core: Option<String> = None;
+    let mut in_block = false;
+    for line in cpuinfo.lines() {
+        if line.starts_with("processor") {
+            if in_block {
+                if let Some(c) = core.take() {
+                    pairs.insert((phys.clone(), c));
+                }
+            }
+            phys = String::from("0");
+            core = None;
+            in_block = true;
+        } else if let Some(v) = val(line, "physical id") {
+            phys = v;
+        } else if let Some(v) = val(line, "core id") {
+            core = Some(v);
+        }
+    }
+    if in_block {
+        if let Some(c) = core.take() {
+            pairs.insert((phys, c));
+        }
+    }
+    if pairs.is_empty() {
+        None
+    } else {
+        Some(pairs.len())
+    }
 }
 
 pub fn parse_cgroup_max(s: &str) -> Option<u64> {
@@ -65,6 +98,15 @@ mod tests {
     fn physical_cores_counts_unique_core_ids() {
         // two logical CPUs sharing core id 0 (HT), one on core id 1 → 2 physical
         let s = "processor\t: 0\ncore id\t\t: 0\nprocessor\t: 1\ncore id\t\t: 0\nprocessor\t: 2\ncore id\t\t: 1\n";
+        assert_eq!(parse_physical_cores(s), Some(2));
+    }
+
+    #[test]
+    fn physical_cores_counts_across_sockets() {
+        // 2 sockets, each with core id 0 → 2 distinct physical cores, NOT 1
+        // (the old core-id-only counter would have returned 1 here).
+        let s = "processor\t: 0\nphysical id\t: 0\ncore id\t\t: 0\n\n\
+                 processor\t: 1\nphysical id\t: 1\ncore id\t\t: 0\n";
         assert_eq!(parse_physical_cores(s), Some(2));
     }
 
