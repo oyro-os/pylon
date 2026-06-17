@@ -30,6 +30,10 @@ impl Latency {
             h.max() / 1000,
         )
     }
+    /// Reset the histogram so the next step starts with a fresh measurement window.
+    pub fn reset(&self) {
+        self.hist.lock().unwrap().clear();
+    }
 }
 
 #[derive(Default)]

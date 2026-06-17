@@ -4,4 +4,5 @@ pub mod child;
 pub mod conn_ramp;
 pub mod mpstat;
 pub mod openloop;
+pub mod rate_ramp;
 pub mod spec;
