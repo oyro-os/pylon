@@ -73,3 +73,9 @@ nav:
       - Production Tuning: user-guide/production-tuning.md
       - Observability: user-guide/observability.md
       - Troubleshooting & FAQ: user-guide/troubleshooting.md
+  - Developer Guide:
+      - Architecture: dev-guide/architecture.md
+      - Pusher Protocol: dev-guide/protocol.md
+      - Building & Testing: dev-guide/building-and-testing.md
+      - Contributing: dev-guide/contributing.md
+      - Release Process: dev-guide/release-process.md
