@@ -1,0 +1,116 @@
+# Clustering & Scaling
+
+Pylon scales horizontally by connecting multiple nodes through a shared Redis instance.
+Each node is stateless from a routing perspective — any node can serve any client.
+There is no sticky-session requirement.
+
+---
+
+## How it works
+
+By default, pylon uses the `local` adapter, which holds all connection and channel
+state in process memory. This is sufficient for a single node but cannot be shared
+across multiple servers.
+
+Switching to the `redis` adapter causes every node to:
+
+- **Publish and subscribe** to a shared Pub/Sub channel so that an event triggered
+  on one node is fanned out to connections on all other nodes.
+- **Coordinate presence channels** — member joins and leaves are written to Redis so
+  that any node can answer a presence query with the full, consistent member list.
+- **Route user-targeted operations** — `POST /users/{id}/terminate_connections` finds
+  the node(s) holding a specific user's connections via Redis and forwards the
+  termination command accordingly.
+- **Self-heal across Redis restarts** — nodes monitor the Redis connection and
+  reconnect automatically; a brief Redis outage does not crash pylon, it only
+  degrades cluster-state consistency until reconnection.
+
+---
+
+## Enabling the redis adapter
+
+Set these two variables identically on every pylon node:
+
+```env
+PYLON_ADAPTER=redis
+PYLON_REDIS_URL=redis://your-redis-host:6379
+```
+
+All other configuration (bind address, port, `PYLON_APPS_PATH`, …) stays per-node.
+The apps list must be **identical** on every node; pylon does not replicate it through Redis.
+
+### Optional Redis knobs
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `PYLON_REDIS_PREFIX` | `pylon` | Key prefix for all pylon Redis keys — change if you share a Redis instance with other services. |
+| `PYLON_REDIS_POOL_SIZE` | `6` | Connection-pool size per node. |
+| `PYLON_REDIS_MEMBERSHIP_TTL` | `60` | Seconds before a node's membership entry expires if it stops heartbeating. |
+| `PYLON_REDIS_NODE_HEARTBEAT` | `5` | Heartbeat interval (seconds) each node publishes to Redis. |
+| `PYLON_REDIS_PRESENCE_HEARTBEAT` | `25` | Interval (seconds) at which presence-member entries are refreshed. |
+| `PYLON_REDIS_SHARDED_PUBSUB` | `false` | Enable Redis 7+ sharded Pub/Sub for higher-throughput clusters. |
+
+See [Configuration](configuration.md) for the full variable reference.
+
+---
+
+## Load balancer requirements
+
+Any standard TCP/HTTP load balancer works — pylon does **not** require session affinity.
+The only requirements are:
+
+1. **Pass the WebSocket Upgrade through.** The load balancer must forward the
+   `Upgrade: websocket` and `Connection: Upgrade` headers unchanged, and must
+   not buffer or rewrite the HTTP response. Most modern LBs (HAProxy, nginx,
+   AWS ALB, GCP LB) support this out of the box; verify the WebSocket mode is
+   enabled in the LB configuration.
+
+2. **Use `/ready` for health checks.** During a rolling update, pylon flips
+   `/ready` to `503` before draining connections. Configure the LB to use
+   `GET /ready` as its health probe (not `/health`) so that draining nodes stop
+   receiving new connections before existing ones are closed.
+
+3. **Long connection timeouts.** The Pusher heartbeat cycle is 120 s; configure
+   idle-connection timeouts well above that (3 600 s is a safe default).
+
+---
+
+## Two-node Docker Compose example
+
+The repository ships a ready-to-run 2-node cluster under `deploy/docker/docker-compose.yml`.
+It starts Redis 7, `pylon-1` (host port 7000), and `pylon-2` (host port 7001),
+all sharing the same `apps.json` and connected via the redis adapter.
+
+```bash
+# 1. Apply host kernel tuning (needed once per Docker host):
+cp deploy/systemd/99-pylon.sysctl.conf /etc/sysctl.d/
+sysctl --system
+
+# 2. Create and edit the apps config — change the secret!
+cp deploy/systemd/apps.example.json deploy/docker/apps.json
+
+# 3. Build the image and start the cluster.
+cd deploy/docker
+docker compose up -d --build
+
+# 4. Verify both nodes are healthy.
+curl -s http://localhost:7000/health
+curl -s http://localhost:7001/health
+```
+
+In production, put a load balancer (nginx, HAProxy, or a cloud LB) in front of
+the two nodes and route traffic to whichever node responds healthy on `/ready`.
+
+---
+
+## Redis high availability
+
+For production, run Redis with at least one replica and use Redis Sentinel or
+Redis Cluster so that a primary failure does not take the cluster state offline.
+Pylon reconnects automatically on connection loss, so a Sentinel failover
+(typically 10–30 s) results in a brief degradation window rather than a hard outage.
+
+!!! warning "Redis is a coordination plane, not a data plane"
+    All WebSocket frames are delivered directly between pylon nodes and their
+    connected clients. Redis only coordinates channel state and fan-out routing;
+    its throughput requirements are far lower than the WebSocket message rate.

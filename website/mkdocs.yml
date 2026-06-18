@@ -67,3 +67,6 @@ nav:
       - Connecting Clients: user-guide/clients.md
       - Triggering Events: user-guide/triggering-events.md
       - Webhooks: user-guide/webhooks.md
+      - Clustering & Scaling: user-guide/clustering.md
+      - TLS / SSL: user-guide/tls.md
+      - Deployment: user-guide/deployment.md
