@@ -22,4 +22,5 @@ work unchanged — point them at your own server and you're done.
 
 ## Get started
 
-[:fontawesome-brands-github: View on GitHub](https://github.com/oyro-os/pylon){ .md-button .md-button--primary }
+[Quick Start](user-guide/quick-start.md){ .md-button .md-button--primary }
+[:fontawesome-brands-github: View on GitHub](https://github.com/oyro-os/pylon){ .md-button }

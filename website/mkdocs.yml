@@ -57,3 +57,7 @@ plugins:
 
 nav:
   - Home: index.md
+  - User Guide:
+      - Introduction: user-guide/introduction.md
+      - Installation: user-guide/installation.md
+      - Quick Start: user-guide/quick-start.md
