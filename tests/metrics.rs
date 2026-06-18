@@ -213,3 +213,41 @@ async fn metrics_percore_metrics_present() {
         "per-worker inflight must appear:\n{body}"
     );
 }
+
+/// After WebSocket connections are accepted, `pylon_accepted_connections_total` is present and ≥ 1.
+#[tokio::test]
+async fn metrics_accepted_connections_counter_increases() {
+    let addr = spawn().await;
+
+    // Open a WS connection and wait for the connection_established frame.
+    let mut ws1 = connect_ws(addr).await;
+    let _ = next_json(&mut ws1).await;
+
+    // Poll until the counter appears and is ≥ 1 (up to 500 ms).
+    let mut value: u64 = 0;
+    for _ in 0..10 {
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let body = reqwest::Client::new()
+            .get(format!("http://{addr}/metrics"))
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+        value = body
+            .lines()
+            .find(|l| l.starts_with(r#"pylon_accepted_connections_total{worker="0"}"#))
+            .and_then(|l| l.split_whitespace().last())
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0);
+        if value >= 1 {
+            break;
+        }
+    }
+
+    assert!(
+        value >= 1,
+        "accepted_connections_total{{worker=\"0\"}} must be >= 1 after a connection, got {value}"
+    );
+}

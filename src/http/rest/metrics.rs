@@ -374,4 +374,112 @@ mod tests {
         assert!(help_pos < type_pos, "HELP must precede TYPE");
         assert!(type_pos < series_pos, "TYPE must precede series");
     }
+
+    #[test]
+    fn encode_percore_accepted_and_codel_present_when_some() {
+        use crate::transport::PercoreMetricsSnapshot;
+        let pc = PercoreMetricsSnapshot {
+            inflight: vec![0, 0],
+            dropped: vec![0, 0],
+            accepted: vec![42, 17],
+            codel_dropped: vec![3, 0],
+            inflight_total: 0,
+            budget_factor: 1.0,
+            worker_budget_bytes: 1,
+        };
+        let s = MetricsSnapshot {
+            apps: HashMap::new(),
+            saturation: None,
+            percore: Some(pc),
+            webhook: None,
+            webhook_queue_depth: None,
+            cluster: None,
+        };
+        let text = encode(&s);
+        assert!(text.contains("pylon_accepted_connections_total{worker=\"0\"} 42\n"), "accepted w0: {text}");
+        assert!(text.contains("pylon_accepted_connections_total{worker=\"1\"} 17\n"), "accepted w1: {text}");
+        assert!(text.contains("pylon_codel_dropped_total{worker=\"0\"} 3\n"), "codel_dropped w0: {text}");
+        assert!(text.contains("pylon_codel_dropped_total{worker=\"1\"} 0\n"), "codel_dropped w1: {text}");
+        assert!(text.contains("# TYPE pylon_accepted_connections_total counter"), "type counter accepted: {text}");
+        assert!(text.contains("# TYPE pylon_codel_dropped_total counter"), "type counter codel: {text}");
+    }
+
+    #[test]
+    fn encode_webhook_metrics_present_when_some() {
+        use crate::webhook::WebhookMetrics;
+        use std::sync::atomic::Ordering;
+        let wm = Arc::new(WebhookMetrics::new(100));
+        wm.enqueued.store(10, Ordering::Relaxed);
+        wm.dropped.store(2, Ordering::Relaxed);
+        wm.delivered_ok.store(7, Ordering::Relaxed);
+        wm.delivered_failed.store(1, Ordering::Relaxed);
+        let s = MetricsSnapshot {
+            apps: HashMap::new(),
+            saturation: None,
+            percore: None,
+            webhook: Some(wm),
+            webhook_queue_depth: Some(3),
+            cluster: None,
+        };
+        let text = encode(&s);
+        assert!(text.contains("pylon_webhook_enqueued_total 10\n"), "enqueued: {text}");
+        assert!(text.contains("pylon_webhook_dropped_total 2\n"), "dropped: {text}");
+        assert!(text.contains("pylon_webhook_delivered_total{status=\"ok\"} 7\n"), "ok: {text}");
+        assert!(text.contains("pylon_webhook_delivered_total{status=\"failed\"} 1\n"), "failed: {text}");
+        assert!(text.contains("pylon_webhook_queue_depth 3\n"), "queue_depth: {text}");
+        assert!(text.contains("# TYPE pylon_webhook_enqueued_total counter"), "type enqueued: {text}");
+        assert!(text.contains("# TYPE pylon_webhook_delivered_total counter"), "type delivered: {text}");
+    }
+
+    #[test]
+    fn encode_webhook_metrics_absent_when_none() {
+        let s = MetricsSnapshot {
+            apps: HashMap::new(),
+            saturation: None,
+            percore: None,
+            webhook: None,
+            webhook_queue_depth: None,
+            cluster: None,
+        };
+        let text = encode(&s);
+        assert!(!text.contains("pylon_webhook_enqueued_total"), "webhook must be absent: {text}");
+        assert!(!text.contains("pylon_webhook_queue_depth"), "queue_depth must be absent: {text}");
+    }
+
+    #[test]
+    fn encode_cluster_metrics_present_when_some() {
+        use crate::cluster::bridge::ClusterMetrics;
+        use std::sync::atomic::Ordering;
+        let cm = Arc::new(ClusterMetrics::new());
+        cm.cmd_dropped.store(5, Ordering::Relaxed);
+        cm.redis_connected.store(true, Ordering::Relaxed);
+        let s = MetricsSnapshot {
+            apps: HashMap::new(),
+            saturation: None,
+            percore: None,
+            webhook: None,
+            webhook_queue_depth: None,
+            cluster: Some(cm),
+        };
+        let text = encode(&s);
+        assert!(text.contains("pylon_cluster_cmd_dropped_total 5\n"), "cmd_dropped: {text}");
+        assert!(text.contains("pylon_redis_connected 1\n"), "redis_connected 1: {text}");
+        assert!(text.contains("# TYPE pylon_cluster_cmd_dropped_total counter"), "type counter cluster: {text}");
+        assert!(text.contains("# TYPE pylon_redis_connected gauge"), "type gauge redis: {text}");
+    }
+
+    #[test]
+    fn encode_cluster_metrics_absent_when_none() {
+        let s = MetricsSnapshot {
+            apps: HashMap::new(),
+            saturation: None,
+            percore: None,
+            webhook: None,
+            webhook_queue_depth: None,
+            cluster: None,
+        };
+        let text = encode(&s);
+        assert!(!text.contains("pylon_cluster_cmd_dropped_total"), "cluster must be absent: {text}");
+        assert!(!text.contains("pylon_redis_connected"), "redis_connected must be absent: {text}");
+    }
 }

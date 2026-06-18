@@ -40,7 +40,7 @@ pub struct ClusterMetrics {
 }
 
 impl ClusterMetrics {
-    fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             cmd_dropped: AtomicU64::new(0),
             redis_connected: Arc::new(AtomicBool::new(false)),
