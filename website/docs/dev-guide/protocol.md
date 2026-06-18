@@ -188,7 +188,6 @@ events on an otherwise open connection (the socket is **not** closed).
 | `4007` | Unsupported protocol version |
 | `4008` | No protocol version supplied (strict mode) |
 | `4009` | Channel name invalid or connection not authorised |
-| `4100` | Server over capacity (admission shedding) |
 | `4200` | Server shutting down — reconnect immediately |
 | `4201` | Pong timeout (connection went silent) |
 | `4301` | Client event rate-limited (non-fatal, connection stays open) |

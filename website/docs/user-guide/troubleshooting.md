@@ -16,14 +16,13 @@ their meanings, and the recommended client action.
 | `4007` | Unsupported protocol version | Do not reconnect; upgrade client library |
 | `4008` | No protocol version supplied | Do not reconnect; upgrade client library |
 | `4009` | Connection not authorised (auth failure) | Do not reconnect; fix authentication |
-| `4100` | Server over capacity | Back off and reconnect; server is shedding load |
 | `4200` | Server restarting | Reconnect immediately; pylon is doing a graceful restart |
 | `4201` | Activity / pong timeout | Reconnect; connection went silent too long |
 | `4301` | Client event rate limited (in-band error, connection stays open) | Slow down client event sends |
 | `4302` | Watchlist too large (in-band error, connection stays open) | Reduce the number of channels in the watchlist |
 
 Codes `4001`–`4009` are terminal and should not trigger automatic reconnection.
-Codes `4100` and `4201` warrant an exponential back-off before reconnecting.
+Code `4201` warrants an exponential back-off before reconnecting.
 Code `4200` warrants an immediate reconnect (the new process will be ready).
 Codes `4301` and `4302` are delivered as `pusher:error` events on an otherwise
 open connection — they do not close the socket.

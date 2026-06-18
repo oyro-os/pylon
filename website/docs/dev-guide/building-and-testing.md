@@ -77,7 +77,7 @@ Both are gated in CI on every push and pull request:
 cargo fmt --all --check   # check formatting (CI gate)
 cargo fmt --all           # apply formatting (before committing)
 
-cargo clippy --all-targets -- -D warnings   # lint (CI gate; zero warnings allowed)
+cargo clippy --all-targets --locked -- -D warnings   # lint (CI gate; zero warnings allowed)
 ```
 
 ---
