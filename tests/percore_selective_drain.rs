@@ -89,6 +89,7 @@ async fn spawn() -> Harness {
         webhooks: pylon::webhook::WebhookHandle::null(),
         saturated: None,
         clustered: false,
+        max_connections: 0,
     });
 
     let port = free_port();

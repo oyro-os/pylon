@@ -181,6 +181,17 @@ pub fn run_percore(
     // fallback), so the WS drop never fires there.
     let saturated_flag = local.as_ref().map(|l| l.saturation_flag());
 
+    // SP10 self-sizing: worker count (explicit or `available_parallelism`), the
+    // total memory budget (explicit/fraction override or the `max(1.5 GiB, 7%)`
+    // reserve formula over the effective — cgroup-aware — envelope), each
+    // worker's budget slice, and the per-connection out-queue cap clamped to the
+    // configured [min, max] window. `per_conn_cap` becomes each `Connection`'s
+    // `high_water`, so a slow consumer's drop-head queue is sized to the host.
+    // Computed before `env` so `resolved_max_connections` can consume the budget.
+    let worker_count = config.worker_count();
+    let effective_mem = resources::detect_effective_mem();
+    let budget = config.resolved_memory_budget(effective_mem);
+
     let env = Arc::new(DispatchEnv {
         apps,
         adapter,
@@ -192,22 +203,15 @@ pub fn run_percore(
         webhooks,
         saturated: saturated_flag,
         clustered,
+        // Node ceiling: explicit override or auto-derived from memory budget.
+        // `0` = unlimited (no ceiling check).
+        max_connections: config.resolved_max_connections(budget),
     });
-
     // WS frame cap: bound a single inbound frame's payload. The configured
     // event-payload limit is small (KiB), so use a 1 MiB frame ceiling that
     // comfortably covers any legitimate Pusher frame while bounding abuse.
     let max_payload = config.max_event_payload_bytes.max(1 << 20);
 
-    // SP10 self-sizing: worker count (explicit or `available_parallelism`), the
-    // total memory budget (explicit/fraction override or the `max(1.5 GiB, 7%)`
-    // reserve formula over the effective — cgroup-aware — envelope), each
-    // worker's budget slice, and the per-connection out-queue cap clamped to the
-    // configured [min, max] window. `per_conn_cap` becomes each `Connection`'s
-    // `high_water`, so a slow consumer's drop-head queue is sized to the host.
-    let worker_count = config.worker_count();
-    let effective_mem = resources::detect_effective_mem();
-    let budget = config.resolved_memory_budget(effective_mem);
     let per_worker_budget = budget / worker_count.max(1) as u64;
     let per_conn_cap = resources::per_conn_cap(per_worker_budget, config.expected_conns_per_worker)
         .clamp(

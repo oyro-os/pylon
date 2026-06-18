@@ -30,6 +30,9 @@ impl PusherError {
     pub fn no_protocol() -> Self {
         Self::new(4008, "No protocol version supplied")
     }
+    pub fn server_over_capacity() -> Self {
+        Self::new(4100, "Server is over capacity")
+    }
 }
 
 #[cfg(test)]
@@ -44,6 +47,12 @@ mod tests {
         assert_eq!(PusherError::unsupported_protocol().code, 4007);
         assert_eq!(PusherError::no_protocol().code, 4008);
         assert!(!PusherError::app_not_found().message.is_empty());
+    }
+
+    #[test]
+    fn server_over_capacity_carries_4100() {
+        assert_eq!(PusherError::server_over_capacity().code, 4100);
+        assert!(!PusherError::server_over_capacity().message.is_empty());
     }
 
     #[test]

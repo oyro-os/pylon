@@ -77,6 +77,7 @@ async fn spawn(config: ServerConfig) -> Harness {
         webhooks: pylon::webhook::WebhookHandle::null(),
         saturated: None,
         clustered: false,
+        max_connections: 0,
     });
 
     let port = free_port();
@@ -257,6 +258,141 @@ async fn client_event_delivered_to_peer_not_sender() {
         next_event_named(&mut a, "pusher:pong").await["event"],
         "pusher:pong"
     );
+}
+
+// ── Scenario 3b: node connection ceiling (4100) ──────────────────────────────
+
+/// Spawn a dispatch worker with a node-level connection ceiling of `max_node`.
+/// The app's own per-app `capacity` is set to 0 (unlimited) so only the node
+/// ceiling fires.
+async fn spawn_with_node_ceiling(max_connections: usize) -> Harness {
+    /// App with capacity=0 (unlimited per-app) so only the node ceiling fires.
+    const APPS_UNLIMITED: &str = r#"[
+        {"name":"Test","id":"app","key":"app-key","secret":"app-secret",
+         "capacity":0,"client_messages_enabled":true,"subscription_count_enabled":false}
+    ]"#;
+    let apps: Arc<dyn AppManager> =
+        Arc::new(StaticFileAppManager::from_json(APPS_UNLIMITED).unwrap());
+    let registry = Arc::new(Registry::new());
+    let adapter: Arc<dyn Adapter> = Arc::new(LocalAdapter::new(registry));
+    let env = Arc::new(DispatchEnv {
+        apps,
+        adapter: adapter.clone(),
+        limits: ServerConfig::default().limits(),
+        activity_timeout: 120,
+        pong_timeout: 30,
+        strict_protocol: false,
+        conn_counts: Arc::new(Default::default()),
+        webhooks: pylon::webhook::WebhookHandle::null(),
+        saturated: None,
+        clustered: false,
+        max_connections,
+    });
+
+    let port = free_port();
+    let addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let sd = shutdown.clone();
+    let handle = std::thread::spawn(move || {
+        run(
+            WorkerConfig {
+                addr,
+                max_payload: 1 << 20,
+                high_water: 1 << 20,
+                mode: Mode::Dispatch(env),
+                rest_handoff: None,
+                worker_id: 0,
+                broadcast: None,
+                per_worker_budget: 0,
+                inflight_slot: None,
+                accepted_slot: None,
+                codel_dropped_slot: None,
+                codel: pylon::transport::conn::CodelParams::DEFAULT,
+                budget_factor: None,
+                shutdown_grace_ms: 0,
+                tls: None,
+            },
+            sd,
+        )
+        .expect("worker run failed");
+    });
+
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    Harness {
+        port,
+        adapter,
+        shutdown,
+        handle: Some(handle),
+    }
+}
+
+/// Read frames until a Close frame arrives; return its code (or None).
+async fn wait_close_code(ws: &mut Ws) -> Option<u16> {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match ws.next().await {
+                Some(Ok(Message::Close(Some(cf)))) => return Some(u16::from(cf.code)),
+                Some(Ok(Message::Close(None))) | None => return None,
+                Some(Ok(_)) => {} // skip text/ping/binary
+                Some(Err(_)) => return None,
+            }
+        }
+    })
+    .await
+    .expect("close frame within 5s")
+}
+
+/// Connect without waiting for the established frame (we may receive a reject).
+async fn try_connect(port: u16) -> Ws {
+    let url = format!("ws://127.0.0.1:{port}/app/app-key?protocol=7");
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        tokio_tungstenite::connect_async(url),
+    )
+    .await
+    .expect("connect within 5s")
+    .expect("ws handshake")
+    .0
+}
+
+/// With `max_connections = 2`, the 3rd simultaneous connection is rejected
+/// and its close frame carries code 4100.  After the held connections close,
+/// the counter returns to 0 so a new connection succeeds (no counter leak).
+#[tokio::test]
+async fn node_ceiling_rejects_at_4100_and_counter_released() {
+    let h = spawn_with_node_ceiling(2).await;
+
+    // Open 2 connections — both should succeed (get connection_established).
+    let mut ws1 = try_connect(h.port).await;
+    let _ = established_socket_id(&mut ws1).await;
+    let mut ws2 = try_connect(h.port).await;
+    let _ = established_socket_id(&mut ws2).await;
+
+    // 3rd connection: ceiling is 2, so this must be rejected with 4100.
+    let mut ws3 = try_connect(h.port).await;
+    let close_code = wait_close_code(&mut ws3).await;
+    assert_eq!(
+        close_code,
+        Some(4100),
+        "3rd connection should be rejected with close code 4100, got {close_code:?}"
+    );
+
+    // Drop the 2 held connections; the node counter must return to 0.
+    drop(ws1);
+    drop(ws2);
+
+    // Give the worker a moment to process the close events.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // Now a fresh connection should succeed — counter was properly released.
+    let mut ws4 = try_connect(h.port).await;
+    let sid = established_socket_id(&mut ws4).await;
+    assert!(
+        sid.contains('.'),
+        "new connection after counter release should succeed, got sid {sid:?}"
+    );
+    drop(ws4);
 }
 
 // ── Scenario 4: disconnect cleanup ──────────────────────────────────────────

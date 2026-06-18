@@ -81,6 +81,7 @@ async fn spawn(activity_timeout: u32, pong_timeout: u32) -> Harness {
         webhooks: pylon::webhook::WebhookHandle::null(),
         saturated: None,
         clustered: false,
+        max_connections: 0,
     });
 
     let port = free_port();

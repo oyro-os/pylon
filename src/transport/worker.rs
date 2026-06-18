@@ -92,6 +92,14 @@ pub fn percore_selective_drain_visits() -> u64 {
 /// mailbox drains then run and figure out what actually needs delivering.
 const WORKER_WAKER: Token = Token(usize::MAX - 1);
 
+/// Process-global live connection counter for the node-level ceiling check.
+///
+/// Incremented at accept (before the per-app capacity check); decremented either
+/// immediately if the node ceiling rejects the connection (before returning
+/// `Err(Reject)`) or in [`remove`] on every normal/timeout/drain close path.
+/// This ensures the count is released exactly once per accepted connection.
+static NODE_CONNS: AtomicUsize = AtomicUsize::new(0);
+
 /// Shared, `Arc`-cloneable bundle of the `AppState` pieces a [`Mode::Dispatch`]
 /// worker needs to build a [`ConnectionContext`] per connection.
 pub struct DispatchEnv {
@@ -120,6 +128,12 @@ pub struct DispatchEnv {
     /// connection handler suppresses its node-local emits. `false` ⇒ the
     /// not-yet-clustered percore path keeps the node-local handler emits.
     pub clustered: bool,
+    /// Node-level connection ceiling enforced before the per-app `capacity` check.
+    /// `0` = unlimited (no ceiling check). When non-zero, the 3rd+ connection that
+    /// pushes the process-global [`NODE_CONNS`] counter to or above this limit is
+    /// rejected with code **4100** (`server_over_capacity`). The per-app `capacity`
+    /// (code 4004) check continues to apply independently.
+    pub max_connections: usize,
 }
 
 /// Configuration for a single worker event loop.
@@ -1103,6 +1117,17 @@ fn establish_session(
         }
     };
 
+    // Node-level ceiling check: enforced before the per-app capacity check.
+    // `max_connections == 0` means unlimited (no ceiling).
+    let node_n = NODE_CONNS.fetch_add(1, Ordering::SeqCst);
+    if env.max_connections != 0 && node_n >= env.max_connections {
+        NODE_CONNS.fetch_sub(1, Ordering::SeqCst);
+        return Err(Reject {
+            error: PusherError::server_over_capacity(),
+            codec: Some(codec),
+        });
+    }
+
     let counter = env
         .conn_counts
         .entry(app.id.clone())
@@ -1111,6 +1136,7 @@ fn establish_session(
     let current = counter.fetch_add(1, Ordering::SeqCst);
     if app.capacity != 0 && current >= app.capacity as usize {
         counter.fetch_sub(1, Ordering::SeqCst);
+        NODE_CONNS.fetch_sub(1, Ordering::SeqCst);
         return Err(Reject {
             error: PusherError::over_capacity(),
             codec: Some(codec),
@@ -1671,6 +1697,7 @@ fn remove(
             deindex_connection(&session, local_subs, sid_to_token);
             futures_executor::block_on(session.ctx.on_close());
             session.conn_count.fetch_sub(1, Ordering::SeqCst);
+            NODE_CONNS.fetch_sub(1, Ordering::SeqCst);
         }
         let _ = poll.registry().deregister(entry.conn.stream_mut());
     }

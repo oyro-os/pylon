@@ -98,6 +98,16 @@ pub struct ServerConfig {
     /// load balancers time to observe `/ready`=503 and stop sending new traffic.
     /// `PYLON_SHUTDOWN_PREDRAIN_MS` (default `2000`).
     pub shutdown_predrain_ms: u64,
+    // ── Node-level connection ceiling ────────────────────────────────────────
+    /// Maximum simultaneous connections this node will accept, across all apps.
+    /// `0` (default) ⇒ auto: `memory_budget_bytes / expected_per_conn_bytes`
+    /// (if the budget is 0/unknown, the effective ceiling is 0 = unlimited).
+    /// `PYLON_MAX_CONNECTIONS`.
+    pub max_connections: usize,
+    /// Expected per-connection memory footprint (bytes), used to auto-derive
+    /// `max_connections` from the memory budget when `max_connections == 0`.
+    /// `PYLON_EXPECTED_PER_CONN_BYTES` (default 8192).
+    pub expected_per_conn_bytes: usize,
     // ── TLS (native rustls, optional) ───────────────────────────────────────
     /// Path to the PEM certificate chain. Must be set together with `tls_key_path`
     /// to enable TLS. Setting only one of cert/key is a fatal config error.
@@ -166,6 +176,8 @@ impl Default for ServerConfig {
             tls_cert_path: None,
             tls_key_path: None,
             tls_ca_path: None,
+            max_connections: 0,
+            expected_per_conn_bytes: 8192,
         }
     }
 }
@@ -408,6 +420,16 @@ impl ServerConfig {
                 c.tls_ca_path = Some(v);
             }
         }
+        if let Ok(v) = std::env::var("PYLON_MAX_CONNECTIONS") {
+            if let Ok(p) = v.parse() {
+                c.max_connections = p;
+            }
+        }
+        if let Ok(v) = std::env::var("PYLON_EXPECTED_PER_CONN_BYTES") {
+            if let Ok(p) = v.parse() {
+                c.expected_per_conn_bytes = p;
+            }
+        }
         c
     }
 
@@ -445,6 +467,23 @@ impl ServerConfig {
                 .unwrap_or(1)
         } else {
             self.workers
+        }
+    }
+
+    /// Resolve the effective node connection ceiling.
+    ///
+    /// * If `max_connections != 0`, return it as-is (explicit override).
+    /// * Else derive from budget: `memory_budget_bytes / expected_per_conn_bytes`.
+    ///   The caller supplies `budget` (already resolved via
+    ///   [`resolved_memory_budget`]) so this method is pure.
+    ///   If `budget == 0` (budget unknown), returns `0` = unlimited.
+    pub fn resolved_max_connections(&self, budget: u64) -> usize {
+        if self.max_connections != 0 {
+            self.max_connections
+        } else if budget != 0 && self.expected_per_conn_bytes != 0 {
+            (budget / self.expected_per_conn_bytes as u64) as usize
+        } else {
+            0
         }
     }
 
@@ -618,6 +657,50 @@ mod tests {
         std::env::remove_var("PYLON_REDIS_SWEEP_INTERVAL");
         std::env::remove_var("PYLON_WEBHOOK_VACATED_GRACE_MS");
         std::env::remove_var("PYLON_REDIS_SHARDED_PUBSUB");
+    }
+
+    #[test]
+    fn node_ceiling_defaults_unlimited() {
+        let c = ServerConfig::default();
+        assert_eq!(c.max_connections, 0);
+        assert_eq!(c.expected_per_conn_bytes, 8192);
+        // max_connections == 0 with budget == 0 → unlimited (0).
+        assert_eq!(c.resolved_max_connections(0), 0);
+        // max_connections == 0 with non-zero budget → auto-derive.
+        assert_eq!(c.resolved_max_connections(8192), 1);
+    }
+
+    #[test]
+    fn node_ceiling_explicit_override_wins() {
+        let c = ServerConfig {
+            max_connections: 500,
+            ..ServerConfig::default()
+        };
+        assert_eq!(c.resolved_max_connections(0), 500);
+        assert_eq!(c.resolved_max_connections(1 << 30), 500);
+    }
+
+    #[test]
+    fn node_ceiling_auto_from_budget() {
+        let c = ServerConfig {
+            expected_per_conn_bytes: 8192,
+            ..ServerConfig::default()
+        };
+        // budget = 8 MiB → 8 MiB / 8 KiB = 1024 connections
+        assert_eq!(c.resolved_max_connections(8 << 20), 1024);
+        // budget = 0 → unlimited (0)
+        assert_eq!(c.resolved_max_connections(0), 0);
+    }
+
+    #[test]
+    fn node_ceiling_env_overrides_apply() {
+        std::env::set_var("PYLON_MAX_CONNECTIONS", "1000");
+        std::env::set_var("PYLON_EXPECTED_PER_CONN_BYTES", "4096");
+        let c = ServerConfig::from_env();
+        assert_eq!(c.max_connections, 1000);
+        assert_eq!(c.expected_per_conn_bytes, 4096);
+        std::env::remove_var("PYLON_MAX_CONNECTIONS");
+        std::env::remove_var("PYLON_EXPECTED_PER_CONN_BYTES");
     }
 
     #[test]
