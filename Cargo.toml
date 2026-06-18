@@ -53,6 +53,9 @@ futures-util = "0.3"
 # methods never await real I/O, so this completes without parking a runtime.
 futures-executor = "0.3"
 thiserror = "1"
+# TLS: rustls (direct dep — already transitively present at 0.23 via reqwest/fred) + PEM loader.
+rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std", "tls12"] }
+rustls-pemfile = "2"
 # Outbound HTTP for webhook delivery. rustls (no OpenSSL system dep) to reach https endpoints.
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 # Redis client for the scaling adapter
@@ -75,6 +78,8 @@ rayon = "1"
 # external crate, where `cfg(test)` is NOT active) can call the off-hot-path
 # debug accessors like `percore_total_inflight_bytes`.
 pylon = { path = ".", features = ["test-hooks"] }
+# Self-signed cert generation for the TLS integration tests (never in production).
+rcgen = "0.13"
 # Enables paused-time control (`start_paused`, `tokio::time::advance`) in tests.
 tokio = { version = "1", features = ["test-util"] }
 tokio-tungstenite = "0.24"

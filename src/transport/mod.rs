@@ -16,6 +16,7 @@ pub mod frame;
 pub mod handshake;
 pub mod rest;
 pub mod timer;
+pub mod tls;
 pub mod worker;
 
 use crate::adapter::local::LocalAdapter;

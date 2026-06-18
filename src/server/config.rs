@@ -96,6 +96,19 @@ pub struct ServerConfig {
     /// load balancers time to observe `/ready`=503 and stop sending new traffic.
     /// `PYLON_SHUTDOWN_PREDRAIN_MS` (default `2000`).
     pub shutdown_predrain_ms: u64,
+    // ── TLS (native rustls, optional) ───────────────────────────────────────
+    /// Path to the PEM certificate chain. Must be set together with `tls_key_path`
+    /// to enable TLS. Setting only one of cert/key is a fatal config error.
+    /// `PYLON_TLS_CERT`. Empty string treated as None.
+    pub tls_cert_path: Option<String>,
+    /// Path to the PEM private key (PKCS#8, RSA, or EC). Must be set together
+    /// with `tls_cert_path` to enable TLS. `PYLON_TLS_KEY`. Empty string treated
+    /// as None.
+    pub tls_key_path: Option<String>,
+    /// Optional path to a PEM CA certificate for mTLS client verification.
+    /// Enabling mTLS requires both `tls_cert_path` and `tls_key_path` to be set.
+    /// `PYLON_TLS_CA`. Empty string treated as None.
+    pub tls_ca_path: Option<String>,
 }
 
 impl Default for ServerConfig {
@@ -147,6 +160,9 @@ impl Default for ServerConfig {
             psi_threshold: 15.0,
             shutdown_grace_ms: 10_000,
             shutdown_predrain_ms: 2_000,
+            tls_cert_path: None,
+            tls_key_path: None,
+            tls_ca_path: None,
         }
     }
 }
@@ -368,6 +384,22 @@ impl ServerConfig {
                 c.shutdown_predrain_ms = p;
             }
         }
+        // TLS — empty string is treated as "not set" (same as absent).
+        if let Ok(v) = std::env::var("PYLON_TLS_CERT") {
+            if !v.is_empty() {
+                c.tls_cert_path = Some(v);
+            }
+        }
+        if let Ok(v) = std::env::var("PYLON_TLS_KEY") {
+            if !v.is_empty() {
+                c.tls_key_path = Some(v);
+            }
+        }
+        if let Ok(v) = std::env::var("PYLON_TLS_CA") {
+            if !v.is_empty() {
+                c.tls_ca_path = Some(v);
+            }
+        }
         c
     }
 
@@ -477,6 +509,10 @@ mod tests {
         // C2a graceful-shutdown defaults.
         assert_eq!(c.shutdown_grace_ms, 10_000);
         assert_eq!(c.shutdown_predrain_ms, 2_000);
+        // TLS defaults — all off.
+        assert!(c.tls_cert_path.is_none());
+        assert!(c.tls_key_path.is_none());
+        assert!(c.tls_ca_path.is_none());
         // codel_params() folds ms → ns with the folly defaults.
         let p = c.codel_params();
         assert_eq!(p.target_ns, 5_000_000);
@@ -599,6 +635,29 @@ mod tests {
         assert_eq!(c.workers, 3);
         assert_eq!(c.worker_count(), 3);
         std::env::remove_var("PYLON_WORKERS");
+    }
+
+    #[test]
+    fn tls_env_overrides_apply() {
+        std::env::set_var("PYLON_TLS_CERT", "/path/to/cert.pem");
+        std::env::set_var("PYLON_TLS_KEY", "/path/to/key.pem");
+        std::env::set_var("PYLON_TLS_CA", "/path/to/ca.pem");
+        let c = ServerConfig::from_env();
+        assert_eq!(c.tls_cert_path.as_deref(), Some("/path/to/cert.pem"));
+        assert_eq!(c.tls_key_path.as_deref(), Some("/path/to/key.pem"));
+        assert_eq!(c.tls_ca_path.as_deref(), Some("/path/to/ca.pem"));
+        // Empty string is treated as absent (same test, same lock on the env vars
+        // — avoids a parallel-test race on the shared process environment).
+        std::env::set_var("PYLON_TLS_CERT", "");
+        std::env::set_var("PYLON_TLS_KEY", "");
+        std::env::set_var("PYLON_TLS_CA", "");
+        let c2 = ServerConfig::from_env();
+        assert!(c2.tls_cert_path.is_none(), "empty PYLON_TLS_CERT should be None");
+        assert!(c2.tls_key_path.is_none(), "empty PYLON_TLS_KEY should be None");
+        assert!(c2.tls_ca_path.is_none(), "empty PYLON_TLS_CA should be None");
+        std::env::remove_var("PYLON_TLS_CERT");
+        std::env::remove_var("PYLON_TLS_KEY");
+        std::env::remove_var("PYLON_TLS_CA");
     }
 
     #[test]
