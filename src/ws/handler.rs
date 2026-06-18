@@ -75,7 +75,15 @@ impl ConnectionContext {
     }
 
     pub(in crate::ws) fn send_self(&self, event: ServerEvent) {
-        let _ = self.self_tx.try_send(event);
+        // Self-directed frames share the bounded mailbox. Under extreme overload
+        // (mailbox already full) the frame is dropped — count it, exactly like
+        // `Mailbox::send`, so the drop is observable via `mailbox_dropped`. A
+        // `Closed` error means the connection is already gone (nothing to count).
+        if let Err(tokio::sync::mpsc::error::TrySendError::Full(_)) = self.self_tx.try_send(event) {
+            if let Some(ctr) = &self.mailbox_dropped {
+                ctr.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
     }
 
     /// Enqueue a webhook trigger (non-blocking; dropped if the mailbox is full).

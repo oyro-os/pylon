@@ -1176,7 +1176,10 @@ fn establish_session(
     // overload, `Mailbox::send` uses `try_send` and drops on full, bumping the
     // per-worker `mailbox_dropped` counter. Under normal (non-full) load delivery
     // is unchanged: `try_send` on a non-full channel is non-blocking and succeeds.
-    let (tx, rx) = mpsc::channel::<ServerEvent>(env.mailbox_capacity);
+    // `.max(1)`: `mpsc::channel(0)` panics. `from_env` already rejects 0, but a
+    // direct `WorkerEnv` struct literal could pass it — clamp here so the single
+    // point where the capacity reaches tokio is panic-proof regardless of source.
+    let (tx, rx) = mpsc::channel::<ServerEvent>(env.mailbox_capacity.max(1));
     let ctx = ConnectionContext {
         app,
         socket_id,
