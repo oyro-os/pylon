@@ -19,6 +19,7 @@ use pylon::adapter::Adapter;
 use pylon::app::static_file::StaticFileAppManager;
 use pylon::app::AppManager;
 use pylon::channel::registry::Registry;
+use pylon::protocol::event::ServerEvent;
 use pylon::server::config::ServerConfig;
 use pylon::transport::worker::{run, DispatchEnv, Mode, WorkerConfig};
 use serde_json::{json, Value};
@@ -40,6 +41,9 @@ struct Harness {
     port: u16,
     shutdown: Arc<AtomicBool>,
     conn_counts: Arc<dashmap::DashMap<String, Arc<AtomicUsize>>>,
+    /// Shared adapter — retained so tests can call `adapter.broadcast()` to push
+    /// events to subscribed connections and exercise the inflight-bytes path.
+    adapter: Arc<dyn Adapter>,
     handle: Option<std::thread::JoinHandle<()>>,
 }
 
@@ -52,6 +56,11 @@ impl Drop for Harness {
     }
 }
 
+/// Serializes the drain tests that share the same worker config. Not strictly
+/// required for single-worker tests, but prevents flaky port contention if tests
+/// run multi-threaded.
+static HARNESS_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 fn free_port() -> u16 {
     let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     l.local_addr().unwrap().port()
@@ -63,12 +72,15 @@ async fn spawn_with_grace(grace_ms: u64) -> Harness {
     let config = ServerConfig::default();
     let apps: Arc<dyn AppManager> = Arc::new(StaticFileAppManager::from_json(APPS).unwrap());
     let registry = Arc::new(Registry::new());
-    let adapter: Arc<dyn Adapter> = Arc::new(LocalAdapter::new(registry));
+    // Keep a clone of the adapter before it is moved into DispatchEnv so tests
+    // can call adapter.broadcast() to push events to subscribed connections.
+    let adapter_arc: Arc<dyn Adapter> = Arc::new(LocalAdapter::new(registry));
+    let adapter_for_harness = adapter_arc.clone();
     let conn_counts: Arc<dashmap::DashMap<String, Arc<AtomicUsize>>> =
         Arc::new(Default::default());
     let env = Arc::new(DispatchEnv {
         apps,
-        adapter,
+        adapter: adapter_arc,
         limits: config.limits(),
         activity_timeout: config.activity_timeout,
         pong_timeout: config.pong_timeout,
@@ -110,6 +122,7 @@ async fn spawn_with_grace(grace_ms: u64) -> Harness {
         port,
         shutdown,
         conn_counts,
+        adapter: adapter_for_harness,
         handle: Some(handle),
     }
 }
@@ -178,8 +191,9 @@ async fn wait_close(ws: &mut Ws) -> Option<u16> {
 
 /// Main drain test: connect 3 clients, subscribe them, trigger graceful
 /// shutdown, assert each receives Close(1001) and conn_counts returns to 0.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn graceful_drain_sends_close_1001_and_cleans_up() {
+    let _lock = HARNESS_LOCK.lock().await;
     const N: usize = 3;
     // A 2-second grace window: plenty to flush a tiny Close frame, tight enough
     // that the test completes in reasonable time even under load.
@@ -254,4 +268,120 @@ async fn graceful_drain_sends_close_1001_and_cleans_up() {
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
+}
+
+/// Backpressure drain test: ensure that when a connection has queued-but-not-yet-
+/// flushed bytes at the moment of shutdown (`inflight_bytes > 0`), the drain does
+/// NOT fire the `inflight_bytes == 0` exit prematurely and the `debug_assert_eq!`
+/// invariant holds (no panic in debug builds).
+///
+/// Without Fix 1 (missing `fold_delta` after the drain-phase `send_close` loop):
+///   * `inflight_bytes` stays 0 even though the Close frame is queued on the
+///     backpressured connection.
+///   * The drain's `inflight_bytes == 0` guard exits immediately, dropping the
+///     frame without flushing it.
+///   * In debug mode the `debug_assert_eq!(inflight_bytes, sum(out_bytes))` fires
+///     and panics — that is exactly what this test catches.
+///
+/// With Fix 1 in place:
+///   * `fold_delta` folds the Close frame's queued bytes into `inflight_bytes`.
+///   * The drain loop iterates until those bytes flush or the grace window expires.
+///   * `debug_assert_eq` holds throughout; the test passes without panic.
+///
+/// # How backpressure is produced
+///
+/// The harness connects one WS client and subscribes it to a channel. It then
+/// STOPS reading from the client socket (never calls `.next()` on the stream
+/// after subscribe) and floods the channel with `N_FLOOD` broadcast events, each
+/// carrying a ~1 KB payload. Once the TCP socket's receive buffer is saturated,
+/// `conn.flush()` returns `WouldBlock` and the frames accumulate in `out_bytes`,
+/// making `inflight_bytes > 0`. Shutdown is then triggered.
+///
+/// Determinism note: we flood enough data (≥ 1 MB) that the kernel's per-socket
+/// receive buffer (typically 64–128 KB) fills up and backpressure is virtually
+/// guaranteed. A small delay between subscribe and flood ensures the subscription
+/// frame is drained first, so only the broadcast frames cause the WouldBlock.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn graceful_drain_with_backpressured_client() {
+    let _lock = HARNESS_LOCK.lock().await;
+
+    // 5 s grace window: enough for the worker to flush the queued Close frame even
+    // through a slow-draining TCP send buffer; tight enough that the test doesn't
+    // hang if something goes wrong.
+    let h = spawn_with_grace(5000).await;
+
+    // Connect one client and subscribe it so the channel is registered.
+    let mut ws = connect(h.port).await;
+    wait_established(&mut ws).await;
+    subscribe(&mut ws, "flood-channel").await;
+
+    // Give the worker a moment to drain the subscription_succeeded frame so it is
+    // not counted as inflight when we flood — we want only broadcast frames to
+    // contribute to inflight_bytes.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    // NOW stop reading from the socket: we hold `ws` but never call `.next()` on
+    // it again. The TCP receive buffer on the client side will fill up once we
+    // start flooding, causing the server's `conn.flush()` to return WouldBlock
+    // and leaving frames in `out_bytes` (=> inflight_bytes > 0).
+
+    // Flood the channel with N_FLOOD large events through the adapter.
+    // ~1 KB payload × 1 000 iterations = ~1 MB of broadcast data, enough to
+    // saturate the ~64–128 KB kernel receive buffer and guarantee WouldBlock.
+    const N_FLOOD: usize = 1_000;
+    let pad = "x".repeat(1024); // ~1 KB per event
+    let adapter = h.adapter.clone();
+    let pad_clone = pad.clone();
+    tokio::spawn(async move {
+        for i in 0..N_FLOOD {
+            adapter
+                .broadcast(
+                    APP_ID,
+                    "flood-channel",
+                    ServerEvent::ChannelEvent {
+                        channel: "flood-channel".to_string(),
+                        event: "flood".to_string(),
+                        data: serde_json::json!({ "i": i, "pad": pad_clone }),
+                        user_id: None,
+                    },
+                    None,
+                )
+                .await;
+        }
+    });
+
+    // Give the flood task a moment to queue frames into the worker. The non-reading
+    // client will saturate quickly; we don't need to wait for all N_FLOOD events —
+    // just enough that the worker's out-queue has bytes when we signal shutdown.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // Trigger graceful shutdown while inflight_bytes is (very likely) > 0.
+    // The regression guard is: if Fix 1 is absent, the worker panics here in
+    // debug mode on the debug_assert_eq!. With Fix 1, it drains cleanly.
+    h.shutdown.store(true, Ordering::SeqCst);
+
+    // The worker must exit cleanly (no panic from the worker thread) and the
+    // conn_counts must return to 0 within grace_ms + some slack.
+    let deadline = std::time::Instant::now() + Duration::from_secs(8);
+    loop {
+        let count = h
+            .conn_counts
+            .get(APP_ID)
+            .map(|v| v.load(Ordering::SeqCst))
+            .unwrap_or(0);
+        if count == 0 {
+            break;
+        }
+        if std::time::Instant::now() >= deadline {
+            panic!(
+                "conn_counts[{APP_ID}] still {count} after drain — \
+                 remove() did not run (or worker panicked on debug_assert)"
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    // `ws` is intentionally kept alive (not read) until here so the TCP receive
+    // buffer stays full during the drain, keeping the backpressure scenario live.
+    drop(ws);
 }

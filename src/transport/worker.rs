@@ -386,6 +386,14 @@ pub fn run(mut cfg: WorkerConfig, shutdown: Arc<AtomicBool>) -> std::io::Result<
                 let keys: Vec<usize> = conns.iter().map(|(k, _)| k).collect();
                 for k in keys {
                     send_close(&poll, &mut conns, k, now_ns, 1001, "Server shutting down");
+                    // INCREMENTAL INFLIGHT: mirror the 4201 path (lines ~668-674).
+                    // The Close frame may not flush synchronously (backpressured
+                    // client). Without this fold, `inflight_bytes` stays 0 and the
+                    // drain's `inflight_bytes == 0` exit fires immediately, dropping
+                    // the still-queued Close frame. After this fold, inflight_bytes
+                    // is exact: the exit only fires when all Close frames are truly
+                    // flushed, and the debug_assert_eq holds on a non-idle drain.
+                    fold_delta(&mut conns, k, &mut inflight_bytes);
                 }
                 tracing::info!(
                     worker = cfg.worker_id,
