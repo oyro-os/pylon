@@ -118,6 +118,7 @@ async fn spawn() -> Harness {
             worker_shutdown,
             Some(local),
             false, // not clustered
+            None,
         )
         .expect("run_percore failed");
     });

@@ -21,6 +21,7 @@
 
 use crate::transport::frame::{self, Frame, ParseError};
 use bytes::BytesMut;
+use rustls::server::ServerConnection as TlsConn;
 use std::collections::VecDeque;
 use std::io::{ErrorKind, Read, Write};
 use std::sync::Arc;
@@ -119,11 +120,27 @@ struct CodelState {
     overloaded: bool,
 }
 
+/// The I/O backend for a connection: either a plain TCP stream or a rustls-
+/// encrypted stream backed by the same underlying socket.
+enum Io {
+    Plain(mio::net::TcpStream),
+    Tls(mio::net::TcpStream, Box<TlsConn>),
+}
+
+impl Io {
+    fn stream_mut(&mut self) -> &mut mio::net::TcpStream {
+        match self {
+            Io::Plain(s) | Io::Tls(s, _) => s,
+        }
+    }
+}
+
 /// A single non-blocking WebSocket connection.
 pub struct Connection {
-    /// The non-blocking client socket. `pub` so the worker can register it with
-    /// its [`mio::Poll`] and re-arm interest.
-    pub stream: mio::net::TcpStream,
+    /// The I/O backend: a plain TCP stream or a rustls-encrypted stream backed
+    /// by the same underlying socket. `stream_mut()` exposes the raw TCP stream
+    /// for mio poll registration and re-arming.
+    io: Io,
     /// Current lifecycle state.
     pub state: ConnState,
     /// Pending outbound frames (pre-encoded bytes, shared via `Arc` for
@@ -167,7 +184,7 @@ impl Connection {
     /// worker sets real parameters via [`Connection::set_codel`]).
     pub fn new(stream: mio::net::TcpStream, high_water: usize) -> Self {
         Connection {
-            stream,
+            io: Io::Plain(stream),
             state: ConnState::Handshaking,
             out: VecDeque::new(),
             out_cursor: 0,
@@ -178,6 +195,30 @@ impl Connection {
             codel_dropped: 0,
             inflight_delta: 0,
         }
+    }
+
+    /// Wrap a freshly-accepted non-blocking socket with a TLS server-side
+    /// handshake in progress. Starts in [`ConnState::Handshaking`] with empty
+    /// queues and CoDel disabled.
+    pub fn new_tls(stream: mio::net::TcpStream, tls: Box<TlsConn>, high_water: usize) -> Self {
+        Connection {
+            io: Io::Tls(stream, tls),
+            state: ConnState::Handshaking,
+            out: VecDeque::new(),
+            out_cursor: 0,
+            out_bytes: 0,
+            high_water,
+            codel: CodelParams::DISABLED,
+            codel_state: CodelState::default(),
+            codel_dropped: 0,
+            inflight_delta: 0,
+        }
+    }
+
+    /// Return a mutable reference to the underlying TCP stream so the worker
+    /// can register/reregister it with its [`mio::Poll`].
+    pub fn stream_mut(&mut self) -> &mut mio::net::TcpStream {
+        self.io.stream_mut()
     }
 
     /// Install this connection's CoDel freshness parameters. Called once by the
@@ -201,7 +242,81 @@ impl Connection {
     /// Any queued outbound bytes are discarded (a REST connection has none — the
     /// head was only ever read).
     pub fn into_stream(self) -> mio::net::TcpStream {
-        self.stream
+        match self.io {
+            Io::Plain(s) => s,
+            Io::Tls(s, _) => s,
+        }
+    }
+
+    /// Send a TLS `close_notify` alert to the peer (a graceful TLS shutdown).
+    /// No-op for plain connections. Best-effort: write errors are ignored.
+    pub fn send_close_notify(&mut self) {
+        if let Io::Tls(stream, tls) = &mut self.io {
+            tls.send_close_notify();
+            while tls.wants_write() {
+                match tls.write_tls(stream) {
+                    Ok(_) => {}
+                    Err(_) => break,
+                }
+            }
+        }
+    }
+
+    /// Read all currently-available raw bytes into `buf`, stopping on
+    /// `WouldBlock` or EOF. For plain connections this reads directly from the
+    /// socket; for TLS connections this drives the TLS state machine (ingesting
+    /// ciphertext, running the handshake, and pulling any available plaintext).
+    ///
+    /// Returns `true` when more data may arrive (ok/would-block),
+    /// `false` when the connection is closed (EOF or error).
+    pub fn drain_head_bytes(&mut self, buf: &mut BytesMut) -> bool {
+        let mut chunk = [0u8; 16 * 1024];
+        match &mut self.io {
+            Io::Plain(stream) => loop {
+                match stream.read(&mut chunk) {
+                    Ok(0) => return false,
+                    Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                    Err(ref e) if e.kind() == ErrorKind::WouldBlock => return true,
+                    Err(ref e) if e.kind() == ErrorKind::Interrupted => continue,
+                    Err(_) => return false,
+                }
+            },
+            Io::Tls(stream, tls) => {
+                // Read ciphertext from socket into rustls state machine.
+                loop {
+                    match tls.read_tls(stream) {
+                        Ok(0) => return false,
+                        Ok(_) => {
+                            if tls.process_new_packets().is_err() {
+                                return false;
+                            }
+                        }
+                        Err(ref e) if e.kind() == ErrorKind::WouldBlock => break,
+                        Err(ref e) if e.kind() == ErrorKind::Interrupted => continue,
+                        Err(_) => return false,
+                    }
+                }
+                // Drive pending TLS writes (handshake responses).
+                while tls.wants_write() {
+                    match tls.write_tls(stream) {
+                        Ok(_) => {}
+                        Err(ref e) if e.kind() == ErrorKind::WouldBlock => break,
+                        Err(_) => return false,
+                    }
+                }
+                // Pull available plaintext (empty during the handshake phase).
+                loop {
+                    match tls.reader().read(&mut chunk) {
+                        Ok(0) => break,
+                        Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                        Err(ref e) if e.kind() == ErrorKind::WouldBlock => break,
+                        Err(ref e) if e.kind() == ErrorKind::Interrupted => continue,
+                        Err(_) => return false,
+                    }
+                }
+                true
+            }
+        }
     }
 
     /// Queue a pre-encoded frame for sending (SP10 byte-bounded **drop-head**).
@@ -270,17 +385,33 @@ impl Connection {
     /// CoDel enabled (`target_ns != 0`), each frame's sojourn (`now_ns -
     /// enqueue_ns`) is checked before it is written: see [`codel_dequeue`].
     pub fn flush(&mut self, now_ns: u64) -> WriteStatus {
+        match &self.io {
+            Io::Plain(_) => self.flush_plain(now_ns),
+            Io::Tls(_, _) => self.flush_tls(now_ns),
+        }
+    }
+
+    /// Plain-TCP flush: drain the out-queue directly to the socket.
+    fn flush_plain(&mut self, now_ns: u64) -> WriteStatus {
         loop {
             // CoDel: before sending the front frame, drop any leading frame that
             // is too stale to be worth sending (skips the mid-write front). When
             // this returns, the front is either fresh-enough to send or the queue
             // is empty.
             self.codel_dequeue(now_ns);
-            let Some((front, _ts)) = self.out.front() else {
+            if self.out.is_empty() {
                 break;
+            }
+            let buf_start = self.out_cursor;
+            let front_len = self.out.front().unwrap().0.len();
+            // Clone the Arc (O(1) atomic bump) to release the borrow on self.out
+            // before we take the mutable borrow on self.io below.
+            let front_arc = Arc::clone(&self.out.front().unwrap().0);
+            let buf = &front_arc[buf_start..];
+            let Io::Plain(stream) = &mut self.io else {
+                unreachable!()
             };
-            let buf = &front[self.out_cursor..];
-            match self.stream.write(buf) {
+            match stream.write(buf) {
                 Ok(0) => {
                     // A zero-length write on a non-empty buffer means the peer
                     // can no longer accept data.
@@ -288,10 +419,10 @@ impl Connection {
                 }
                 Ok(n) => {
                     self.out_cursor += n;
-                    if self.out_cursor == front.len() {
+                    if self.out_cursor == front_len {
                         // Frame fully written: drop it, reset the cursor, and
                         // continue coalescing into the next frame.
-                        let sent = front.len();
+                        let sent = front_len;
                         self.out_bytes -= sent;
                         // Sent bytes leave the queue: fold the negative delta in so
                         // the worker's incremental inflight total drops by exactly
@@ -312,6 +443,107 @@ impl Connection {
                 Err(_) => return WriteStatus::Closed,
             }
         }
+        WriteStatus::Drained
+    }
+
+    /// TLS flush: encrypt app-data through rustls and drain ciphertext to the socket.
+    fn flush_tls(&mut self, now_ns: u64) -> WriteStatus {
+        // Phase 1: drain any pending TLS ciphertext that rustls has already
+        // buffered (e.g. handshake records). Do this before touching the app queue.
+        {
+            let Io::Tls(stream, tls) = &mut self.io else {
+                unreachable!()
+            };
+            while tls.wants_write() {
+                match tls.write_tls(stream) {
+                    Ok(_) => {}
+                    Err(ref e) if e.kind() == ErrorKind::WouldBlock => {
+                        return WriteStatus::WouldBlock;
+                    }
+                    Err(_) => return WriteStatus::Closed,
+                }
+            }
+        }
+
+        // Phase 2: encrypt and send each queued app-data frame.
+        loop {
+            self.codel_dequeue(now_ns);
+            if self.out.is_empty() {
+                break;
+            }
+            let buf_start = self.out_cursor;
+            let front_len = self.out.front().unwrap().0.len();
+            // Clone the Arc (O(1) atomic bump) to release the borrow on self.out
+            // before the mutable Io borrow below.
+            let front_arc = Arc::clone(&self.out.front().unwrap().0);
+            let buf = &front_arc[buf_start..];
+
+            // Use a local enum to carry the write result out of the Io borrow block.
+            enum TlsWriteResult {
+                Written(usize),
+                WouldBlock,
+                Closed,
+                Interrupted,
+            }
+            let result = {
+                let Io::Tls(stream, tls) = &mut self.io else {
+                    unreachable!()
+                };
+                match tls.writer().write(buf) {
+                    Ok(0) => TlsWriteResult::Closed,
+                    Ok(n) => {
+                        // Flush the freshly encrypted ciphertext to the socket.
+                        while tls.wants_write() {
+                            match tls.write_tls(stream) {
+                                Ok(_) => {}
+                                Err(ref e) if e.kind() == ErrorKind::WouldBlock => {
+                                    return WriteStatus::WouldBlock;
+                                }
+                                Err(_) => return WriteStatus::Closed,
+                            }
+                        }
+                        TlsWriteResult::Written(n)
+                    }
+                    Err(ref e) if e.kind() == ErrorKind::WouldBlock => TlsWriteResult::WouldBlock,
+                    Err(ref e) if e.kind() == ErrorKind::Interrupted => TlsWriteResult::Interrupted,
+                    Err(_) => TlsWriteResult::Closed,
+                }
+            };
+
+            match result {
+                TlsWriteResult::Closed => return WriteStatus::Closed,
+                TlsWriteResult::WouldBlock => return WriteStatus::WouldBlock,
+                TlsWriteResult::Interrupted => continue,
+                TlsWriteResult::Written(n) => {
+                    self.out_cursor += n;
+                    if self.out_cursor == front_len {
+                        let sent = front_len;
+                        self.out_bytes -= sent;
+                        self.inflight_delta -= sent as i64;
+                        self.out.pop_front();
+                        self.out_cursor = 0;
+                    }
+                }
+            }
+        }
+
+        // Final pass: flush any remaining TLS ciphertext rustls buffered during
+        // the app-data writes (e.g. finishing a record after the last write).
+        {
+            let Io::Tls(stream, tls) = &mut self.io else {
+                unreachable!()
+            };
+            while tls.wants_write() {
+                match tls.write_tls(stream) {
+                    Ok(_) => {}
+                    Err(ref e) if e.kind() == ErrorKind::WouldBlock => {
+                        return WriteStatus::WouldBlock;
+                    }
+                    Err(_) => return WriteStatus::Closed,
+                }
+            }
+        }
+
         WriteStatus::Drained
     }
 
@@ -446,16 +678,61 @@ impl Connection {
         //    EOF, and surface hard errors.
         let mut hit_eof = false;
         let mut chunk = [0u8; 16 * 1024];
-        loop {
-            match self.stream.read(&mut chunk) {
-                Ok(0) => {
-                    hit_eof = true;
-                    break;
+
+        match &mut self.io {
+            Io::Plain(stream) => {
+                loop {
+                    match stream.read(&mut chunk) {
+                        Ok(0) => {
+                            hit_eof = true;
+                            break;
+                        }
+                        Ok(n) => scratch.extend_from_slice(&chunk[..n]),
+                        Err(ref e) if e.kind() == ErrorKind::WouldBlock => break,
+                        Err(ref e) if e.kind() == ErrorKind::Interrupted => continue,
+                        Err(_) => return Err(ConnError::Closed),
+                    }
                 }
-                Ok(n) => scratch.extend_from_slice(&chunk[..n]),
-                Err(ref e) if e.kind() == ErrorKind::WouldBlock => break,
-                Err(ref e) if e.kind() == ErrorKind::Interrupted => continue,
-                Err(_) => return Err(ConnError::Closed),
+            }
+            Io::Tls(stream, tls) => {
+                // Ingest ciphertext from the socket into the rustls state machine.
+                loop {
+                    match tls.read_tls(stream) {
+                        Ok(0) => {
+                            hit_eof = true;
+                            break;
+                        }
+                        Ok(_) => {
+                            if tls.process_new_packets().is_err() {
+                                return Err(ConnError::Closed);
+                            }
+                        }
+                        Err(ref e) if e.kind() == ErrorKind::WouldBlock => break,
+                        Err(ref e) if e.kind() == ErrorKind::Interrupted => continue,
+                        Err(_) => return Err(ConnError::Closed),
+                    }
+                }
+                // Drive any pending TLS writes (handshake responses, alerts).
+                while tls.wants_write() {
+                    match tls.write_tls(stream) {
+                        Ok(_) => {}
+                        Err(ref e) if e.kind() == ErrorKind::WouldBlock => break,
+                        Err(_) => return Err(ConnError::Closed),
+                    }
+                }
+                // Pull available plaintext out of the rustls decryption buffer.
+                loop {
+                    match tls.reader().read(&mut chunk) {
+                        Ok(0) => break,
+                        Ok(n) => scratch.extend_from_slice(&chunk[..n]),
+                        Err(ref e) if e.kind() == ErrorKind::WouldBlock => break,
+                        Err(ref e) if e.kind() == ErrorKind::Interrupted => continue,
+                        Err(_) => {
+                            hit_eof = true;
+                            break;
+                        }
+                    }
+                }
             }
         }
 

@@ -146,6 +146,10 @@ pub fn run_percore(
     // node keeps the node-local handler emits. Stamped onto every connection's
     // `ConnectionContext` via the shared `DispatchEnv`.
     clustered: bool,
+    // Optional rustls TLS server config. `Some` ⇒ every accepted TCP connection
+    // is wrapped with a TLS server-side handshake before the WS upgrade;
+    // `None` ⇒ plain TCP (no TLS).
+    tls: Option<Arc<rustls::ServerConfig>>,
 ) -> std::io::Result<()> {
     let addr: std::net::SocketAddr = format!("{}:{}", config.bind, config.port)
         .parse()
@@ -338,6 +342,7 @@ pub fn run_percore(
             codel,
             budget_factor: Some(budget_factor.clone()),
             shutdown_grace_ms: config.shutdown_grace_ms,
+            tls: tls.clone(),
         };
         let shutdown = shutdown.clone();
         let core = core_ids.get(i % core_ids.len().max(1)).copied();

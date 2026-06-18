@@ -110,6 +110,7 @@ async fn spawn_with_grace(grace_ms: u64) -> Harness {
                 codel: pylon::transport::conn::CodelParams::DEFAULT,
                 budget_factor: None,
                 shutdown_grace_ms: grace_ms,
+                tls: None,
             },
             sd,
         )

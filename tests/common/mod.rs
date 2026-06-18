@@ -173,6 +173,7 @@ pub async fn spawn_percore(spec: SpawnSpec) -> SocketAddr {
             // Single-node parity harness: not clustered (the cluster harness is
             // `spawn_percore_cluster`, which passes `true`).
             false,
+            None,
         );
     });
     // Keep the worker alive for the whole test process.
@@ -330,6 +331,7 @@ pub async fn spawn_percore_cluster_with(
             Some(worker_local),
             // This IS a clustered node: defer the single-emit cluster edges.
             true,
+            None,
         );
     });
 

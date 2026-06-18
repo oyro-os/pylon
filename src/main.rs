@@ -114,6 +114,19 @@ async fn main() -> anyhow::Result<()> {
 
     let local_for_sink = Some(local.clone());
 
+    let tls = pylon::transport::tls::resolve_tls(
+        &config.tls_cert_path,
+        &config.tls_key_path,
+        &config.tls_ca_path,
+    )
+    .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    if tls.is_some() {
+        tracing::info!(cert = ?config.tls_cert_path, "TLS enabled");
+    } else {
+        tracing::info!("TLS disabled (plain mode)");
+    }
+
     let shutdown = Arc::new(AtomicBool::new(false));
     let worker_shutdown = shutdown.clone();
     let worker_config = config.clone();
@@ -131,6 +144,7 @@ async fn main() -> anyhow::Result<()> {
             // its own harness (`run_redis_percore`); this standalone `main` percore
             // path is not clustered.
             false,
+            tls,
         )
     });
 
@@ -232,6 +246,20 @@ async fn run_redis_percore(config: ServerConfig, apps: Arc<dyn AppManager>) -> a
     // worker. `clustered = true` flips each connection into deferred single-emit mode.
     let worker_adapter: Arc<dyn Adapter> =
         Arc::new(ClusterAdapter::new(local.clone(), bridge.handle()));
+
+    let tls = pylon::transport::tls::resolve_tls(
+        &config.tls_cert_path,
+        &config.tls_key_path,
+        &config.tls_ca_path,
+    )
+    .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    if tls.is_some() {
+        tracing::info!(cert = ?config.tls_cert_path, "TLS enabled (redis/cluster mode)");
+    } else {
+        tracing::info!("TLS disabled (plain mode, redis/cluster)");
+    }
+
     let shutdown = Arc::new(AtomicBool::new(false));
     let worker_shutdown = shutdown.clone();
     let worker_config = config.clone();
@@ -248,6 +276,7 @@ async fn run_redis_percore(config: ServerConfig, apps: Arc<dyn AppManager>) -> a
             Some(worker_local),
             // This IS a clustered node: defer the single-emit cluster edges.
             true,
+            tls,
         )
     });
 

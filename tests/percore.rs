@@ -98,6 +98,7 @@ async fn spawn(config: ServerConfig) -> Harness {
                 codel: pylon::transport::conn::CodelParams::DEFAULT,
                 budget_factor: None,
                 shutdown_grace_ms: 0,
+                tls: None,
             },
             sd,
         )

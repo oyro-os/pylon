@@ -65,6 +65,7 @@ async fn spawn() -> SocketAddr {
             worker_shutdown,
             local_for_sink,
             false,
+            None,
         );
     });
     // Leak the worker thread + shutdown flag; the test process is short-lived.

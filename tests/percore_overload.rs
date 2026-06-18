@@ -147,6 +147,7 @@ async fn spawn_with(config: ServerConfig) -> Harness {
             worker_shutdown,
             Some(local),
             false, // not clustered
+            None,
         )
         .expect("run_percore failed");
     });

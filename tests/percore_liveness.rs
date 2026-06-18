@@ -102,6 +102,7 @@ async fn spawn(activity_timeout: u32, pong_timeout: u32) -> Harness {
                 codel: pylon::transport::conn::CodelParams::DEFAULT,
                 budget_factor: None,
                 shutdown_grace_ms: 0,
+                tls: None,
             },
             sd,
         )

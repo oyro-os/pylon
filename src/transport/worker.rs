@@ -56,7 +56,7 @@ use dashmap::DashMap;
 use mio::net::TcpListener;
 use mio::{Events, Interest, Poll, Token};
 use std::collections::{HashMap, HashSet};
-use std::io::{ErrorKind, Read};
+use std::io::ErrorKind;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -171,6 +171,9 @@ pub struct WorkerConfig {
     /// close on shutdown, matching the old behaviour). Echo/test workers can set
     /// this to `0`; production workers get it from `ServerConfig::shutdown_grace_ms`.
     pub shutdown_grace_ms: u64,
+    /// Optional rustls server config. `Some` ⇒ every accepted connection is
+    /// wrapped with a TLS server-side handshake; `None` ⇒ plain TCP (legacy).
+    pub tls: Option<Arc<rustls::ServerConfig>>,
 }
 
 /// The per-worker half of the sharded broadcast plumbing handed to [`run`].
@@ -794,7 +797,17 @@ fn accept_ready(
                     tracing::debug!(error = %e, "failed to register accepted socket");
                     continue;
                 }
-                let mut conn = Connection::new(stream, cfg.high_water);
+                let mut conn = if let Some(tls_cfg) = &cfg.tls {
+                    match rustls::server::ServerConnection::new(tls_cfg.clone()) {
+                        Ok(sc) => Connection::new_tls(stream, Box::new(sc), cfg.high_water),
+                        Err(e) => {
+                            tracing::debug!(error = %e, "failed to create TLS ServerConnection; dropping");
+                            continue;
+                        }
+                    }
+                } else {
+                    Connection::new(stream, cfg.high_water)
+                };
                 conn.set_codel(codel);
                 entry.insert(Entry {
                     conn,
@@ -1365,7 +1378,7 @@ fn flush_and_arm(poll: &Poll, entry: &mut Entry, now_ns: u64) -> Action {
         WriteStatus::Drained => {
             if poll
                 .registry()
-                .reregister(&mut entry.conn.stream, token, Interest::READABLE)
+                .reregister(entry.conn.stream_mut(), token, Interest::READABLE)
                 .is_err()
             {
                 return Action::Close;
@@ -1376,7 +1389,7 @@ fn flush_and_arm(poll: &Poll, entry: &mut Entry, now_ns: u64) -> Action {
             if poll
                 .registry()
                 .reregister(
-                    &mut entry.conn.stream,
+                    entry.conn.stream_mut(),
                     token,
                     Interest::READABLE | Interest::WRITABLE,
                 )
@@ -1400,15 +1413,10 @@ enum ReadOutcome {
 }
 
 fn drain_into(conn: &mut Connection, buf: &mut BytesMut) -> ReadOutcome {
-    let mut chunk = [0u8; 16 * 1024];
-    loop {
-        match conn.stream.read(&mut chunk) {
-            Ok(0) => return ReadOutcome::Closed,
-            Ok(n) => buf.extend_from_slice(&chunk[..n]),
-            Err(ref e) if e.kind() == ErrorKind::WouldBlock => return ReadOutcome::Ok,
-            Err(ref e) if e.kind() == ErrorKind::Interrupted => continue,
-            Err(_) => return ReadOutcome::Closed,
-        }
+    if conn.drain_head_bytes(buf) {
+        ReadOutcome::Ok
+    } else {
+        ReadOutcome::Closed
     }
 }
 
@@ -1434,7 +1442,7 @@ fn handoff_rest(
     let Some(mut entry) = conns.try_remove(key) else {
         return;
     };
-    let _ = poll.registry().deregister(&mut entry.conn.stream);
+    let _ = poll.registry().deregister(entry.conn.stream_mut());
 
     let Some(tx) = cfg.rest_handoff.as_ref() else {
         // No REST plane; dropping `entry` closes the socket.
@@ -1498,12 +1506,13 @@ fn remove(
         *inflight_bytes = inflight_bytes
             .wrapping_add(entry.conn.take_inflight_delta() as u64)
             .wrapping_sub(entry.conn.out_bytes() as u64);
+        entry.conn.send_close_notify();
         if let Some(mut session) = entry.session.take() {
             deindex_connection(&session, local_subs, sid_to_token);
             futures_executor::block_on(session.ctx.on_close());
             session.conn_count.fetch_sub(1, Ordering::SeqCst);
         }
-        let _ = poll.registry().deregister(&mut entry.conn.stream);
+        let _ = poll.registry().deregister(entry.conn.stream_mut());
     }
 }
 
@@ -1771,6 +1780,7 @@ mod tests {
                     codel: crate::transport::conn::CodelParams::DISABLED,
                     budget_factor: None,
                     shutdown_grace_ms: 0,
+                    tls: None,
                 },
                 sd,
             )

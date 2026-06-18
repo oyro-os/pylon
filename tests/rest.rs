@@ -88,6 +88,7 @@ async fn spawn() -> SocketAddr {
             local_for_sink,
             // Single-node (not clustered).
             false,
+            None,
         );
     });
     std::mem::forget((shutdown, handle));

@@ -69,6 +69,7 @@ async fn spawn() -> SocketAddr {
             worker_shutdown,
             local_for_sink,
             false,
+            None,
         );
     });
     std::mem::forget((shutdown, handle));

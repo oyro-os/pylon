@@ -82,7 +82,7 @@ pylon = { path = ".", features = ["test-hooks"] }
 rcgen = "0.13"
 # Enables paused-time control (`start_paused`, `tokio::time::advance`) in tests.
 tokio = { version = "1", features = ["test-util"] }
-tokio-tungstenite = "0.24"
+tokio-tungstenite = { version = "0.24", features = ["rustls-tls-native-roots"] }
 criterion = "0.5"
 futures-util = "0.3"
 # Used by transport::conn tests to shrink SO_SNDBUF and force partial writes.
