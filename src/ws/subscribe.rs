@@ -258,7 +258,7 @@ impl ConnectionContext {
                                         user_id: join.member.user_id,
                                         user_info: join.member.user_info,
                                     },
-                                    Some(self.socket_id.clone()),
+                                    Some(self.socket_id),
                                 )
                                 .await;
                             if self.app.has_member_added_webhooks {
@@ -419,7 +419,7 @@ impl ConnectionContext {
                     // Presence members broadcast their `user_id`; private has none.
                     user_id: user_id.clone(),
                 },
-                Some(self.socket_id.clone()),
+                Some(self.socket_id),
             )
             .await;
         if self.app.has_client_event_webhooks {

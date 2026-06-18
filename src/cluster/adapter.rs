@@ -72,7 +72,7 @@ impl Adapter for ClusterAdapter {
         // Capture the socket id + mailbox BEFORE `handle` is moved into the local adapter.
         // The mailbox lets the bridge send the CLUSTER-wide `subscription_succeeded` roster
         // straight to this connection on the presence path.
-        let socket_id = handle.socket_id.clone();
+        let socket_id = handle.socket_id;
         let mailbox = handle.mailbox.clone();
         // Node-local subscribe (synchronous) — the returned outcome is node-local truth.
         // For presence this also indexes the connection for delivery on this worker (so it
@@ -123,15 +123,13 @@ impl Adapter for ClusterAdapter {
                 Arc::from(app),
                 Arc::from(channel),
                 leave.user_id.clone(),
-                socket_id.clone(),
+                *socket_id,
                 node_last,
             ),
-            None => self.handle.unsubscribe(
-                Arc::from(app),
-                Arc::from(channel),
-                socket_id.clone(),
-                node_last,
-            ),
+            None => {
+                self.handle
+                    .unsubscribe(Arc::from(app), Arc::from(channel), *socket_id, node_last)
+            }
         }
         out
     }
@@ -145,7 +143,7 @@ impl Adapter for ClusterAdapter {
     ) {
         // Local delivery on THIS worker (typed event, honouring `except`).
         self.local
-            .broadcast(app, channel, event.clone(), except.clone())
+            .broadcast(app, channel, event.clone(), except)
             .await;
         // Pre-encode the v7 frame ONCE and fire it at the bridge, which does ONLY the
         // Redis publish (no double local delivery; self-dedup on the origin node).
@@ -199,7 +197,7 @@ impl Adapter for ClusterAdapter {
     ) -> UserJoinOutcome {
         // Capture the socket id BEFORE `handle` is moved into the local adapter — the
         // bridge needs it for the cluster USER_SIGNIN binding token.
-        let socket_id = handle.socket_id.clone();
+        let socket_id = handle.socket_id;
         // Node-local signin (synchronous) — `first_for_user` here is the NODE-local 0→1
         // edge, which drives the bridge's usermsg subscribe-on-first. The cluster-wide
         // online edge (WatchOnline publish + local-watcher notify) is computed on the
@@ -222,12 +220,8 @@ impl Adapter for ClusterAdapter {
         // edge is computed on the bridge.
         let out = self.local.signout_user(app, user_id, socket_id).await;
         let node_last = out.last_for_user;
-        self.handle.signout(
-            Arc::from(app),
-            user_id.to_string(),
-            socket_id.clone(),
-            node_last,
-        );
+        self.handle
+            .signout(Arc::from(app), user_id.to_string(), *socket_id, node_last);
         out
     }
 
@@ -258,7 +252,7 @@ impl Adapter for ClusterAdapter {
         // Capture the socket id + mailbox BEFORE `handle` is moved into the local adapter.
         // The mailbox lets the bridge send the CLUSTER-wide initial online snapshot
         // straight to this connection.
-        let socket_id = handle.socket_id.clone();
+        let socket_id = handle.socket_id;
         let mailbox = handle.mailbox.clone();
         // Record watchers node-locally + learn which users this node now NEWLY watches
         // (the 0→1 watcher edges that drive the bridge's per-user watch Redis SUBSCRIBE).
@@ -274,7 +268,7 @@ impl Adapter for ClusterAdapter {
         // Drop this connection's watch state node-locally + learn the users whose LOCAL
         // watcher set dropped to empty here (1→0), which the bridge UNSUBSCRIBEs.
         let gone = self.local.unwatch_edges(app, socket_id);
-        self.handle.unwatch(Arc::from(app), socket_id.clone(), gone);
+        self.handle.unwatch(Arc::from(app), *socket_id, gone);
     }
 
     async fn watchers_of(&self, app: &str, user_id: &str) -> Vec<ConnectionHandle> {

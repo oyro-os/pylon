@@ -98,7 +98,7 @@ impl BroadcastSink {
                 app: app.clone(),
                 channel: channel.clone(),
                 frame: frame.clone(),
-                except: except.clone(),
+                except,
             }) {
                 Ok(()) => {}
                 Err(std::sync::mpsc::TrySendError::Full(_)) => {

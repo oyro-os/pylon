@@ -3,8 +3,11 @@
 use rand::Rng;
 use std::fmt;
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct SocketId(String);
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct SocketId {
+    buf: [u8; 24],
+    len: u8,
+}
 
 impl SocketId {
     /// Each half is drawn from `[1, 10^10)` — large enough to be unguessable.
@@ -12,22 +15,26 @@ impl SocketId {
         let mut rng = rand::thread_rng();
         let a: u64 = rng.gen_range(1..10_000_000_000);
         let b: u64 = rng.gen_range(1..10_000_000_000);
-        SocketId(format!("{a}.{b}"))
+        Self::from_raw(format!("{a}.{b}"))
     }
 
     pub fn as_str(&self) -> &str {
-        &self.0
+        std::str::from_utf8(&self.buf[..self.len as usize]).unwrap_or("")
     }
 
     /// Build a `SocketId` from a client-supplied string (e.g. a REST `socket_id`).
-    pub fn from_raw(raw: impl Into<String>) -> Self {
-        SocketId(raw.into())
+    pub fn from_raw(raw: impl AsRef<str>) -> Self {
+        let s = raw.as_ref().as_bytes();
+        let n = s.len().min(24);
+        let mut buf = [0u8; 24];
+        buf[..n].copy_from_slice(&s[..n]);
+        Self { buf, len: n as u8 }
     }
 }
 
 impl fmt::Display for SocketId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
+        f.write_str(self.as_str())
     }
 }
 

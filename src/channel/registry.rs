@@ -155,7 +155,7 @@ mod tests {
         let reg = Registry::new();
         let (h1, mut rx1) = handle();
         let (h2, mut rx2) = handle();
-        let sid1 = h1.socket_id.clone();
+        let sid1 = h1.socket_id;
         assert_eq!(reg.subscribe("app", "c", h1, None).subscription_count, 1);
         assert_eq!(reg.subscribe("app", "c", h2, None).subscription_count, 2);
         reg.broadcast("app", "c", &ServerEvent::Pong, Some(&sid1));
@@ -175,7 +175,7 @@ mod tests {
     fn unsubscribe_prunes_empty_channel() {
         let reg = Registry::new();
         let (h, _rx) = handle();
-        let sid = h.socket_id.clone();
+        let sid = h.socket_id;
         reg.subscribe("app", "c", h, None);
         let out = reg.unsubscribe("app", "c", &sid);
         assert_eq!(out.subscription_count, 0);
@@ -202,8 +202,8 @@ mod tests {
         let reg = Registry::new();
         let (h1, _r1) = handle();
         let (h2, _r2) = handle();
-        let s1 = h1.socket_id.clone();
-        let s2 = h2.socket_id.clone();
+        let s1 = h1.socket_id;
+        let s2 = h2.socket_id;
         reg.subscribe("app", "c", h1, None);
         reg.subscribe("app", "c", h2, None);
         // 2 -> 1 : not vacated
@@ -225,9 +225,9 @@ mod tests {
         let (h1, _r1) = handle();
         let (h2, _r2) = handle();
         let (h3, _r3) = handle();
-        let s1 = h1.socket_id.clone();
-        let s2 = h2.socket_id.clone();
-        let s3 = h3.socket_id.clone();
+        let s1 = h1.socket_id;
+        let s2 = h2.socket_id;
+        let s3 = h3.socket_id;
         // Two channels: "c1" has two sockets, "c2" has one.
         reg.subscribe("app", "c1", h1, None);
         reg.subscribe("app", "c1", h2, None);

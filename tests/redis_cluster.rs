@@ -169,7 +169,7 @@ async fn redis_sub_lifecycle_tracks_channels() {
     let socket_id = SocketId::generate();
     let (tx, _rx) = tokio::sync::mpsc::channel(1024);
     let handle = ConnectionHandle {
-        socket_id: socket_id.clone(),
+        socket_id,
         mailbox: pylon::connection::handle::Mailbox::new(tx, None, None),
     };
 
@@ -229,7 +229,7 @@ async fn subscribe_socket(
     let socket_id = SocketId::generate();
     let (tx, rx) = tokio::sync::mpsc::channel(1024);
     let handle = ConnectionHandle {
-        socket_id: socket_id.clone(),
+        socket_id,
         mailbox: pylon::connection::handle::Mailbox::new(tx, None, None),
     };
     adapter.subscribe(TEST_APP, channel, handle, None).await;
@@ -288,7 +288,7 @@ async fn cross_node_broadcast_fans_out_with_dedup_and_exclusion() {
                 data: serde_json::json!({ "hello": "world" }),
                 user_id: None,
             },
-            Some(sender_a_id.clone()),
+            Some(sender_a_id),
         )
         .await;
 
@@ -349,7 +349,7 @@ fn fake_handle() -> (SocketId, ConnectionHandle) {
     let socket_id = SocketId::generate();
     let (tx, _rx) = tokio::sync::mpsc::channel(1024);
     let handle = ConnectionHandle {
-        socket_id: socket_id.clone(),
+        socket_id,
         mailbox: pylon::connection::handle::Mailbox::new(tx, None, None),
     };
     (socket_id, handle)
@@ -777,7 +777,7 @@ fn presence_handle(
     let socket_id = SocketId::generate();
     let (tx, _rx) = tokio::sync::mpsc::channel(1024);
     let handle = ConnectionHandle {
-        socket_id: socket_id.clone(),
+        socket_id,
         mailbox: pylon::connection::handle::Mailbox::new(tx, None, None),
     };
     let member = pylon::presence::member::PresenceMember {
@@ -1155,7 +1155,7 @@ fn recording_handle() -> (
     let socket_id = SocketId::generate();
     let (tx, rx) = tokio::sync::mpsc::channel(1024);
     let handle = ConnectionHandle {
-        socket_id: socket_id.clone(),
+        socket_id,
         mailbox: pylon::connection::handle::Mailbox::new(tx, None, None),
     };
     (socket_id, handle, rx)
@@ -1280,7 +1280,7 @@ async fn cross_node_watchlist_online_offline() {
 
         // 2. B signs in u7 → cluster online edge → publishes WatchOnline on watch(u7).
         let (_sb, handle_b, _rx_b) = recording_handle();
-        let b_socket = handle_b.socket_id.clone();
+        let b_socket = handle_b.socket_id;
         adapter_b.signin_user(TEST_APP, "u7", handle_b).await;
 
         // 3. A's watcher receives a WatchlistEvents "online" for u7.

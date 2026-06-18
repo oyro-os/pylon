@@ -128,7 +128,7 @@ async fn fake_subscriber(
     // `Mailbox` just forwards `send` (no wake).
     let mailbox = pylon::connection::handle::Mailbox::new(tx, None, None);
     let handle = ConnectionHandle {
-        socket_id: socket_id.clone(),
+        socket_id,
         mailbox: mailbox.clone(),
     };
     let out = local.subscribe(TEST_APP, channel, handle, None).await;
@@ -340,7 +340,7 @@ async fn cross_node_vacated_single_emit() {
         node_a.bridge.handle().subscribe(
             Arc::from(TEST_APP),
             Arc::from(channel),
-            sid_a.clone(),
+            sid_a,
             mailbox_a,
             true,
         );
@@ -353,7 +353,7 @@ async fn cross_node_vacated_single_emit() {
         node_b.bridge.handle().subscribe(
             Arc::from(TEST_APP),
             Arc::from(channel),
-            sid_b.clone(),
+            sid_b,
             mailbox_b,
             true,
         );

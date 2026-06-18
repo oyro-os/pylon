@@ -62,7 +62,7 @@ impl ConnectionContext {
 
     pub(in crate::ws) fn handle(&self) -> ConnectionHandle {
         ConnectionHandle {
-            socket_id: self.socket_id.clone(),
+            socket_id: self.socket_id,
             // A WAKING mailbox: a cross-connection `send` marks this connection
             // dirty + wakes its worker (when `mailbox_notify` is wired), so the
             // worker drains exactly this connection and never scans idle ones.

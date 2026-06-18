@@ -87,7 +87,7 @@ async fn deliver(
             .await;
         return;
     }
-    let except = socket_id.map(|s| SocketId::from_raw(s.to_string()));
+    let except = socket_id.map(SocketId::from_raw);
     state
         .adapter
         .broadcast(

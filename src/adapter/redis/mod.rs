@@ -882,7 +882,7 @@ impl Adapter for RedisAdapter {
     ) -> SubscribeOutcome {
         // Capture the socket id BEFORE `handle` is moved into the local adapter —
         // we need it below to form this connection's member token for Redis.
-        let socket_id = handle.socket_id.clone();
+        let socket_id = handle.socket_id;
 
         let mut out = self.local.subscribe(app, channel, handle, member).await;
 
@@ -976,7 +976,7 @@ impl Adapter for RedisAdapter {
     ) {
         // 1. Local delivery on THIS node — typed event, honouring `except`.
         self.local
-            .broadcast(app, channel, event.clone(), except.clone())
+            .broadcast(app, channel, event.clone(), except)
             .await;
 
         // 2. Fan out to the rest of the cluster. Publish the *pre-encoded* v7 frame
@@ -1140,7 +1140,7 @@ impl Adapter for RedisAdapter {
     ) -> UserJoinOutcome {
         // Capture the socket id BEFORE `handle` is moved into the local adapter —
         // we need it to form this connection's binding token for Redis.
-        let socket_id = handle.socket_id.clone();
+        let socket_id = handle.socket_id;
         let mut out = self.local.signin_user(app, user_id, handle).await;
 
         // The node-LOCAL first-connection edge, read BEFORE the cluster half overwrites

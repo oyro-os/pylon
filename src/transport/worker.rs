@@ -1050,7 +1050,7 @@ fn handle_handshake(
                 match establish_session(env, &path, notify, cfg.mailbox_dropped_slot.clone()) {
                     Ok(session) => {
                         let established = ServerEvent::ConnectionEstablished {
-                            socket_id: session.ctx.socket_id.clone(),
+                            socket_id: session.ctx.socket_id,
                             activity_timeout: env.activity_timeout,
                         };
                         let text = session.codec.encode(&established);
@@ -1786,7 +1786,7 @@ fn reconcile_membership(
         local_subs
             .entry((app.clone(), channel.clone()))
             .or_default()
-            .insert(sid.clone());
+            .insert(*sid);
     }
     // Removed channels: were recorded, no longer subscribed.
     for channel in session.subs.difference(&session.ctx.subscribed) {
@@ -1799,7 +1799,7 @@ fn reconcile_membership(
         }
     }
     // Keep the reverse map current (stamp on first subscribe; harmless re-stamp).
-    sid_to_token.insert(sid.clone(), token);
+    sid_to_token.insert(*sid, token);
     // Record the new set as the reconcile baseline.
     session.subs = session.ctx.subscribed.clone();
 }

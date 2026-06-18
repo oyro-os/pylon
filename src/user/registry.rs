@@ -29,7 +29,7 @@ impl UserRegistry {
             .entry((app.to_string(), user_id.to_string()))
             .or_default();
         let first_for_user = entry.is_empty();
-        entry.insert(handle.socket_id.clone(), handle);
+        entry.insert(handle.socket_id, handle);
         UserJoinOutcome { first_for_user }
     }
 
@@ -75,7 +75,7 @@ impl UserRegistry {
         handle: ConnectionHandle,
         watched: Vec<String>,
     ) -> (Vec<String>, Vec<String>) {
-        let sock = handle.socket_id.clone();
+        let sock = handle.socket_id;
         // Idempotent: drop any prior watch state for this connection before
         // recording the new one, so a re-watch can't leak stale `watchers` entries.
         self.unwatch(app, &sock);
@@ -89,7 +89,7 @@ impl UserRegistry {
             if entry.is_empty() {
                 newly_watched.push(w.clone());
             }
-            entry.insert(sock.clone(), handle.clone());
+            entry.insert(sock, handle.clone());
         }
         let online = watched
             .iter()
@@ -104,7 +104,7 @@ impl UserRegistry {
     /// dropped to empty here (1→0 on this node) — the cross-node adapter uses these to
     /// UNSUBSCRIBE the per-user `watch` Redis channel.
     pub fn unwatch(&self, app: &str, socket_id: &SocketId) -> Vec<String> {
-        let Some((_, watched)) = self.watching.remove(&(app.to_string(), socket_id.clone())) else {
+        let Some((_, watched)) = self.watching.remove(&(app.to_string(), *socket_id)) else {
             return Vec::new();
         };
         let mut now_empty = Vec::new();
@@ -189,8 +189,8 @@ mod tests {
         let r = UserRegistry::new();
         let (h1, _r1) = handle();
         let (h2, _r2) = handle();
-        let s1 = h1.socket_id.clone();
-        let s2 = h2.socket_id.clone();
+        let s1 = h1.socket_id;
+        let s2 = h2.socket_id;
         r.signin("app", "u", h1);
         r.signin("app", "u", h2);
         assert!(!r.signout("app", "u", &s1).last_for_user);
@@ -204,7 +204,7 @@ mod tests {
         let (online_user, _o) = handle();
         r.signin("app", "b", online_user); // b is online; c is not
         let (watcher, _w) = handle();
-        let sock = watcher.socket_id.clone();
+        let sock = watcher.socket_id;
         let (online, _newly) = r.watch("app", watcher, vec!["b".into(), "c".into()]);
         assert_eq!(online, vec!["b".to_string()]); // only b currently online
         assert_eq!(r.watchers_of("app", "b").len(), 1);
@@ -216,7 +216,7 @@ mod tests {
     fn rewatch_replaces_prior_watchlist_without_leak() {
         let r = UserRegistry::new();
         let (watcher, _w) = handle();
-        let sock = watcher.socket_id.clone();
+        let sock = watcher.socket_id;
         // First watch covers a and b.
         r.watch("app", watcher.clone(), vec!["a".into(), "b".into()]);
         assert_eq!(r.watchers_of("app", "a").len(), 1);
@@ -243,9 +243,9 @@ mod tests {
         let (h1, _r1) = handle();
         let (h2, _r2) = handle();
         let (h3, _r3) = handle();
-        let s1 = h1.socket_id.clone();
-        let s2 = h2.socket_id.clone();
-        let s3 = h3.socket_id.clone();
+        let s1 = h1.socket_id;
+        let s2 = h2.socket_id;
+        let s3 = h3.socket_id;
         // Two sockets for user "u" and one for user "v", all under app "app".
         r.signin("app", "u", h1);
         r.signin("app", "u", h2);
@@ -270,7 +270,7 @@ mod tests {
         let r = UserRegistry::new();
         // First watcher of "b": its LOCAL watcher set goes 0→1, so "b" is newly_watched.
         let (w1, _r1) = handle();
-        let sock1 = w1.socket_id.clone();
+        let sock1 = w1.socket_id;
         let (_online, newly) = r.watch("app", w1, vec!["b".into()]);
         assert!(
             newly.contains(&"b".to_string()),
@@ -280,7 +280,7 @@ mod tests {
         // A SECOND, different socket watching "b": the set is already non-empty
         // (1→2), so "b" must NOT be reported as newly_watched again.
         let (w2, _r2) = handle();
-        let sock2 = w2.socket_id.clone();
+        let sock2 = w2.socket_id;
         let (_online2, newly2) = r.watch("app", w2, vec!["b".into()]);
         assert!(
             !newly2.contains(&"b".to_string()),

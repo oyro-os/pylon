@@ -43,7 +43,7 @@ impl ChannelState {
         handle: ConnectionHandle,
         member: Option<PresenceMember>,
     ) -> Option<PresenceJoin> {
-        let socket_id = handle.socket_id.clone();
+        let socket_id = handle.socket_id;
         let join = member.as_ref().map(|m| {
             let first_for_user = !self.users.contains_key(&m.user_id);
             let u = self
@@ -225,7 +225,7 @@ mod tests {
     fn public_add_remove_counts() {
         let mut s = ChannelState::default();
         let h = handle();
-        let sid = h.socket_id.clone();
+        let sid = h.socket_id;
         assert!(s.add(h, None).is_none());
         assert_eq!(s.subscription_count(), 1);
         assert!(s.user_count().is_none());
@@ -237,7 +237,7 @@ mod tests {
     fn presence_dedup_same_user_two_connections() {
         let mut s = ChannelState::default();
         let (h1, h2) = (handle(), handle());
-        let (s1, s2) = (h1.socket_id.clone(), h2.socket_id.clone());
+        let (s1, s2) = (h1.socket_id, h2.socket_id);
 
         let j1 = s.add(h1, Some(member("u1"))).unwrap();
         assert!(j1.first_for_user);
@@ -296,7 +296,7 @@ mod tests {
         for i in 0..n {
             let (h, rx) = handle_with_rx();
             if i == 0 {
-                excluded_sid = Some(h.socket_id.clone());
+                excluded_sid = Some(h.socket_id);
             }
             s.add(h, None);
             rxs.push((i, rx));

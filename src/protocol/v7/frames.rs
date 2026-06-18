@@ -199,7 +199,7 @@ mod tests {
     fn connection_established_double_encodes_data() {
         let id = SocketId::generate();
         let out = parse(&encode(&ServerEvent::ConnectionEstablished {
-            socket_id: id.clone(),
+            socket_id: id,
             activity_timeout: 120,
         }));
         assert_eq!(out["event"], "pusher:connection_established");

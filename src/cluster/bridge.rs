@@ -952,7 +952,7 @@ async fn handle_cmd(
                             user_id: member.user_id.clone(),
                             user_info: member.user_info.clone(),
                         },
-                        Some(socket_id.clone()),
+                        Some(socket_id),
                     )
                     .await;
                 if a.has_member_added_webhooks {

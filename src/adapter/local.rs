@@ -238,7 +238,7 @@ impl Adapter for LocalAdapter {
 
     async fn terminate_user(&self, app: &str, user_id: &str) -> Vec<SocketId> {
         let handles = self.users.handles(app, user_id);
-        let ids = handles.iter().map(|h| h.socket_id.clone()).collect();
+        let ids = handles.iter().map(|h| h.socket_id).collect();
         for h in handles {
             // Mirror soketi namespace.ts:179-188 — error frame then close, both 4009.
             let _ = h.mailbox.send(ServerEvent::Error(PusherError::new(
@@ -426,7 +426,7 @@ mod tests {
                 "app",
                 "u",
                 ConnectionHandle {
-                    socket_id: s.clone(),
+                    socket_id: s,
                     mailbox: crate::connection::handle::Mailbox::new(tx, None, None),
                 },
             )
