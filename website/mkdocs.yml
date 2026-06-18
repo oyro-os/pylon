@@ -70,3 +70,6 @@ nav:
       - Clustering & Scaling: user-guide/clustering.md
       - TLS / SSL: user-guide/tls.md
       - Deployment: user-guide/deployment.md
+      - Production Tuning: user-guide/production-tuning.md
+      - Observability: user-guide/observability.md
+      - Troubleshooting & FAQ: user-guide/troubleshooting.md

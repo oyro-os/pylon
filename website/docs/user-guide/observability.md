@@ -1,0 +1,163 @@
+# Observability
+
+Pylon exposes Prometheus metrics, a liveness probe, and a readiness probe on the
+same HTTP port as the REST API (`PYLON_PORT`, default 6001).
+
+---
+
+## `GET /metrics` — Prometheus Exposition
+
+Returns a Prometheus text-format (v0.0.4) snapshot. The endpoint is
+unauthenticated by design — restrict access at the network layer if needed.
+
+```bash
+curl http://localhost:6001/metrics
+```
+
+### Metrics Reference
+
+All series use cardinality-safe labels only: `worker` (integer index), `app`
+(app ID string), `status` (`ok` / `failed`). There are **no per-channel
+labels**.
+
+#### Process
+
+| Series | Type | Labels | Description |
+|---|---|---|---|
+| `pylon_up` | gauge | — | Always `1`; confirms the process is alive and the scrape succeeded |
+
+#### Per-App (presence requires at least one active app)
+
+| Series | Type | Labels | Description |
+|---|---|---|---|
+| `pylon_connections` | gauge | `app` | Live WebSocket connections for the app |
+| `pylon_channels_occupied` | gauge | `app` | Channels with at least one subscriber |
+| `pylon_subscriptions` | gauge | `app` | Total channel subscriptions across all connections |
+
+#### Per-Worker Transport
+
+| Series | Type | Labels | Description |
+|---|---|---|---|
+| `pylon_accepted_connections_total` | counter | `worker` | Cumulative connections accepted by each worker since start |
+| `pylon_broadcast_dropped_total` | counter | `worker` | Broadcasts dropped because the worker hand-off channel was full |
+| `pylon_codel_dropped_total` | counter | `worker` | Frames discarded by the CoDel staleness check (stale frames removed from the queue before sending) |
+| `pylon_inflight_bytes` | gauge | `worker` | Bytes currently queued in each worker's outbound buffer |
+| `pylon_inflight_bytes_sum` | gauge | — | Sum of `pylon_inflight_bytes` across all workers |
+| `pylon_worker_budget_bytes` | gauge | — | Per-worker memory budget in bytes |
+| `pylon_budget_factor` | gauge | — | PSI memory-pressure budget factor (0.0–1.0); drops toward 0 as workers approach their memory budget |
+| `pylon_saturation_flag` | gauge | — | `1` if the broadcast pipeline is saturated, `0` otherwise; omitted when the saturation monitor is not running |
+
+#### Webhook Pipeline
+
+| Series | Type | Labels | Description |
+|---|---|---|---|
+| `pylon_webhook_enqueued_total` | counter | — | Webhook events successfully placed in the delivery mailbox |
+| `pylon_webhook_dropped_total` | counter | — | Webhook events dropped because the mailbox was full or closed |
+| `pylon_webhook_delivered_total` | counter | `status` | Completed delivery attempts; `status="ok"` or `status="failed"` |
+| `pylon_webhook_queue_depth` | gauge | — | Current number of events waiting in the webhook mailbox |
+
+#### Cluster / Redis (only present on the Redis clustering path)
+
+| Series | Type | Labels | Description |
+|---|---|---|---|
+| `pylon_cluster_cmd_dropped_total` | counter | — | `ClusterCmd` messages dropped on a full bridge channel |
+| `pylon_redis_connected` | gauge | — | `1` = Redis connection healthy; `0` = error/disconnected |
+
+---
+
+### Prometheus Scrape Config
+
+Add pylon as a scrape target in `prometheus.yml`:
+
+```yaml
+scrape_configs:
+  - job_name: pylon
+    static_configs:
+      - targets:
+          - "pylon-host-1:6001"
+          - "pylon-host-2:6001"
+    # No auth needed; restrict at network layer instead.
+```
+
+For Kubernetes, use a `ServiceMonitor` (Prometheus Operator) pointing at port
+`6001` with path `/metrics`.
+
+---
+
+### Grafana
+
+Import the series above into Grafana dashboards. Useful panel ideas:
+
+- **Connection density**: `pylon_connections{app="…"}` per app, plus
+  `sum(pylon_inflight_bytes_sum)` for buffer pressure.
+- **Drop rates**: rate of `pylon_broadcast_dropped_total` and
+  `pylon_codel_dropped_total` — non-zero values indicate backpressure.
+- **Webhook health**: `pylon_webhook_dropped_total` rate and
+  `pylon_webhook_queue_depth` — rising queue depth signals a slow upstream.
+- **Redis health**: `pylon_redis_connected` as a status panel; alert on `< 1`.
+- **Memory pressure**: `pylon_budget_factor` — alert when it drops below 0.2.
+
+---
+
+## `GET /health` — Liveness Probe
+
+```
+200 OK   body: ok
+```
+
+Always returns `200 ok` as long as the process can handle HTTP requests. Use
+this as a **liveness probe**: if it fails, restart the container.
+
+```bash
+curl -f http://localhost:6001/health
+```
+
+Kubernetes liveness probe:
+
+```yaml
+livenessProbe:
+  httpGet:
+    path: /health
+    port: 6001
+  initialDelaySeconds: 5
+  periodSeconds: 10
+```
+
+Also available at `/healthz`.
+
+---
+
+## `GET /ready` — Readiness Probe
+
+| Status | Body | Meaning |
+|---|---|---|
+| `200 OK` | `ready` | Workers up and not draining — safe to route traffic here |
+| `503 Service Unavailable` | `draining` | Shutdown in progress; stop routing new connections |
+| `503 Service Unavailable` | `starting` | Workers not yet initialised |
+
+Use this as a **readiness probe**: the load balancer or k8s controller stops
+sending new connections to a node when it returns non-200, which is exactly what
+you want during a [graceful restart](production-tuning.md#graceful-restart).
+
+```bash
+curl -f http://localhost:6001/ready
+```
+
+Kubernetes readiness probe:
+
+```yaml
+readinessProbe:
+  httpGet:
+    path: /ready
+    port: 6001
+  initialDelaySeconds: 3
+  periodSeconds: 5
+  failureThreshold: 2
+```
+
+Also available at `/readyz`.
+
+!!! tip "Load-balancer health checks"
+    Point your load balancer's health check at `/ready` (not `/health`). This
+    ensures that draining nodes are removed from the rotation before their
+    connections are closed with [Pusher code 4200](troubleshooting.md#close-codes).
