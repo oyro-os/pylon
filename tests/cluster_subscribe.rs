@@ -79,10 +79,11 @@ fn apps_manager() -> Arc<dyn AppManager> {
 /// read back the recorded deliveries). A tiny batch window keeps the test fast.
 fn recording_webhooks(apps: Arc<dyn AppManager>) -> (WebhookHandle, RecordingTransport) {
     let transport = RecordingTransport::new();
-    let dyn_transport: Arc<dyn WebhookTransport> = Arc::new(transport.clone());
+    let recorded = transport.clone();
     let handle = pylon::webhook::spawn(
         apps,
-        dyn_transport,
+        // RecordingTransport doesn't count outcomes; it ignores the metrics.
+        move |_metrics| Arc::new(recorded) as Arc<dyn WebhookTransport>,
         Arc::new(SystemClock),
         10,   // 10ms batch window
         1024, // mailbox capacity

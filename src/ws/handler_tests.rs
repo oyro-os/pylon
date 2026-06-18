@@ -7,7 +7,7 @@ use tokio::sync::mpsc;
 mod pylon_dispatcher_helpers {
     use crate::app::{App, AppManager};
     use crate::webhook::dispatcher::FixedClock;
-    use crate::webhook::transport::RecordingTransport;
+    use crate::webhook::transport::{RecordingTransport, WebhookTransport};
     use crate::webhook::{spawn, WebhookHandle};
     use async_trait::async_trait;
     use std::sync::Arc;
@@ -28,9 +28,11 @@ mod pylon_dispatcher_helpers {
     pub fn recording_webhooks(app: App, batch_ms: u64) -> (WebhookHandle, Arc<RecordingTransport>) {
         let recorder = Arc::new(RecordingTransport::new());
         let apps: Arc<dyn AppManager> = Arc::new(OneApp(app));
+        let recorded = recorder.clone();
         let handle = spawn(
             apps,
-            recorder.clone(),
+            // RecordingTransport doesn't count outcomes; it ignores the metrics.
+            move |_metrics| recorded as Arc<dyn WebhookTransport>,
             Arc::new(FixedClock(1700000000000)),
             batch_ms,
             1024,

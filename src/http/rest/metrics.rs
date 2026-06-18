@@ -152,12 +152,8 @@ pub fn encode(snapshot: &MetricsSnapshot) -> String {
         let _ = writeln!(out, "pylon_webhook_delivered_total{{status=\"ok\"}} {ok}");
         let _ = writeln!(out, "pylon_webhook_delivered_total{{status=\"failed\"}} {failed}");
 
-        // Queue depth gauge: max_capacity − remaining permits.
-        // `Sender::capacity()` from tokio returns remaining permits.
-        // We don't hold the Sender here; compute from enqueued - (ok + failed) as a proxy,
-        // but the spec says to use tx.capacity(). Since we only have the metrics (not the tx),
-        // we store nothing here and omit this gauge from the snapshot-only encoder path.
-        // (The handler stores max_capacity and a snapshot of the sender capacity separately.)
+        // Queue depth gauge: max_capacity − remaining permits, computed by the
+        // handler from `WebhookHandle::queue_depth()` (it holds the Sender).
         if let Some(queue_depth) = snapshot.webhook_queue_depth {
             out.push_str("# HELP pylon_webhook_queue_depth Current number of events in the webhook mailbox\n");
             out.push_str("# TYPE pylon_webhook_queue_depth gauge\n");
@@ -201,22 +197,10 @@ pub async fn get_metrics(State(state): State<AppState>) -> impl IntoResponse {
     let saturation = state.saturated.as_ref().map(|s| s.load(Ordering::Relaxed));
     let percore = percore_metrics_snapshot();
 
-    // Phase-2 B2: webhook metrics + queue depth.
+    // Phase-2 B2: webhook metrics + queue depth. The depth is the spec formula
+    // `max_capacity − remaining permits`, read straight off the handle's Sender.
     let webhook = Some(state.webhooks.metrics());
-    let webhook_queue_depth = {
-        let wm = state.webhooks.metrics();
-        let max = wm.max_capacity as u64;
-        // depth = enqueued - (delivered_ok + delivered_failed) is an approximation;
-        // the real depth is max_capacity - remaining_permits which requires the Sender.
-        // We expose max_capacity via WebhookMetrics and enqueued/delivered to let
-        // operators derive depth. For the gauge we compute: enqueued - (ok + failed).
-        // This may go negative briefly (timing) so clamp to 0.
-        let ok = wm.delivered_ok.load(Ordering::Relaxed);
-        let failed = wm.delivered_failed.load(Ordering::Relaxed);
-        let enqueued = wm.enqueued.load(Ordering::Relaxed);
-        let in_flight = enqueued.saturating_sub(ok.saturating_add(failed));
-        Some(in_flight.min(max))
-    };
+    let webhook_queue_depth = Some(state.webhooks.queue_depth());
 
     // Phase-2 B3: cluster metrics (Some on Redis path, None on local path).
     let cluster = state.cluster_metrics.clone();

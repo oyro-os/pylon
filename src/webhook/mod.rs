@@ -74,6 +74,15 @@ impl WebhookHandle {
         self.metrics.clone()
     }
 
+    /// Current webhook mailbox depth: `max_capacity − remaining permits` (spec
+    /// §8). `Sender::capacity()` returns the remaining permits, so this is the
+    /// number of events queued but not yet drained by the dispatcher.
+    pub fn queue_depth(&self) -> u64 {
+        self.metrics
+            .max_capacity
+            .saturating_sub(self.tx.capacity()) as u64
+    }
+
     /// Non-blocking enqueue. Drops + logs on a full or closed mailbox.
     pub fn enqueue(&self, event: WebhookEvent) {
         match self.tx.try_send(event) {
@@ -99,23 +108,33 @@ impl WebhookHandle {
 /// Spawn the dispatcher actor and return the enqueue handle. `mailbox_capacity`
 /// sizes the bounded channel (the §8 backpressure safety valve).
 ///
+/// `make_transport` is a factory handed the freshly-built `Arc<WebhookMetrics>`
+/// so the transport (e.g. `HttpTransport`) shares the SAME counters as the
+/// returned `WebhookHandle`: the handle owns `enqueued` / `dropped` /
+/// `queue_depth`, the transport owns `delivered_ok` / `delivered_failed`. A
+/// transport that doesn't count (e.g. `RecordingTransport`) simply ignores it.
+///
 /// `vacated_grace_ms` + `occupancy` enable the cluster-aware `channel_vacated`
 /// grace window (Task D1): when both are active (grace > 0 and `occupancy` is
 /// `Some`), a surviving `channel_vacated` is debounced by the grace window and
 /// re-checked against the cluster subscription_count before firing — suppressed
 /// if the channel is occupied again anywhere in the cluster. With `0` / `None`
 /// (the local-adapter path) vacated fires immediately, as before.
-pub fn spawn(
+pub fn spawn<F>(
     apps: Arc<dyn AppManager>,
-    transport: Arc<dyn WebhookTransport>,
+    make_transport: F,
     clock: Arc<dyn Clock>,
     batch_ms: u64,
     mailbox_capacity: usize,
     vacated_grace_ms: u64,
     occupancy: Option<Arc<dyn OccupancySource>>,
-) -> WebhookHandle {
+) -> WebhookHandle
+where
+    F: FnOnce(Arc<WebhookMetrics>) -> Arc<dyn WebhookTransport>,
+{
     let (tx, rx) = mpsc::channel(mailbox_capacity);
     let metrics = Arc::new(WebhookMetrics::new(mailbox_capacity));
+    let transport = make_transport(metrics.clone());
     let dispatcher = WebhookDispatcher::new(
         rx,
         apps,
@@ -124,7 +143,6 @@ pub fn spawn(
         batch_ms,
         vacated_grace_ms,
         occupancy,
-        metrics.clone(),
     );
     tokio::spawn(dispatcher.run());
     WebhookHandle { tx, metrics }

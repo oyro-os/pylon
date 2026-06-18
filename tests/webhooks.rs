@@ -79,10 +79,9 @@ async fn spawn_pylon(receiver: SocketAddr) -> SocketAddr {
     );
     let apps: Arc<dyn AppManager> = Arc::new(StaticFileAppManager::from_json(&apps_json).unwrap());
     let local = Arc::new(LocalAdapter::new(Arc::new(Registry::new())));
-    let transport: Arc<dyn WebhookTransport> = Arc::new(HttpTransport::new(3, 50, 5000, 100));
     let webhooks = pylon::webhook::spawn(
         apps.clone(),
-        transport,
+        |metrics| Arc::new(HttpTransport::new(3, 50, 5000, 100, metrics)) as Arc<dyn WebhookTransport>,
         Arc::new(SystemClock),
         30, // 30ms batch window
         1024,
@@ -164,4 +163,75 @@ async fn occupied_webhook_is_posted_and_signature_validates() {
     // Signature validates exactly the way pusher-http-node's WebHook does:
     // hex(HMAC_SHA256(secret, raw_body)) == X-Pusher-Signature.
     assert_eq!(signature, hmac_sha256_hex(SECRET, &body));
+}
+
+/// Parse a single `metric_name value` series out of a Prometheus text body,
+/// returning the parsed `u64` value (or `None` if the line is absent).
+fn metric_value(body: &str, line_prefix: &str) -> Option<u64> {
+    body.lines()
+        .find(|l| l.starts_with(line_prefix))
+        .and_then(|l| l.split_whitespace().last())
+        .and_then(|v| v.parse().ok())
+}
+
+/// End-to-end: driving a webhook (subscribe → `channel_occupied`) must move the
+/// `pylon_webhook_*` counters in `GET /metrics`. The receiver returns 2xx so the
+/// delivery resolves `ok`. Polls (webhooks are async: batch window + spawned
+/// delivery task) rather than assuming a fixed sleep.
+#[tokio::test]
+async fn metrics_reflect_a_driven_webhook() {
+    let (receiver_addr, mut rx) = spawn_receiver().await;
+    let pylon_addr = spawn_pylon(receiver_addr).await;
+
+    let mut ws = connect(pylon_addr).await;
+    let est = next_json(&mut ws).await;
+    assert_eq!(est["event"], "pusher:connection_established");
+
+    // Subscribe to a public channel → 0→1 → channel_occupied webhook fires.
+    ws.send(Message::Text(
+        json!({ "event": "pusher:subscribe", "data": { "channel": "metrics-room" } }).to_string(),
+    ))
+    .await
+    .unwrap();
+    let ack = next_json(&mut ws).await;
+    assert_eq!(ack["event"], "pusher_internal:subscription_succeeded");
+
+    // The delivery must actually land (the receiver returns 200) so the spawned
+    // transport task bumps delivered_ok before we scrape.
+    let _ = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+        .await
+        .expect("webhook POST arrived")
+        .expect("channel open");
+
+    // Poll /metrics until both the enqueued and the delivered{ok} counters reflect
+    // the driven webhook (bounded so a real regression fails fast).
+    let client = reqwest::Client::new();
+    let mut enqueued = 0u64;
+    let mut delivered_ok = 0u64;
+    for _ in 0..50 {
+        let body = client
+            .get(format!("http://{pylon_addr}/metrics"))
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+        enqueued = metric_value(&body, "pylon_webhook_enqueued_total").unwrap_or(0);
+        delivered_ok =
+            metric_value(&body, r#"pylon_webhook_delivered_total{status="ok"}"#).unwrap_or(0);
+        if enqueued >= 1 && delivered_ok >= 1 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    assert!(
+        enqueued >= 1,
+        "pylon_webhook_enqueued_total must be >= 1 after a driven webhook, got {enqueued}"
+    );
+    assert!(
+        delivered_ok >= 1,
+        "pylon_webhook_delivered_total{{status=\"ok\"}} must be >= 1 after a 2xx delivery, got {delivered_ok}"
+    );
 }

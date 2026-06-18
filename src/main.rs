@@ -30,15 +30,21 @@ fn spawn_webhooks(
     vacated_grace_ms: u64,
     occupancy: Option<Arc<dyn OccupancySource>>,
 ) -> WebhookHandle {
-    let transport: Arc<dyn WebhookTransport> = Arc::new(HttpTransport::new(
-        config.webhook_max_retries,
-        config.webhook_retry_base_ms,
-        config.webhook_timeout_ms,
-        config.webhook_max_concurrency,
-    ));
+    let max_retries = config.webhook_max_retries;
+    let retry_base_ms = config.webhook_retry_base_ms;
+    let timeout_ms = config.webhook_timeout_ms;
+    let max_concurrency = config.webhook_max_concurrency;
     pylon::webhook::spawn(
         apps,
-        transport,
+        move |metrics| {
+            Arc::new(HttpTransport::new(
+                max_retries,
+                retry_base_ms,
+                timeout_ms,
+                max_concurrency,
+                metrics,
+            )) as Arc<dyn WebhookTransport>
+        },
         Arc::new(SystemClock),
         config.webhook_batch_ms,
         // Generously sized mailbox (the §8 backpressure safety valve).

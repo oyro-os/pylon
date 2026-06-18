@@ -2,9 +2,11 @@
 //! `WebhookTransport` trait, and its `HttpTransport` / `RecordingTransport` impls.
 
 use crate::auth::signature::hmac_sha256_hex;
+use crate::webhook::WebhookMetrics;
 use async_trait::async_trait;
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{Mutex, Semaphore};
@@ -48,11 +50,12 @@ pub fn build_signed_delivery(
 }
 
 /// The pluggable delivery boundary. `HttpTransport` POSTs; `RecordingTransport`
-/// records for tests. Returns `true` on a successful delivery (2xx), `false`
-/// when all retries are exhausted without success.
+/// records for tests. `deliver` owns retry/concurrency policy internally and
+/// never returns an error to the dispatcher (it spawns the attempt loop and
+/// returns immediately; outcomes are counted in the spawned task, not here).
 #[async_trait]
 pub trait WebhookTransport: Send + Sync {
-    async fn deliver(&self, delivery: WebhookDelivery) -> bool;
+    async fn deliver(&self, delivery: WebhookDelivery);
 }
 
 /// Test double: records every delivery handed to it; performs no I/O.
@@ -74,9 +77,8 @@ impl RecordingTransport {
 
 #[async_trait]
 impl WebhookTransport for RecordingTransport {
-    async fn deliver(&self, delivery: WebhookDelivery) -> bool {
+    async fn deliver(&self, delivery: WebhookDelivery) {
         self.deliveries.lock().await.push(delivery);
-        true
     }
 }
 
@@ -88,16 +90,22 @@ pub struct HttpTransport {
     max_retries: u32,
     retry_base_ms: u64,
     semaphore: Arc<Semaphore>,
+    /// Shared pipeline counters. The spawned delivery task bumps `delivered_ok`
+    /// (2xx) or `delivered_failed` (permanent 4xx / exhausted retries / closed
+    /// semaphore) exactly once when the attempt loop resolves.
+    metrics: Arc<WebhookMetrics>,
 }
 
 impl HttpTransport {
     /// `timeout_ms` is the per-attempt request timeout; `max_concurrency` caps
-    /// simultaneous in-flight deliveries.
+    /// simultaneous in-flight deliveries. `metrics` is the shared pipeline
+    /// counter set; the spawned delivery task records each resolved outcome.
     pub fn new(
         max_retries: u32,
         retry_base_ms: u64,
         timeout_ms: u64,
         max_concurrency: usize,
+        metrics: Arc<WebhookMetrics>,
     ) -> Self {
         let client = reqwest::Client::builder()
             .timeout(Duration::from_millis(timeout_ms))
@@ -108,6 +116,7 @@ impl HttpTransport {
             max_retries,
             retry_base_ms,
             semaphore: Arc::new(Semaphore::new(max_concurrency)),
+            metrics,
         }
     }
 
@@ -120,51 +129,66 @@ impl HttpTransport {
 
 #[async_trait]
 impl WebhookTransport for HttpTransport {
-    /// Attempt delivery with retry + backoff. Acquires a concurrency permit
-    /// (blocking if saturated), then runs the attempt loop inline and returns
-    /// `true` on success, `false` when all retries are exhausted. The
-    /// dispatcher awaits this, so concurrent deliveries are bounded by the
-    /// semaphore rather than by the number of spawned tasks.
-    async fn deliver(&self, delivery: WebhookDelivery) -> bool {
-        // Concurrency cap: if the broker is saturated this awaits a permit.
-        let _permit = match self.semaphore.acquire().await {
-            Ok(p) => p,
-            Err(_) => return false, // semaphore closed (shutdown)
-        };
+    /// Spawn the attempt loop (with retry + backoff) and return immediately —
+    /// the caller (dispatcher) is never blocked, so it keeps draining its
+    /// mailbox. Concurrent deliveries are bounded by the `Semaphore` acquired
+    /// *inside* the spawned task. When the loop resolves, the task bumps
+    /// `delivered_ok` (2xx) or `delivered_failed` (permanent failure / exhausted
+    /// retries / closed semaphore) exactly once.
+    async fn deliver(&self, delivery: WebhookDelivery) {
+        let client = self.client.clone();
+        let max_retries = self.max_retries;
+        let base = self.retry_base_ms;
+        let sem = self.semaphore.clone();
+        let metrics = self.metrics.clone();
 
-        // attempt 0 is the first try; up to `max_retries` extra attempts.
-        for attempt in 0..=self.max_retries {
-            let mut req = self.client.post(&delivery.url).body(delivery.body.clone());
-            for (k, v) in &delivery.headers {
-                req = req.header(k, v);
-            }
-            match req.send().await {
-                Ok(resp) => {
-                    let status = resp.status();
-                    if status.is_success() {
-                        return true;
-                    }
-                    if !HttpTransport::retryable(status) {
-                        tracing::warn!(url = %delivery.url, %status, "webhook rejected (permanent)");
-                        return false; // 4xx (non-429): permanent failure
-                    }
-                    // retryable status: fall through to backoff
-                    tracing::debug!(url = %delivery.url, %status, attempt, "webhook retryable status");
+        tokio::spawn(async move {
+            // Concurrency cap: if the broker is saturated this awaits a permit.
+            let _permit = match sem.acquire().await {
+                Ok(p) => p,
+                Err(_) => {
+                    // semaphore closed (shutdown): the delivery never went out.
+                    metrics.delivered_failed.fetch_add(1, Ordering::Relaxed);
+                    return;
                 }
-                Err(e) => {
-                    // transport error (timeout, connection refused): retry
-                    tracing::debug!(url = %delivery.url, error = %e, attempt, "webhook transport error");
+            };
+
+            // attempt 0 is the first try; up to `max_retries` extra attempts.
+            for attempt in 0..=max_retries {
+                let mut req = client.post(&delivery.url).body(delivery.body.clone());
+                for (k, v) in &delivery.headers {
+                    req = req.header(k, v);
                 }
+                match req.send().await {
+                    Ok(resp) => {
+                        let status = resp.status();
+                        if status.is_success() {
+                            metrics.delivered_ok.fetch_add(1, Ordering::Relaxed);
+                            return;
+                        }
+                        if !HttpTransport::retryable(status) {
+                            tracing::warn!(url = %delivery.url, %status, "webhook rejected (permanent)");
+                            metrics.delivered_failed.fetch_add(1, Ordering::Relaxed);
+                            return; // 4xx (non-429): permanent failure
+                        }
+                        // retryable status: fall through to backoff
+                        tracing::debug!(url = %delivery.url, %status, attempt, "webhook retryable status");
+                    }
+                    Err(e) => {
+                        // transport error (timeout, connection refused): retry
+                        tracing::debug!(url = %delivery.url, error = %e, attempt, "webhook transport error");
+                    }
+                }
+                if attempt == max_retries {
+                    tracing::warn!(url = %delivery.url, "webhook delivery exhausted retries; dropping");
+                    metrics.delivered_failed.fetch_add(1, Ordering::Relaxed);
+                    return;
+                }
+                // exponential backoff: base * 2^attempt.
+                let delay = base.saturating_mul(1u64 << attempt);
+                tokio::time::sleep(Duration::from_millis(delay)).await;
             }
-            if attempt == self.max_retries {
-                tracing::warn!(url = %delivery.url, "webhook delivery exhausted retries; dropping");
-                return false;
-            }
-            // exponential backoff: base * 2^attempt.
-            let delay = self.retry_base_ms.saturating_mul(1u64 << attempt);
-            tokio::time::sleep(Duration::from_millis(delay)).await;
-        }
-        false
+        });
     }
 }
 
@@ -217,7 +241,8 @@ mod tests {
         // 503, 503, 200 → exactly 3 attempts.
         let calls = Arc::new(AtomicUsize::new(0));
         let addr = spawn_mock(post(flaky_handler), calls.clone()).await;
-        let t = HttpTransport::new(3, 1, 5000, 10); // base 1ms so the test is fast
+        let metrics = Arc::new(WebhookMetrics::new(64));
+        let t = HttpTransport::new(3, 1, 5000, 10, metrics.clone()); // base 1ms so the test is fast
         let d = build_signed_delivery(
             &format!("http://{addr}/wh"),
             "k",
@@ -230,13 +255,17 @@ mod tests {
         // small settle for the spawned delivery task
         tokio::time::sleep(Duration::from_millis(200)).await;
         assert_eq!(calls.load(Ordering::SeqCst), 3, "two retries then success");
+        // A 2xx (after retries) bumps delivered_ok exactly once, never failed.
+        assert_eq!(metrics.delivered_ok.load(Ordering::Relaxed), 1, "one ok");
+        assert_eq!(metrics.delivered_failed.load(Ordering::Relaxed), 0, "no failed");
     }
 
     #[tokio::test]
     async fn http_transport_does_not_retry_on_400() {
         let calls = Arc::new(AtomicUsize::new(0));
         let addr = spawn_mock(post(reject_handler), calls.clone()).await;
-        let t = HttpTransport::new(3, 1, 5000, 10);
+        let metrics = Arc::new(WebhookMetrics::new(64));
+        let t = HttpTransport::new(3, 1, 5000, 10, metrics.clone());
         let d = build_signed_delivery(
             &format!("http://{addr}/wh"),
             "k",
@@ -252,6 +281,9 @@ mod tests {
             1,
             "4xx is permanent: single attempt"
         );
+        // A permanent 4xx bumps delivered_failed exactly once, never ok.
+        assert_eq!(metrics.delivered_ok.load(Ordering::Relaxed), 0, "no ok");
+        assert_eq!(metrics.delivered_failed.load(Ordering::Relaxed), 1, "one failed");
     }
 
     #[test]

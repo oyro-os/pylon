@@ -48,6 +48,12 @@ impl ClusterMetrics {
     }
 }
 
+impl Default for ClusterMetrics {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Bound on the worker→bridge control-plane channel. A full channel drops the command (see
 /// [`ClusterHandle::publish`]); sized generously so only a sustained bridge stall — never a
 /// normal burst — ever overflows it.
