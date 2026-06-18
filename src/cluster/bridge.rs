@@ -24,10 +24,29 @@ use crate::protocol::socket_id::SocketId;
 use crate::server::config::ServerConfig;
 use crate::webhook::event::WebhookEvent;
 use crate::webhook::WebhookHandle;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::thread::JoinHandle;
 use tokio::sync::mpsc;
+
+/// Shared counters for the cluster bridge, exposed via `/metrics`.
+pub struct ClusterMetrics {
+    /// Total `ClusterCmd`s dropped because the bridge channel was full or closed.
+    pub cmd_dropped: AtomicU64,
+    /// Whether the Redis connection is currently healthy. Set `true` by the
+    /// node-heartbeat loop after a successful tick; `false` on error.
+    /// Held as `Arc<AtomicBool>` so it can be cloned into the heartbeat loop.
+    pub redis_connected: Arc<AtomicBool>,
+}
+
+impl ClusterMetrics {
+    fn new() -> Self {
+        Self {
+            cmd_dropped: AtomicU64::new(0),
+            redis_connected: Arc::new(AtomicBool::new(false)),
+        }
+    }
+}
 
 /// Bound on the worker→bridge control-plane channel. A full channel drops the command (see
 /// [`ClusterHandle::publish`]); sized generously so only a sustained bridge stall — never a
@@ -163,6 +182,9 @@ pub enum ClusterCmd {
 pub struct ClusterHandle {
     tx: mpsc::Sender<ClusterCmd>,
     node_id: Arc<str>,
+    /// Shared bridge metrics. The handle only writes `cmd_dropped`; `redis_connected`
+    /// is written by the heartbeat loop that runs inside the bridge's runtime.
+    metrics: Arc<ClusterMetrics>,
 }
 
 impl ClusterHandle {
@@ -192,9 +214,11 @@ impl ClusterHandle {
         match self.tx.try_send(cmd) {
             Ok(()) => {}
             Err(mpsc::error::TrySendError::Full(_)) => {
+                self.metrics.cmd_dropped.fetch_add(1, Ordering::Relaxed);
                 tracing::debug!("cluster bridge channel full; dropping cross-node publish");
             }
             Err(mpsc::error::TrySendError::Closed(_)) => {
+                self.metrics.cmd_dropped.fetch_add(1, Ordering::Relaxed);
                 tracing::debug!("cluster bridge gone; dropping cross-node publish");
             }
         }
@@ -224,9 +248,11 @@ impl ClusterHandle {
         match self.tx.try_send(cmd) {
             Ok(()) => {}
             Err(mpsc::error::TrySendError::Full(_)) => {
+                self.metrics.cmd_dropped.fetch_add(1, Ordering::Relaxed);
                 tracing::debug!("cluster bridge channel full; dropping cross-node subscribe");
             }
             Err(mpsc::error::TrySendError::Closed(_)) => {
+                self.metrics.cmd_dropped.fetch_add(1, Ordering::Relaxed);
                 tracing::debug!("cluster bridge gone; dropping cross-node subscribe");
             }
         }
@@ -250,9 +276,11 @@ impl ClusterHandle {
         match self.tx.try_send(cmd) {
             Ok(()) => {}
             Err(mpsc::error::TrySendError::Full(_)) => {
+                self.metrics.cmd_dropped.fetch_add(1, Ordering::Relaxed);
                 tracing::debug!("cluster bridge channel full; dropping cross-node unsubscribe");
             }
             Err(mpsc::error::TrySendError::Closed(_)) => {
+                self.metrics.cmd_dropped.fetch_add(1, Ordering::Relaxed);
                 tracing::debug!("cluster bridge gone; dropping cross-node unsubscribe");
             }
         }
@@ -283,11 +311,13 @@ impl ClusterHandle {
         match self.tx.try_send(cmd) {
             Ok(()) => {}
             Err(mpsc::error::TrySendError::Full(_)) => {
+                self.metrics.cmd_dropped.fetch_add(1, Ordering::Relaxed);
                 tracing::debug!(
                     "cluster bridge channel full; dropping cross-node presence subscribe"
                 );
             }
             Err(mpsc::error::TrySendError::Closed(_)) => {
+                self.metrics.cmd_dropped.fetch_add(1, Ordering::Relaxed);
                 tracing::debug!("cluster bridge gone; dropping cross-node presence subscribe");
             }
         }
@@ -313,9 +343,11 @@ impl ClusterHandle {
         match self.tx.try_send(cmd) {
             Ok(()) => {}
             Err(mpsc::error::TrySendError::Full(_)) => {
+                self.metrics.cmd_dropped.fetch_add(1, Ordering::Relaxed);
                 tracing::debug!("cluster bridge channel full; dropping cross-node presence leave");
             }
             Err(mpsc::error::TrySendError::Closed(_)) => {
+                self.metrics.cmd_dropped.fetch_add(1, Ordering::Relaxed);
                 tracing::debug!("cluster bridge gone; dropping cross-node presence leave");
             }
         }
@@ -335,9 +367,11 @@ impl ClusterHandle {
         match self.tx.try_send(cmd) {
             Ok(()) => {}
             Err(mpsc::error::TrySendError::Full(_)) => {
+                self.metrics.cmd_dropped.fetch_add(1, Ordering::Relaxed);
                 tracing::debug!("cluster bridge channel full; dropping cross-node signin");
             }
             Err(mpsc::error::TrySendError::Closed(_)) => {
+                self.metrics.cmd_dropped.fetch_add(1, Ordering::Relaxed);
                 tracing::debug!("cluster bridge gone; dropping cross-node signin");
             }
         }
@@ -355,9 +389,11 @@ impl ClusterHandle {
         match self.tx.try_send(cmd) {
             Ok(()) => {}
             Err(mpsc::error::TrySendError::Full(_)) => {
+                self.metrics.cmd_dropped.fetch_add(1, Ordering::Relaxed);
                 tracing::debug!("cluster bridge channel full; dropping cross-node signout");
             }
             Err(mpsc::error::TrySendError::Closed(_)) => {
+                self.metrics.cmd_dropped.fetch_add(1, Ordering::Relaxed);
                 tracing::debug!("cluster bridge gone; dropping cross-node signout");
             }
         }
@@ -385,9 +421,11 @@ impl ClusterHandle {
         match self.tx.try_send(cmd) {
             Ok(()) => {}
             Err(mpsc::error::TrySendError::Full(_)) => {
+                self.metrics.cmd_dropped.fetch_add(1, Ordering::Relaxed);
                 tracing::debug!("cluster bridge channel full; dropping cross-node watch");
             }
             Err(mpsc::error::TrySendError::Closed(_)) => {
+                self.metrics.cmd_dropped.fetch_add(1, Ordering::Relaxed);
                 tracing::debug!("cluster bridge gone; dropping cross-node watch");
             }
         }
@@ -404,9 +442,11 @@ impl ClusterHandle {
         match self.tx.try_send(cmd) {
             Ok(()) => {}
             Err(mpsc::error::TrySendError::Full(_)) => {
+                self.metrics.cmd_dropped.fetch_add(1, Ordering::Relaxed);
                 tracing::debug!("cluster bridge channel full; dropping cross-node unwatch");
             }
             Err(mpsc::error::TrySendError::Closed(_)) => {
+                self.metrics.cmd_dropped.fetch_add(1, Ordering::Relaxed);
                 tracing::debug!("cluster bridge gone; dropping cross-node unwatch");
             }
         }
@@ -421,6 +461,8 @@ impl ClusterHandle {
 /// at the end of the drain loop aborts its background tasks via the adapter's own `Drop`.
 pub struct ClusterBridge {
     handle: ClusterHandle,
+    /// Shared metrics for this bridge (cmd_dropped + redis_connected).
+    metrics: Arc<ClusterMetrics>,
     /// The node's single `RedisAdapter`, sent out of the runtime thread on the startup
     /// handshake and held here so the REST plane can drive cluster-wide reads/writes
     /// through it. There is EXACTLY ONE `RedisAdapter` per node: its one pub/sub recv loop
@@ -447,6 +489,11 @@ impl ClusterBridge {
     /// A cheap clone of the handle for a worker (or a test).
     pub fn handle(&self) -> ClusterHandle {
         self.handle.clone()
+    }
+
+    /// The shared cluster metrics (cmd_dropped counter + redis_connected gauge).
+    pub fn metrics(&self) -> Arc<ClusterMetrics> {
+        self.metrics.clone()
     }
 
     /// The node's single `RedisAdapter`, as an `Arc<dyn Adapter>` for the REST plane to
@@ -507,6 +554,10 @@ pub fn start(
 ) -> anyhow::Result<ClusterBridge> {
     let (tx, mut rx) = mpsc::channel::<ClusterCmd>(CMD_CHANNEL_CAPACITY);
     let shutdown = Arc::new(AtomicBool::new(false));
+    let metrics = Arc::new(ClusterMetrics::new());
+    // Clone the redis_connected Arc so the runtime thread can pass it into with_local,
+    // where the node-heartbeat loop will update it after each tick.
+    let thread_redis_connected = metrics.redis_connected.clone();
 
     // The deferred webhook cell: empty until `attach_webhooks` runs (after the dispatcher
     // is built). Shared with the runtime thread's drain loop so it sees the handle once set.
@@ -551,7 +602,9 @@ pub fn start(
                 let local_for_loop = local.clone();
                 // Connect the adapter sharing the workers' `LocalAdapter`. On failure, hand
                 // the error back so `start` returns `Err` instead of hanging.
-                let adapter = match RedisAdapter::with_local(&cfg, local).await {
+                // Pass `thread_redis_connected` so the node-heartbeat loop inside the adapter
+                // updates it after each tick (true = ok, false = error).
+                let adapter = match RedisAdapter::with_local(&cfg, local, Some(thread_redis_connected)).await {
                     Ok(a) => Arc::new(a),
                     Err(e) => {
                         let _ = ready_tx.send(Err(e));
@@ -628,9 +681,10 @@ pub fn start(
     };
 
     let node_id: Arc<str> = Arc::from(adapter.node_id());
-    let handle = ClusterHandle { tx, node_id };
+    let handle = ClusterHandle { tx, node_id, metrics: metrics.clone() };
     Ok(ClusterBridge {
         handle,
+        metrics,
         adapter,
         webhooks,
         shutdown,

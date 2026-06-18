@@ -2,6 +2,7 @@
 
 use crate::adapter::Adapter;
 use crate::app::AppManager;
+use crate::cluster::bridge::ClusterMetrics;
 use crate::server::config::ServerConfig;
 use crate::webhook::WebhookHandle;
 use axum::routing::get;
@@ -29,6 +30,10 @@ pub struct AppState {
     /// so load balancers stop routing new connections before we close existing ones.
     /// Always `false` at startup; the flag is only toggled by the shutdown sequence.
     pub draining: Arc<AtomicBool>,
+    /// Phase-2 cluster metrics (B3): present on the clustered Redis path, absent
+    /// (`None`) on the local single-node path. The `/metrics` handler emits
+    /// `pylon_cluster_cmd_dropped_total` and `pylon_redis_connected` only when `Some`.
+    pub cluster_metrics: Option<Arc<ClusterMetrics>>,
 }
 
 impl AppState {

@@ -45,6 +45,10 @@ struct PercoreRegistry {
     /// Worker slot arcs retained to read `.dropped` (a plain `AtomicU64` embedded
     /// in the slot struct, owned by the `Arc`). `Empty` when `local` is `None`.
     worker_slots: Vec<Arc<fanout::WorkerSlot>>,
+    /// Per-worker cumulative accepted-connections counter (B1).
+    accepted_slots: Vec<Arc<AtomicU64>>,
+    /// Per-worker cumulative CoDel-dropped-frames counter (B1).
+    codel_dropped_slots: Vec<Arc<AtomicU64>>,
     budget_factor: Arc<AtomicU32>,
     worker_budget_bytes: u64,
 }
@@ -55,6 +59,10 @@ pub struct PercoreMetricsSnapshot {
     pub inflight: Vec<u64>,
     /// Per-worker broadcast drop count (cumulative counter, one per worker).
     pub dropped: Vec<u64>,
+    /// Per-worker cumulative accepted-connections count (B1).
+    pub accepted: Vec<u64>,
+    /// Per-worker cumulative CoDel-dropped-frames count (B1).
+    pub codel_dropped: Vec<u64>,
     /// Sum of all workers' inflight bytes.
     pub inflight_total: u64,
     /// Budget factor as a fraction (×1000 fixed-point → 0.0–1.0).
@@ -83,12 +91,24 @@ pub fn percore_metrics_snapshot() -> Option<PercoreMetricsSnapshot> {
         .iter()
         .map(|s| s.dropped.load(Ordering::Relaxed))
         .collect();
+    let accepted: Vec<u64> = guard
+        .accepted_slots
+        .iter()
+        .map(|s| s.load(Ordering::Relaxed))
+        .collect();
+    let codel_dropped: Vec<u64> = guard
+        .codel_dropped_slots
+        .iter()
+        .map(|s| s.load(Ordering::Relaxed))
+        .collect();
     let inflight_total = inflight.iter().sum();
     let budget_factor = guard.budget_factor.load(Ordering::Relaxed) as f64 / 1000.0;
     let worker_budget_bytes = guard.worker_budget_bytes;
     Some(PercoreMetricsSnapshot {
         inflight,
         dropped,
+        accepted,
+        codel_dropped,
         inflight_total,
         budget_factor,
         worker_budget_bytes,
@@ -213,6 +233,12 @@ pub fn run_percore(
     let inflight_slots: Vec<Arc<AtomicU64>> =
         (0..worker_count).map(|_| Arc::new(AtomicU64::new(0))).collect();
 
+    // B1: per-worker accepted-connections and CoDel-dropped-frames counters.
+    let accepted_slots: Vec<Arc<AtomicU64>> =
+        (0..worker_count).map(|_| Arc::new(AtomicU64::new(0))).collect();
+    let codel_dropped_slots: Vec<Arc<AtomicU64>> =
+        (0..worker_count).map(|_| Arc::new(AtomicU64::new(0))).collect();
+
     // Build the per-core sharded broadcast plumbing: one `(Sender, Receiver)`
     // pair + `WorkerSlot` per worker. The `Sender`s live in the sink (installed
     // on the concrete adapter BEFORE any worker spawns, so the first broadcast
@@ -314,6 +340,8 @@ pub fn run_percore(
             .get_or_init(|| std::sync::Mutex::new(PercoreRegistry {
                 inflight_slots: Vec::new(),
                 worker_slots: Vec::new(),
+                accepted_slots: Vec::new(),
+                codel_dropped_slots: Vec::new(),
                 budget_factor: budget_factor.clone(),
                 worker_budget_bytes: per_worker_budget,
             }))
@@ -323,6 +351,10 @@ pub fn run_percore(
         g.inflight_slots.extend(inflight_slots.iter().cloned());
         g.worker_slots.clear();
         g.worker_slots.extend(worker_slots_for_metrics.iter().cloned());
+        g.accepted_slots.clear();
+        g.accepted_slots.extend(accepted_slots.iter().cloned());
+        g.codel_dropped_slots.clear();
+        g.codel_dropped_slots.extend(codel_dropped_slots.iter().cloned());
         g.budget_factor = budget_factor.clone();
         g.worker_budget_bytes = per_worker_budget;
     }
@@ -339,6 +371,8 @@ pub fn run_percore(
             broadcast: wiring,
             per_worker_budget,
             inflight_slot: Some(inflight_slots[i].clone()),
+            accepted_slot: Some(accepted_slots[i].clone()),
+            codel_dropped_slot: Some(codel_dropped_slots[i].clone()),
             codel,
             budget_factor: Some(budget_factor.clone()),
             shutdown_grace_ms: config.shutdown_grace_ms,

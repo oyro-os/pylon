@@ -99,6 +99,8 @@ async fn spawn(activity_timeout: u32, pong_timeout: u32) -> Harness {
                 broadcast: None,
                 per_worker_budget: 0,
                 inflight_slot: None,
+                accepted_slot: None,
+                codel_dropped_slot: None,
                 codel: pylon::transport::conn::CodelParams::DEFAULT,
                 budget_factor: None,
                 shutdown_grace_ms: 0,

@@ -68,6 +68,7 @@ async fn spawn() -> SocketAddr {
         webhooks: webhooks.clone(),
         saturated: Some(local.saturation_flag()),
         draining: Arc::new(AtomicBool::new(false)),
+        cluster_metrics: None,
     };
     tokio::spawn(pylon::transport::rest::serve(rest_rx, build_router(rest_state)));
 

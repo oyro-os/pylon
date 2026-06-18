@@ -32,6 +32,7 @@ use fred::interfaces::{
     EventInterface, HashesInterface, KeysInterface, PubsubInterface, SetsInterface,
 };
 use fred::types::Expiration;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::task::JoinHandle;
@@ -116,14 +117,24 @@ async fn heartbeat_loop(
 ///
 /// One Redis error is logged and skipped, never fatal — the loop runs for the
 /// adapter's lifetime.
-async fn node_heartbeat_loop(pool: Pool, keys: keys::Keys, node_id: String, interval_secs: u64) {
+///
+/// If `connected` is `Some`, it is set `true` after a fully-successful tick and
+/// `false` when either Redis call errors — giving the metrics handler an accurate
+/// health gauge without reading Fred's internal state.
+async fn node_heartbeat_loop(
+    pool: Pool,
+    keys: keys::Keys,
+    node_id: String,
+    interval_secs: u64,
+    connected: Option<Arc<AtomicBool>>,
+) {
     let interval = interval_secs.max(1);
     let ttl_secs = (3 * interval) as i64;
     let mut ticker = tokio::time::interval(Duration::from_secs(interval));
     loop {
         ticker.tick().await;
         let node_key = keys.node(&node_id);
-        if let Err(e) = pool
+        let set_ok = pool
             .next()
             .set::<(), _, _>(
                 &node_key,
@@ -132,16 +143,28 @@ async fn node_heartbeat_loop(pool: Pool, keys: keys::Keys, node_id: String, inte
                 None,
                 false,
             )
-            .await
-        {
+            .await;
+        if let Err(ref e) = set_ok {
+            if let Some(ref c) = connected {
+                c.store(false, Ordering::Relaxed);
+            }
             tracing::warn!(error = %e, node_id, "redis node heartbeat SET failed; skipping this tick");
+            continue;
         }
-        if let Err(e) = pool
+        let sadd_ok = pool
             .next()
             .sadd::<i64, _, _>(keys.nodes(), node_id.clone())
-            .await
-        {
+            .await;
+        if let Err(ref e) = sadd_ok {
+            if let Some(ref c) = connected {
+                c.store(false, Ordering::Relaxed);
+            }
             tracing::warn!(error = %e, node_id, "redis node heartbeat SADD nodes failed; skipping this tick");
+            continue;
+        }
+        // Both ops succeeded: mark connected.
+        if let Some(ref c) = connected {
+            c.store(true, Ordering::Relaxed);
         }
     }
 }
@@ -216,7 +239,7 @@ impl RedisAdapter {
     ///
     /// [`with_local`]: RedisAdapter::with_local
     pub async fn new(cfg: &ServerConfig) -> anyhow::Result<Self> {
-        Self::with_local(cfg, Arc::new(LocalAdapter::new(Arc::new(Registry::new())))).await
+        Self::with_local(cfg, Arc::new(LocalAdapter::new(Arc::new(Registry::new()))), None).await
     }
 
     /// Connect to Redis (per `cfg.redis_url` / `cfg.redis_pool_size`) and build the
@@ -227,9 +250,17 @@ impl RedisAdapter {
     /// `LocalAdapter` the workers broadcast through, so cross-node frames the receive loop
     /// re-delivers via `local.broadcast(Raw(..))` shard straight to the workers' sink.
     ///
+    /// `redis_connected` — when `Some`, the node-liveness heartbeat loop stores `true`
+    /// after a successful tick and `false` on error, providing an accurate health gauge
+    /// for the `/metrics` handler.
+    ///
     /// [`new`]: RedisAdapter::new
     /// [`ClusterBridge`]: crate::cluster::bridge::ClusterBridge
-    pub async fn with_local(cfg: &ServerConfig, local: Arc<LocalAdapter>) -> anyhow::Result<Self> {
+    pub async fn with_local(
+        cfg: &ServerConfig,
+        local: Arc<LocalAdapter>,
+        redis_connected: Option<Arc<AtomicBool>>,
+    ) -> anyhow::Result<Self> {
         let node_id = uuid::Uuid::new_v4().to_string();
         let keys = keys::Keys::new(&cfg.redis_prefix);
         let clients = client::RedisClients::connect(&cfg.redis_url, cfg.redis_pool_size).await?;
@@ -267,7 +298,7 @@ impl RedisAdapter {
         let nh_node = node_id.clone();
         let nh_interval = redis_cfg.node_heartbeat_secs;
         let node_heartbeat_handle = tokio::spawn(async move {
-            node_heartbeat_loop(nh_pool, nh_keys, nh_node, nh_interval).await
+            node_heartbeat_loop(nh_pool, nh_keys, nh_node, nh_interval, redis_connected).await
         });
 
         Ok(Self {

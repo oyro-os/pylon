@@ -7,7 +7,9 @@ use crate::webhook::batch::coalesce;
 use crate::webhook::event::WebhookEvent;
 use crate::webhook::occupancy::OccupancySource;
 use crate::webhook::transport::{build_signed_delivery, WebhookTransport};
+use crate::webhook::WebhookMetrics;
 use std::collections::BTreeMap;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -53,6 +55,9 @@ pub struct WebhookDispatcher {
     /// Cluster occupancy lookup used to re-check the subscription_count before a
     /// debounced vacated fires. `None` on the local-adapter path.
     occupancy: Option<Arc<dyn OccupancySource>>,
+    /// Shared delivery counters (`delivered_ok` / `delivered_failed`). Also
+    /// carried into deferred vacated tasks so their deliveries are counted.
+    metrics: Arc<WebhookMetrics>,
 }
 
 impl WebhookDispatcher {
@@ -64,6 +69,7 @@ impl WebhookDispatcher {
         batch_ms: u64,
         vacated_grace_ms: u64,
         occupancy: Option<Arc<dyn OccupancySource>>,
+        metrics: Arc<WebhookMetrics>,
     ) -> Self {
         Self {
             rx,
@@ -73,6 +79,7 @@ impl WebhookDispatcher {
             batch_ms,
             vacated_grace_ms,
             occupancy,
+            metrics,
         }
     }
 
@@ -148,6 +155,7 @@ impl WebhookDispatcher {
                         &app,
                         self.clock.now_ms(),
                         &immediate,
+                        &self.metrics,
                     )
                     .await;
                 }
@@ -173,6 +181,7 @@ impl WebhookDispatcher {
                     let clock = self.clock.clone();
                     let occupancy = occupancy.clone();
                     let grace = self.vacated_grace_ms;
+                    let metrics = self.metrics.clone();
                     tokio::spawn(async move {
                         tokio::time::sleep(Duration::from_millis(grace)).await;
                         let count = occupancy.subscription_count(&app, &channel).await;
@@ -197,6 +206,7 @@ impl WebhookDispatcher {
                             &resolved,
                             clock.now_ms(),
                             std::slice::from_ref(&event),
+                            &metrics,
                         )
                         .await;
                     });
@@ -207,12 +217,14 @@ impl WebhookDispatcher {
 
     /// Per-endpoint filter (`event_types`) + build/sign + deliver for one app's
     /// surviving events. Shared by the immediate flush path and the deferred
-    /// vacated firing so the loop is written once (DRY).
+    /// vacated firing so the loop is written once (DRY). Bumps `delivered_ok`
+    /// or `delivered_failed` in `metrics` after each endpoint delivery resolves.
     async fn deliver_app_events(
         transport: &dyn WebhookTransport,
         app: &crate::app::App,
         time_ms: u64,
         events: &[WebhookEvent],
+        metrics: &WebhookMetrics,
     ) {
         for endpoint in &app.webhooks {
             let selected: Vec<serde_json::Value> = events
@@ -232,7 +244,11 @@ impl WebhookDispatcher {
                 &selected,
                 &custom,
             );
-            transport.deliver(delivery).await;
+            if transport.deliver(delivery).await {
+                metrics.delivered_ok.fetch_add(1, Ordering::Relaxed);
+            } else {
+                metrics.delivered_failed.fetch_add(1, Ordering::Relaxed);
+            }
         }
     }
 }
@@ -340,6 +356,7 @@ mod tests {
             batch_ms: 50,
             vacated_grace_ms: 0,
             occupancy: None,
+            metrics: Arc::new(crate::webhook::WebhookMetrics::new(64)),
         };
         let task = tokio::spawn(dispatcher.run());
 
@@ -398,6 +415,7 @@ mod tests {
             batch_ms: 50,
             vacated_grace_ms: 0,
             occupancy: None,
+            metrics: Arc::new(crate::webhook::WebhookMetrics::new(64)),
         };
         let task = tokio::spawn(dispatcher.run());
 
@@ -450,6 +468,7 @@ mod tests {
             batch_ms: 50,
             vacated_grace_ms: 3000,
             occupancy: Some(occupancy),
+            metrics: Arc::new(crate::webhook::WebhookMetrics::new(64)),
         };
         let task = tokio::spawn(dispatcher.run());
 
@@ -495,6 +514,7 @@ mod tests {
             batch_ms: 50,
             vacated_grace_ms: 3000,
             occupancy: Some(occupancy),
+            metrics: Arc::new(crate::webhook::WebhookMetrics::new(64)),
         };
         let task = tokio::spawn(dispatcher.run());
 
@@ -535,6 +555,7 @@ mod tests {
             batch_ms: 50,
             vacated_grace_ms: 0,
             occupancy: None,
+            metrics: Arc::new(crate::webhook::WebhookMetrics::new(64)),
         };
         let task = tokio::spawn(dispatcher.run());
 

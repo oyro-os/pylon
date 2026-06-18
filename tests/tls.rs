@@ -119,6 +119,7 @@ async fn spawn_tls_server(cert_path: &std::path::Path, key_path: &std::path::Pat
         webhooks: webhooks.clone(),
         saturated: Some(local.saturation_flag()),
         draining: Arc::new(AtomicBool::new(false)),
+        cluster_metrics: None,
     };
     tokio::spawn(pylon::transport::rest::serve(rest_rx, build_router(rest_state)));
 
@@ -463,6 +464,7 @@ async fn spawn_tls_server_large(
         webhooks: webhooks.clone(),
         saturated: Some(local.saturation_flag()),
         draining: Arc::new(AtomicBool::new(false)),
+        cluster_metrics: None,
     };
     tokio::spawn(pylon::transport::rest::serve(rest_rx, build_router(rest_state)));
     let shutdown = Arc::new(AtomicBool::new(false));

@@ -108,6 +108,7 @@ async fn main() -> anyhow::Result<()> {
         // LocalAdapter's, shared with the sink).
         saturated: Some(local.saturation_flag()),
         draining,
+        cluster_metrics: None,
     };
     let rest_router = build_router(rest_state);
     tokio::spawn(pylon::transport::rest::serve(rest_rx, rest_router));
@@ -233,6 +234,7 @@ async fn run_redis_percore(config: ServerConfig, apps: Arc<dyn AppManager>) -> a
         webhooks: webhooks.clone(),
         saturated: Some(local.saturation_flag()),
         draining,
+        cluster_metrics: Some(bridge.metrics()),
     };
     tokio::spawn(pylon::transport::rest::serve(
         rest_rx,

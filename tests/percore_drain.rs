@@ -108,6 +108,8 @@ async fn spawn_with_grace(grace_ms: u64) -> Harness {
                 broadcast: None,
                 per_worker_budget: 0,
                 inflight_slot: None,
+                accepted_slot: None,
+                codel_dropped_slot: None,
                 codel: pylon::transport::conn::CodelParams::DEFAULT,
                 budget_factor: None,
                 shutdown_grace_ms: grace_ms,

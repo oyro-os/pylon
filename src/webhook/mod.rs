@@ -13,10 +13,39 @@ use crate::app::AppManager;
 use dispatcher::{Clock, WebhookDispatcher};
 use event::WebhookEvent;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::mpsc;
 use transport::WebhookTransport;
 
 pub use occupancy::{AdapterOccupancy, OccupancySource};
+
+/// Shared counters for the webhook pipeline, exposed via `/metrics`.
+/// All fields are `AtomicU64`; hold as `Arc<WebhookMetrics>` to share between
+/// the `WebhookHandle`, the dispatcher, and the metrics handler.
+pub struct WebhookMetrics {
+    /// Total events successfully enqueued via `WebhookHandle::enqueue`.
+    pub enqueued: AtomicU64,
+    /// Total events dropped on a full or closed mailbox.
+    pub dropped: AtomicU64,
+    /// Total webhook deliveries that resolved with a 2xx response.
+    pub delivered_ok: AtomicU64,
+    /// Total webhook deliveries that exhausted all retries without success.
+    pub delivered_failed: AtomicU64,
+    /// Maximum mailbox capacity (for queue-depth gauge: depth = max - remaining).
+    pub max_capacity: usize,
+}
+
+impl WebhookMetrics {
+    pub fn new(max_capacity: usize) -> Self {
+        Self {
+            enqueued: AtomicU64::new(0),
+            dropped: AtomicU64::new(0),
+            delivered_ok: AtomicU64::new(0),
+            delivered_failed: AtomicU64::new(0),
+            max_capacity,
+        }
+    }
+}
 
 /// Cheap-clone enqueue handle held in `AppState` and `ConnectionContext`. The
 /// WS path NEVER blocks on it: `enqueue` is a non-awaiting `try_send` that drops
@@ -24,6 +53,7 @@ pub use occupancy::{AdapterOccupancy, OccupancySource};
 #[derive(Clone)]
 pub struct WebhookHandle {
     tx: mpsc::Sender<WebhookEvent>,
+    metrics: Arc<WebhookMetrics>,
 }
 
 impl WebhookHandle {
@@ -33,14 +63,25 @@ impl WebhookHandle {
     pub fn null() -> Self {
         let (tx, mut rx) = mpsc::channel(1024);
         tokio::spawn(async move { while rx.recv().await.is_some() {} });
-        WebhookHandle { tx }
+        WebhookHandle {
+            tx,
+            metrics: Arc::new(WebhookMetrics::new(1024)),
+        }
+    }
+
+    /// The shared metrics for this webhook pipeline.
+    pub fn metrics(&self) -> Arc<WebhookMetrics> {
+        self.metrics.clone()
     }
 
     /// Non-blocking enqueue. Drops + logs on a full or closed mailbox.
     pub fn enqueue(&self, event: WebhookEvent) {
         match self.tx.try_send(event) {
-            Ok(()) => {}
+            Ok(()) => {
+                self.metrics.enqueued.fetch_add(1, Ordering::Relaxed);
+            }
             Err(mpsc::error::TrySendError::Full(e)) => {
+                self.metrics.dropped.fetch_add(1, Ordering::Relaxed);
                 tracing::warn!(
                     name = e.name(),
                     app = e.app(),
@@ -48,6 +89,7 @@ impl WebhookHandle {
                 );
             }
             Err(mpsc::error::TrySendError::Closed(_)) => {
+                self.metrics.dropped.fetch_add(1, Ordering::Relaxed);
                 tracing::warn!("webhook dispatcher gone; dropping trigger");
             }
         }
@@ -73,6 +115,7 @@ pub fn spawn(
     occupancy: Option<Arc<dyn OccupancySource>>,
 ) -> WebhookHandle {
     let (tx, rx) = mpsc::channel(mailbox_capacity);
+    let metrics = Arc::new(WebhookMetrics::new(mailbox_capacity));
     let dispatcher = WebhookDispatcher::new(
         rx,
         apps,
@@ -81,7 +124,8 @@ pub fn spawn(
         batch_ms,
         vacated_grace_ms,
         occupancy,
+        metrics.clone(),
     );
     tokio::spawn(dispatcher.run());
-    WebhookHandle { tx }
+    WebhookHandle { tx, metrics }
 }

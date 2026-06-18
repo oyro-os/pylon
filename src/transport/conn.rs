@@ -249,6 +249,14 @@ impl Connection {
         self.codel_dropped
     }
 
+    /// Take and reset the CoDel drop counter: returns the count of frames dropped
+    /// since the last call and resets the per-connection accumulator to 0. The
+    /// worker adds the returned delta to its worker-level `codel_dropped_total`
+    /// after each flush, so the shared slot stays current without per-iteration cost.
+    pub fn take_codel_dropped(&mut self) -> u64 {
+        std::mem::take(&mut self.codel_dropped)
+    }
+
     /// Consume the connection and return ownership of its underlying socket.
     ///
     /// Used by the per-core worker's REST handoff (SP9 §3.4): a plain-HTTP
