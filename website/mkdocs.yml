@@ -63,3 +63,7 @@ nav:
       - Quick Start: user-guide/quick-start.md
       - Configuration: user-guide/configuration.md
       - Applications & Authentication: user-guide/applications.md
+      - Channels: user-guide/channels.md
+      - Connecting Clients: user-guide/clients.md
+      - Triggering Events: user-guide/triggering-events.md
+      - Webhooks: user-guide/webhooks.md

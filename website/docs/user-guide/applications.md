@@ -51,7 +51,7 @@ default `apps.json` (configurable via [`PYLON_APPS_PATH`](configuration.md)).
 | `client_messages_enabled` | boolean | When `true`, clients may publish events to channels via `client_event`. Defaults to `true`. |
 | `capacity` | integer | Maximum concurrent WebSocket connections for this app. Connections beyond this limit are refused with WebSocket close code **4004**. |
 | `statistics_enabled` | boolean | Reserved for future metrics collection. Has no effect in the current release. |
-| `webhooks` | array | Zero or more webhook targets. Each entry has a `url`, an `event_types` list, and an optional `headers` map. See the Webhooks page (coming soon) for the full event-type reference. |
+| `webhooks` | array | Zero or more webhook targets. Each entry has a `url`, an `event_types` list, and an optional `headers` map. See the [Webhooks](webhooks.md) page for the full event-type reference. |
 
 ---
 
@@ -109,7 +109,7 @@ where `user_data` is the verbatim JSON string the client sends (must contain `"i
 
 HTTP requests to the Pylon REST API (triggering events, querying channel state) are authenticated
 using HMAC-SHA256 over a canonical query string derived from the request method, path, and
-parameters. REST signing details are covered on the Triggering Events page (coming soon).
+parameters. REST signing details are covered on the [Triggering Events](triggering-events.md) page.
 
 ---
 
