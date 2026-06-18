@@ -34,9 +34,10 @@ RUN touch src/main.rs && \
 # ── Stage 2: runtime ─────────────────────────────────────────────────────────
 FROM debian:bookworm-slim AS runtime
 
-# ca-certificates is needed for TLS connections to Redis (if using rediss://).
+# ca-certificates: TLS to Redis (rediss://). wget: the container HEALTHCHECK /
+# compose healthcheck probes GET /health (debian-slim ships neither curl nor wget).
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends ca-certificates && \
+    apt-get install -y --no-install-recommends ca-certificates wget && \
     rm -rf /var/lib/apt/lists/*
 
 # Create a non-root user.

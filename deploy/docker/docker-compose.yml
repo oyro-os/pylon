@@ -18,11 +18,9 @@
 #   Liveness:   GET /health
 #   Readiness:  GET /ready  (503 during drain)
 #
-# Note: debian:bookworm-slim does not include curl. The healthcheck uses
-# wget (busybox-style). If wget is also absent in your build, either add
-# `RUN apt-get install -y --no-install-recommends wget` to the Dockerfile
-# runtime stage, or replace the healthcheck command with a small nc / bash
-# TCP check, or add a separate sidecar health binary.
+# Note: the healthcheck uses wget, which the Dockerfile installs into the
+# debian:bookworm-slim runtime stage for exactly this purpose (slim ships
+# neither curl nor wget by default).
 
 services:
 
