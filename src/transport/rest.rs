@@ -162,53 +162,84 @@ impl AsyncWrite for Rewind {
 /// `try_read`/`try_write` — they never busy-loop. When the TCP socket is not
 /// ready, `poll_read_ready`/`poll_write_ready` registers the waker and returns
 /// `Pending`. When the socket IS ready but a non-blocking read/write returns
-/// `WouldBlock`, we fall through and return `Pending` (the `poll_*_ready` call
-/// already registered the waker so tokio will re-poll when the socket is ready
-/// again).
+/// `WouldBlock`, we re-register the waker by calling `poll_read_ready`/
+/// `poll_write_ready` again so the task will be woken when the socket is ready.
+///
+/// # Ciphertext buffering (C1 fix)
+///
+/// `out_ct`/`out_pos` is a persistent outbound ciphertext buffer. Rustls
+/// produces ciphertext via `write_tls` — once that call returns the bytes are
+/// consumed from rustls's internal buffer and live ONLY in `out_ct`. If the TCP
+/// send buffer is full we must not discard them; instead we keep them in
+/// `out_ct` and resume writing on the next wakeup. `poll_flush_ct` owns the
+/// full drain loop: pull from rustls → write to socket → repeat until both
+/// `out_ct` is empty AND `!tls.wants_write()`.
 struct TlsRestStream {
     tcp: tokio::net::TcpStream,
     tls: Box<TlsConn>,
     prefix: Vec<u8>,
     prefix_pos: usize,
+    /// Ciphertext drained from rustls but not yet fully written to the socket.
+    out_ct: Vec<u8>,
+    /// Write cursor into `out_ct`; bytes `[..out_pos]` have been sent.
+    out_pos: usize,
 }
 
 impl TlsRestStream {
-    /// Drain any pending TLS write records to the TCP socket.
+    /// Poll-style flush: write all buffered ciphertext to the socket, then pull
+    /// more from rustls and repeat, until BOTH the socket buffer is empty
+    /// (`out_pos == out_ct.len()`) AND `!tls.wants_write()`.
     ///
-    /// Loops calling `write_tls` while `tls.wants_write()` is true and the TCP
-    /// `try_write` accepts bytes. Returns `Ok(())` when drained or would-block,
-    /// `Err` on a fatal socket error.
-    ///
-    /// Callers register the write waker via `poll_write_ready` before calling
-    /// this; if `try_write` returns `WouldBlock` the waker is already set so
-    /// tokio will re-poll.
-    fn try_flush_tls(&mut self) -> io::Result<()> {
-        while self.tls.wants_write() {
-            // Collect ciphertext rustls wants to send.
-            let mut ciphertext = Vec::new();
-            self.tls.write_tls(&mut ciphertext)?;
-            if ciphertext.is_empty() {
-                break;
-            }
-            // Push it to the TCP socket as much as it will accept right now.
-            let mut written = 0;
-            while written < ciphertext.len() {
-                match self.tcp.try_write(&ciphertext[written..]) {
+    /// Returns `Poll::Ready(Ok(()))` only when fully drained. Returns
+    /// `Poll::Pending` (with waker registered) when the TCP send buffer is full.
+    /// Returns `Poll::Ready(Err(_))` on any fatal I/O error.
+    fn poll_flush_ct(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        loop {
+            // (a) Write any already-buffered ciphertext to the TCP socket.
+            while self.out_pos < self.out_ct.len() {
+                match self.tcp.poll_write_ready(cx) {
+                    Poll::Pending => return Poll::Pending,
+                    Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                    Poll::Ready(Ok(())) => {}
+                }
+                match self.tcp.try_write(&self.out_ct[self.out_pos..]) {
                     Ok(0) => {
-                        // Zero-write: kernel rejected entirely; stop here and
-                        // re-attempt next time the socket is writable.
-                        return Ok(());
+                        return Poll::Ready(Err(io::Error::new(
+                            io::ErrorKind::WriteZero,
+                            "tls rest: socket closed",
+                        )));
                     }
-                    Ok(n) => written += n,
+                    Ok(n) => self.out_pos += n,
                     Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
-                        // TCP send buffer full; we'll be re-polled.
-                        return Ok(());
+                        // try_write returned WouldBlock; poll_write_ready
+                        // already registered the waker — loop to re-check.
+                        continue;
                     }
-                    Err(e) => return Err(e),
+                    Err(ref e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                    Err(e) => return Poll::Ready(Err(e)),
                 }
             }
+            // All buffered bytes written; reset the buffer.
+            self.out_ct.clear();
+            self.out_pos = 0;
+
+            // (b) Pull more ciphertext from rustls.
+            if !self.tls.wants_write() {
+                // Fully drained: nothing in our buffer AND rustls has nothing.
+                return Poll::Ready(Ok(()));
+            }
+            match self.tls.write_tls(&mut self.out_ct) {
+                Ok(0) => {
+                    // rustls produced nothing despite wants_write; treat as done.
+                    return Poll::Ready(Ok(()));
+                }
+                Ok(_) => {
+                    // More ciphertext appended to out_ct; loop to send it.
+                    self.out_pos = 0;
+                }
+                Err(e) => return Poll::Ready(Err(e)),
+            }
         }
-        Ok(())
     }
 }
 
@@ -263,8 +294,20 @@ impl AsyncRead for TlsRestStream {
             }
             Ok(n) => n,
             Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
-                // Socket marked readable but no bytes yet (spurious wakeup).
-                return Poll::Pending;
+                // Spurious readiness: socket not actually ready yet. The prior
+                // `poll_read_ready` call consumed the readiness event, so we
+                // MUST re-register the waker before returning Pending — otherwise
+                // the task will never be woken (I1 fix).
+                match this.tcp.poll_read_ready(cx) {
+                    Poll::Pending => return Poll::Pending,
+                    Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                    Poll::Ready(Ok(())) => {
+                        // Socket became ready again immediately; self-wake so
+                        // the runtime re-polls this future without delay.
+                        cx.waker().wake_by_ref();
+                        return Poll::Pending;
+                    }
+                }
             }
             Err(e) => return Poll::Ready(Err(e)),
         };
@@ -284,7 +327,7 @@ impl AsyncRead for TlsRestStream {
 
         // After processing, drive any pending TLS writes (e.g. alerts, key-update).
         // Best-effort: a write-side error here doesn't affect the read result.
-        let _ = this.try_flush_tls();
+        let _ = this.poll_flush_ct(cx);
 
         // 5. Pull the freshly decrypted plaintext out of rustls.
         match this.tls.reader().read(&mut chunk) {
@@ -326,28 +369,19 @@ impl AsyncWrite for TlsRestStream {
     ) -> Poll<io::Result<usize>> {
         let this = self.get_mut();
 
-        // Hand the plaintext to rustls (in-memory; builds ciphertext records).
+        // Hand the plaintext to rustls (in-memory; builds TLS records).
         let n = match this.tls.writer().write(buf) {
             Ok(n) => n,
             Err(e) => return Poll::Ready(Err(e)),
         };
 
-        // Drain the freshly produced ciphertext to the TCP socket. We need the
-        // socket to be writable; register the waker first.
-        match this.tcp.poll_write_ready(cx) {
-            Poll::Pending => {
-                // TCP not writable yet; the ciphertext is buffered inside rustls
-                // (in its write buffer) and will be flushed on the next poll_flush
-                // or poll_write. Return n (the plaintext bytes we accepted) so
-                // the caller knows we consumed them.
-                return Poll::Ready(Ok(n));
-            }
+        // Best-effort: drain whatever rustls just produced. The ciphertext is
+        // safely buffered in out_ct/rustls even if the socket is not writable
+        // yet, so if poll_flush_ct returns Pending we still report the plaintext
+        // bytes as accepted — the caller will drive flush to completion.
+        match this.poll_flush_ct(cx) {
             Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-            Poll::Ready(Ok(())) => {}
-        }
-
-        if let Err(e) = this.try_flush_tls() {
-            return Poll::Ready(Err(e));
+            _ => {} // Pending or Ok(()) — either way, plaintext was accepted.
         }
 
         Poll::Ready(Ok(n))
@@ -356,21 +390,12 @@ impl AsyncWrite for TlsRestStream {
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         let this = self.get_mut();
 
-        // Drain any pending TLS write records.
-        if this.tls.wants_write() {
-            match this.tcp.poll_write_ready(cx) {
-                Poll::Pending => return Poll::Pending,
-                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                Poll::Ready(Ok(())) => {}
-            }
-            if let Err(e) = this.try_flush_tls() {
-                return Poll::Ready(Err(e));
-            }
-            if this.tls.wants_write() {
-                // Still more to drain; re-register the waker.
-                cx.waker().wake_by_ref();
-                return Poll::Pending;
-            }
+        // Drain all pending TLS write records to the TCP socket. Returns Ready
+        // only when out_ct is empty AND !tls.wants_write().
+        match this.poll_flush_ct(cx) {
+            Poll::Pending => return Poll::Pending,
+            Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+            Poll::Ready(Ok(())) => {}
         }
 
         // Flush the underlying TCP socket.
@@ -380,23 +405,15 @@ impl AsyncWrite for TlsRestStream {
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         let this = self.get_mut();
 
-        // Send a TLS close_notify if we haven't yet.
+        // Queue a TLS close_notify alert (idempotent).
         this.tls.send_close_notify();
 
-        // Drain all pending TLS records (including the close_notify).
-        if this.tls.wants_write() {
-            match this.tcp.poll_write_ready(cx) {
-                Poll::Pending => return Poll::Pending,
-                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                Poll::Ready(Ok(())) => {}
-            }
-            if let Err(e) = this.try_flush_tls() {
-                return Poll::Ready(Err(e));
-            }
-            if this.tls.wants_write() {
-                cx.waker().wake_by_ref();
-                return Poll::Pending;
-            }
+        // Drain all pending TLS records (including the close_notify) to the
+        // TCP socket. Returns Ready only when fully drained.
+        match this.poll_flush_ct(cx) {
+            Poll::Pending => return Poll::Pending,
+            Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+            Poll::Ready(Ok(())) => {}
         }
 
         Pin::new(&mut this.tcp).poll_shutdown(cx)
@@ -452,6 +469,8 @@ async fn serve_one(conn: RestConn, router: Router) -> Result<(), Box<dyn std::er
                 tls: tls_conn,
                 prefix,
                 prefix_pos: 0,
+                out_ct: Vec::new(),
+                out_pos: 0,
             };
             let io = hyper_util::rt::TokioIo::new(tls_stream);
             builder.serve_connection(io, service).await?;

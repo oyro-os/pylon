@@ -412,3 +412,249 @@ async fn rest_publish_over_native_tls() {
     let _ = std::fs::remove_file(&cert_path);
     let _ = std::fs::remove_file(&key_path);
 }
+
+// ── Large-response test (C1 regression) ───────────────────────────────────────
+
+/// App config with high capacity for the large-response test (we open one WS
+/// connection that subscribes to many channels without hitting the cap).
+const LARGE_RESP_APPS: &str = r#"[
+    {"name":"LargeRespTest","id":"large-app","key":"large-key","secret":"large-secret",
+     "capacity":10000,"client_messages_enabled":false,"subscription_count_enabled":false}
+]"#;
+const LARGE_KEY: &str = "large-key";
+const LARGE_APP_ID: &str = "large-app";
+const LARGE_N_CHANNELS: usize = 2000;
+
+async fn spawn_tls_server_large(
+    cert_path: &std::path::Path,
+    key_path: &std::path::Path,
+) -> TlsHarness {
+    let port = {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        l.local_addr().unwrap().port()
+    };
+    let apps: Arc<dyn AppManager> =
+        Arc::new(StaticFileAppManager::from_json(LARGE_RESP_APPS).unwrap());
+    let local = Arc::new(LocalAdapter::new(Arc::new(Registry::new())));
+    let adapter: Arc<dyn Adapter> = local.clone();
+    let conn_counts: Arc<DashMap<String, Arc<AtomicUsize>>> = Arc::new(Default::default());
+    let webhooks = WebhookHandle::null();
+    let config = ServerConfig {
+        bind: "127.0.0.1".into(),
+        port,
+        workers: 1,
+        tls_cert_path: Some(cert_path.to_str().unwrap().to_string()),
+        tls_key_path: Some(key_path.to_str().unwrap().to_string()),
+        ..ServerConfig::default()
+    };
+    let tls = pylon::transport::tls::resolve_tls(
+        &config.tls_cert_path,
+        &config.tls_key_path,
+        &config.tls_ca_path,
+    )
+    .expect("TLS config should load");
+    let (rest_tx, rest_rx) =
+        tokio::sync::mpsc::unbounded_channel::<pylon::transport::RestConn>();
+    let rest_state = AppState {
+        config: config.clone(),
+        apps: apps.clone(),
+        adapter: adapter.clone(),
+        conn_counts: Arc::clone(&conn_counts),
+        webhooks: webhooks.clone(),
+        saturated: Some(local.saturation_flag()),
+        draining: Arc::new(AtomicBool::new(false)),
+    };
+    tokio::spawn(pylon::transport::rest::serve(rest_rx, build_router(rest_state)));
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let worker_shutdown = shutdown.clone();
+    let local_for_sink = Some(local.clone());
+    let handle = std::thread::spawn(move || {
+        let _ = pylon::transport::run_percore(
+            config,
+            apps,
+            adapter,
+            conn_counts,
+            webhooks,
+            Some(rest_tx),
+            worker_shutdown,
+            local_for_sink,
+            false,
+            tls,
+        );
+    });
+    std::mem::forget((shutdown, handle));
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    TlsHarness { port, adapter: local }
+}
+
+fn large_signed_query(method: &str, path: &str, body: &[u8]) -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let mut p: BTreeMap<String, String> = BTreeMap::new();
+    p.insert("auth_key".into(), LARGE_KEY.to_string());
+    p.insert("auth_timestamp".into(), now.to_string());
+    p.insert("auth_version".into(), "1.0".into());
+    if !body.is_empty() {
+        p.insert("body_md5".into(), md5_hex(body));
+    }
+    let canon = p
+        .iter()
+        .map(|(k, v)| format!("{k}={v}"))
+        .collect::<Vec<_>>()
+        .join("&");
+    let signed = format!("{}\n{}\n{}", method.to_uppercase(), path, canon);
+    let sig = hmac_sha256_hex("large-secret", &signed);
+    format!("{canon}&auth_signature={sig}")
+}
+
+/// Exercises `TlsRestStream` with a large HTTPS response body (C1 regression
+/// test). Subscribes one WSS client to `LARGE_N_CHANNELS` channels with long
+/// names, then GETs the channel list over HTTPS. The response spans multiple
+/// TLS records, exercising the `out_ct` drain loop.
+///
+/// A truncated body (the pre-fix C1 bug) would fail the Content-Length check
+/// or produce invalid JSON.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rest_large_response_over_native_tls() {
+    let (cert_der, cert_path, key_path) = gen_cert();
+    let harness = spawn_tls_server_large(&cert_path, &key_path).await;
+
+    // ── 1. Connect one WSS client and subscribe it to LARGE_N_CHANNELS ────────
+    let mut ws = {
+        let client_cfg = tls_client_config(&cert_der);
+        let connector = tokio_tungstenite::Connector::Rustls(client_cfg);
+        let url = format!(
+            "wss://127.0.0.1:{}/app/{}?protocol=7",
+            harness.port, LARGE_KEY
+        );
+        let (ws, _) = tokio::time::timeout(
+            Duration::from_secs(10),
+            tokio_tungstenite::connect_async_tls_with_config(
+                &url, None, false, Some(connector),
+            ),
+        )
+        .await
+        .expect("wss connect: timeout")
+        .expect("wss connect: error");
+        ws
+    };
+
+    // Receive connection_established.
+    let _ = next_text(&mut ws).await;
+
+    // Send subscribe messages in batches, draining replies between batches to
+    // prevent the WS send buffer from filling up and causing a connection reset.
+    let base = "abcdefghij".repeat(10); // 100-char base
+    const BATCH: usize = 50;
+    let mut total_confirmed = 0usize;
+    let mut i = 0usize;
+    while i < LARGE_N_CHANNELS {
+        // Send one batch.
+        let end = (i + BATCH).min(LARGE_N_CHANNELS);
+        for j in i..end {
+            let ch = format!("{base}-{j:04}"); // 106 chars
+            let sub = json!({"event": "pusher:subscribe", "data": {"channel": ch}});
+            ws.send(Message::Text(sub.to_string()))
+                .await
+                .expect("subscribe send");
+        }
+        i = end;
+        // Drain replies for a short window so the server's write buffer doesn't back up.
+        let confirmed = tokio::time::timeout(Duration::from_millis(100), async {
+            let mut cnt = 0usize;
+            loop {
+                match tokio::time::timeout(Duration::from_millis(10), ws.next()).await {
+                    Ok(Some(Ok(Message::Text(t)))) => {
+                        if t.contains("subscription_succeeded") {
+                            cnt += 1;
+                        }
+                    }
+                    _ => break,
+                }
+            }
+            cnt
+        })
+        .await
+        .unwrap_or(0);
+        total_confirmed += confirmed;
+    }
+    // Final drain: wait for remaining subscription_succeeded frames.
+    let _ = tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            match tokio::time::timeout(Duration::from_millis(300), ws.next()).await {
+                Ok(Some(Ok(Message::Text(t)))) => {
+                    if t.contains("subscription_succeeded") {
+                        total_confirmed += 1;
+                        if total_confirmed >= LARGE_N_CHANNELS {
+                            break;
+                        }
+                    }
+                }
+                _ => break,
+            }
+        }
+    })
+    .await;
+    let _ = total_confirmed; // consumed above; suppress unused warning
+
+    // ── 2. GET /apps/{id}/channels over HTTPS ─────────────────────────────────
+    let path = format!("/apps/{LARGE_APP_ID}/channels");
+    let q = large_signed_query("GET", &path, &[]);
+    let cert = reqwest::Certificate::from_der(&cert_der).expect("parse cert DER");
+    let client = reqwest::Client::builder()
+        .add_root_certificate(cert)
+        .build()
+        .expect("build reqwest client");
+
+    let resp = client
+        .get(format!("https://127.0.0.1:{}{path}?{q}", harness.port))
+        .send()
+        .await
+        .expect("HTTPS GET /channels");
+
+    assert_eq!(
+        resp.status(),
+        200,
+        "expected HTTP 200, got {}",
+        resp.status()
+    );
+
+    // ── 3. Verify the body is complete and valid ───────────────────────────────
+    let content_length = resp.content_length();
+    let body_bytes = resp.bytes().await.expect("read response body");
+    let body_len = body_bytes.len();
+
+    // Content-Length must match actual body length (truncation → mismatch).
+    if let Some(cl) = content_length {
+        assert_eq!(
+            cl as usize, body_len,
+            "Content-Length ({cl}) != actual body ({body_len}): truncated TLS response (C1 bug)"
+        );
+    }
+
+    // Body must be valid JSON with a "channels" key.
+    let parsed: Value =
+        serde_json::from_slice(&body_bytes).expect("response body must be valid JSON");
+    let channels = parsed["channels"]
+        .as_object()
+        .expect("must have 'channels' object");
+    let n = channels.len();
+
+    // Expect at least half the channels registered (allows for any slow
+    // processing of subscribe messages vs the drain timeout above).
+    assert!(
+        n >= LARGE_N_CHANNELS / 2,
+        "expected at least {} channels in response, got {n} (body={body_len}B)",
+        LARGE_N_CHANNELS / 2,
+    );
+
+    println!(
+        "[rest_large_response_over_native_tls] channels={n}, body_size={body_len}B ({:.1}KB)",
+        body_len as f64 / 1024.0,
+    );
+
+    let _ = std::fs::remove_file(&cert_path);
+    let _ = std::fs::remove_file(&key_path);
+}
