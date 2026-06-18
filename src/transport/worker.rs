@@ -1449,10 +1449,21 @@ fn handoff_rest(
         return;
     };
 
-    let std_stream = crate::transport::rest::mio_to_std(entry.conn.into_stream());
+    // Use `into_io_handoff` to carry the rustls session for TLS connections.
+    // For plain connections this is equivalent to the old `into_stream()` call.
+    let handoff = entry.conn.into_io_handoff();
+    let (std_stream, tls) = match handoff {
+        crate::transport::conn::IoHandoff::Plain(mio_stream) => {
+            (crate::transport::rest::mio_to_std(mio_stream), None)
+        }
+        crate::transport::conn::IoHandoff::Tls(mio_stream, tls_conn) => {
+            (crate::transport::rest::mio_to_std(mio_stream), Some(tls_conn))
+        }
+    };
     if let Err(e) = tx.send(crate::transport::rest::RestConn {
         fd_stream: std_stream,
         prefix,
+        tls,
     }) {
         // Receiver gone (REST task ended): dropping the RestConn closes the fd.
         tracing::debug!(error = %e, "REST handoff channel closed; dropping connection");

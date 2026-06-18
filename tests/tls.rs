@@ -1,19 +1,23 @@
 //! Integration tests for native TLS (Part B): end-to-end wss:// handshake,
-//! encrypted WS subscribe + event delivery roundtrip, and resilience after a
-//! plain client sends garbage to the TLS port.
+//! encrypted WS subscribe + event delivery roundtrip, resilience after a
+//! plain client sends garbage to the TLS port, and REST publish over the same
+//! native-TLS port.
 
 use futures_util::{SinkExt, StreamExt};
 use pylon::adapter::local::LocalAdapter;
 use pylon::adapter::Adapter;
 use pylon::app::static_file::StaticFileAppManager;
 use pylon::app::AppManager;
+use pylon::auth::signature::{hmac_sha256_hex, md5_hex};
 use pylon::channel::registry::Registry;
 use pylon::protocol::event::ServerEvent;
 use pylon::server::config::ServerConfig;
+use pylon::server::router::{build_router, AppState};
 use pylon::webhook::WebhookHandle;
 use dashmap::DashMap;
 use rcgen::generate_simple_self_signed;
 use serde_json::{json, Value};
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize};
 use std::sync::Arc;
@@ -73,7 +77,8 @@ struct TlsHarness {
     adapter: Arc<dyn Adapter>,
 }
 
-/// Spawn a TLS-enabled percore server on 127.0.0.1. Returns the port and adapter.
+/// Spawn a TLS-enabled percore server on 127.0.0.1 with REST handoff wired.
+/// Returns the port and adapter.
 async fn spawn_tls_server(cert_path: &std::path::Path, key_path: &std::path::Path) -> TlsHarness {
     let port = {
         let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -103,6 +108,20 @@ async fn spawn_tls_server(cert_path: &std::path::Path, key_path: &std::path::Pat
     )
     .expect("TLS config should load from test cert/key");
 
+    // Wire REST handoff so HTTPS REST requests go through TlsRestStream.
+    let (rest_tx, rest_rx) =
+        tokio::sync::mpsc::unbounded_channel::<pylon::transport::RestConn>();
+    let rest_state = AppState {
+        config: config.clone(),
+        apps: apps.clone(),
+        adapter: adapter.clone(),
+        conn_counts: Arc::clone(&conn_counts),
+        webhooks: webhooks.clone(),
+        saturated: Some(local.saturation_flag()),
+        draining: Arc::new(AtomicBool::new(false)),
+    };
+    tokio::spawn(pylon::transport::rest::serve(rest_rx, build_router(rest_state)));
+
     let shutdown = Arc::new(AtomicBool::new(false));
     let worker_shutdown = shutdown.clone();
     let local_for_sink = Some(local.clone());
@@ -113,7 +132,7 @@ async fn spawn_tls_server(cert_path: &std::path::Path, key_path: &std::path::Pat
             adapter,
             conn_counts,
             webhooks,
-            None, // no REST plane in TLS tests (REST handoff is plain-TCP only)
+            Some(rest_tx),
             worker_shutdown,
             local_for_sink,
             false,
@@ -124,6 +143,29 @@ async fn spawn_tls_server(cert_path: &std::path::Path, key_path: &std::path::Pat
 
     tokio::time::sleep(Duration::from_millis(250)).await;
     TlsHarness { port, adapter: local }
+}
+
+/// Build a signed REST query string for the TLS app (`tls-key` / `tls-secret`).
+fn tls_signed_query(method: &str, path: &str, body: &[u8]) -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let mut p: BTreeMap<String, String> = BTreeMap::new();
+    p.insert("auth_key".into(), KEY.to_string());
+    p.insert("auth_timestamp".into(), now.to_string());
+    p.insert("auth_version".into(), "1.0".into());
+    if !body.is_empty() {
+        p.insert("body_md5".into(), md5_hex(body));
+    }
+    let canon = p
+        .iter()
+        .map(|(k, v)| format!("{k}={v}"))
+        .collect::<Vec<_>>()
+        .join("&");
+    let signed = format!("{}\n{}\n{}", method.to_uppercase(), path, canon);
+    let sig = hmac_sha256_hex("tls-secret", &signed);
+    format!("{canon}&auth_signature={sig}")
 }
 
 // ── helper: connect a wss client ───────────────────────────────────────────────
@@ -274,6 +316,97 @@ async fn plain_ws_to_tls_port_fails_server_survives() {
         v["event"].as_str().unwrap(),
         "pusher:connection_established",
         "server alive after plain failure: expected connection_established, got: {text}"
+    );
+
+    let _ = std::fs::remove_file(&cert_path);
+    let _ = std::fs::remove_file(&key_path);
+}
+
+/// A wss:// subscriber and an HTTPS REST publish to the **same** native-TLS
+/// port: proves that `TlsRestStream` correctly drives the rustls session in the
+/// async REST plane and that the event reaches the subscriber end-to-end.
+///
+/// Flow:
+/// 1. Start the TLS percore server with REST handoff wired.
+/// 2. Connect a `wss://` subscriber and subscribe to the test channel.
+/// 3. POST a signed `POST /apps/{id}/events` over HTTPS (same port).
+/// 4. Assert the response is HTTP 200.
+/// 5. Assert the subscriber receives the published event over the encrypted
+///    WebSocket connection.
+#[tokio::test]
+async fn rest_publish_over_native_tls() {
+    let (cert_der, cert_path, key_path) = gen_cert();
+    let harness = spawn_tls_server(&cert_path, &key_path).await;
+
+    // ── 1. Connect a wss:// subscriber ──────────────────────────────────────
+    let mut ws = connect_wss(harness.port, &cert_der).await;
+
+    // Receive connection_established.
+    let text = next_text(&mut ws).await;
+    let v: Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(
+        v["event"].as_str().unwrap(),
+        "pusher:connection_established",
+        "expected connection_established, got: {text}"
+    );
+
+    // Subscribe to the test channel.
+    let sub = json!({"event":"pusher:subscribe","data":{"channel":CHANNEL}});
+    ws.send(Message::Text(sub.to_string())).await.unwrap();
+
+    let text = next_text(&mut ws).await;
+    let v: Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(
+        v["event"].as_str().unwrap(),
+        "pusher_internal:subscription_succeeded",
+        "expected subscription_succeeded, got: {text}"
+    );
+
+    // ── 2. POST an event via HTTPS REST to the same TLS port ─────────────────
+    let body =
+        json!({"name":"tls-rest-event","data":"{\"from\":\"https\"}","channels":[CHANNEL]})
+            .to_string();
+    let path = format!("/apps/{APP_ID}/events");
+    let q = tls_signed_query("POST", &path, body.as_bytes());
+
+    // Build a reqwest client that trusts our self-signed cert.
+    let cert = reqwest::Certificate::from_der(&cert_der).expect("parse cert DER");
+    let client = reqwest::Client::builder()
+        .add_root_certificate(cert)
+        .build()
+        .expect("build reqwest client with custom root");
+
+    let resp = client
+        .post(format!("https://127.0.0.1:{}{path}?{q}", harness.port))
+        .header("content-type", "application/json")
+        .body(body)
+        .send()
+        .await
+        .expect("HTTPS POST to TLS port");
+
+    assert_eq!(
+        resp.status(),
+        200,
+        "expected 200 from HTTPS REST publish, got: {}",
+        resp.status()
+    );
+
+    // ── 3. Assert the subscriber receives the event over wss:// ─────────────
+    let event_text = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let t = next_text(&mut ws).await;
+            let v: Value = serde_json::from_str(&t).unwrap();
+            if v["event"].as_str() == Some("tls-rest-event") {
+                return t;
+            }
+        }
+    })
+    .await
+    .expect("timeout waiting for tls-rest-event over wss://");
+
+    assert!(
+        event_text.contains("tls-rest-event"),
+        "expected tls-rest-event delivery over wss, got: {event_text}"
     );
 
     let _ = std::fs::remove_file(&cert_path);

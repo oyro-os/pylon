@@ -127,6 +127,21 @@ enum Io {
     Tls(mio::net::TcpStream, Box<TlsConn>),
 }
 
+/// The full handoff payload returned by [`Connection::into_io_handoff`].
+///
+/// For a plain-TCP connection only the `mio` stream is returned. For a TLS
+/// connection both the `mio` stream AND the live (already-handshaked) rustls
+/// `ServerConnection` are returned so the async REST plane can continue
+/// driving the encrypted session rather than seeing raw ciphertext.
+pub enum IoHandoff {
+    /// A plain (non-TLS) connection; only the socket is needed.
+    Plain(mio::net::TcpStream),
+    /// A TLS connection: the raw TCP socket plus the rustls session that has
+    /// already completed its handshake. Application-layer bytes the worker
+    /// already decrypted are stored separately in `RestConn::prefix`.
+    Tls(mio::net::TcpStream, Box<TlsConn>),
+}
+
 impl Io {
     fn stream_mut(&mut self) -> &mut mio::net::TcpStream {
         match self {
@@ -241,10 +256,31 @@ impl Connection {
     /// converted to a `std::net::TcpStream` and handed to the tokio/axum plane.
     /// Any queued outbound bytes are discarded (a REST connection has none — the
     /// head was only ever read).
+    ///
+    /// For TLS connections, this DROPS the rustls `ServerConnection`, which means
+    /// the caller only gets the raw socket and must deal with raw ciphertext.
+    /// Prefer [`into_io_handoff`](Self::into_io_handoff) when the TLS session must
+    /// be preserved across the handoff.
     pub fn into_stream(self) -> mio::net::TcpStream {
         match self.io {
             Io::Plain(s) => s,
             Io::Tls(s, _) => s,
+        }
+    }
+
+    /// Consume the connection and return the full I/O handoff payload — the mio
+    /// TCP stream plus the rustls `ServerConnection` for TLS connections, or just
+    /// the TCP stream for plain connections.
+    ///
+    /// Used by the REST handoff path when TLS is active: the rustls session has
+    /// already completed the handshake and some application bytes have been
+    /// decrypted into the `prefix` buffer; the session must be carried across the
+    /// handoff so the async REST plane can continue driving it instead of seeing
+    /// raw ciphertext. For plain connections this is equivalent to `into_stream`.
+    pub fn into_io_handoff(self) -> IoHandoff {
+        match self.io {
+            Io::Plain(s) => IoHandoff::Plain(s),
+            Io::Tls(s, tls) => IoHandoff::Tls(s, tls),
         }
     }
 
