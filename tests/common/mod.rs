@@ -147,6 +147,7 @@ pub async fn spawn_percore(spec: SpawnSpec) -> SocketAddr {
         conn_counts: conn_counts.clone(),
         webhooks: webhooks.clone(),
         saturated: Some(local.saturation_flag()),
+        draining: Arc::new(AtomicBool::new(false)),
     };
     let rest_router = build_router(rest_state);
     tokio::spawn(pylon::transport::rest::serve(rest_rx, rest_router));
@@ -302,6 +303,7 @@ pub async fn spawn_percore_cluster_with(
         conn_counts: conn_counts.clone(),
         webhooks: webhooks.clone(),
         saturated: Some(local.saturation_flag()),
+        draining: Arc::new(AtomicBool::new(false)),
     };
     tokio::spawn(pylon::transport::rest::serve(rest_rx, build_router(rest_state)));
 

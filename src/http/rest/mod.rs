@@ -3,6 +3,7 @@
 pub mod auth;
 pub mod channels;
 pub mod events;
+pub mod health;
 pub mod metrics;
 pub mod users;
 
@@ -34,6 +35,11 @@ pub fn merge(router: Router<AppState>, body_limit: usize) -> Router<AppState> {
             post(users::terminate_user_connections),
         )
         .layer(DefaultBodyLimit::max(body_limit));
-    let metrics = Router::new().route("/metrics", get(metrics::get_metrics));
-    router.merge(rest).merge(metrics)
+    let probes = Router::new()
+        .route("/metrics", get(metrics::get_metrics))
+        .route("/health", get(health::get_health))
+        .route("/healthz", get(health::get_health))
+        .route("/ready", get(health::get_ready))
+        .route("/readyz", get(health::get_ready));
+    router.merge(rest).merge(probes)
 }

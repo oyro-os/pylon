@@ -24,6 +24,11 @@ pub struct AppState {
     /// (the redis+percore fallback) or in tests, where [`AppState::is_saturated`]
     /// is always `false` so the 503 gate is a no-op.
     pub saturated: Option<Arc<AtomicBool>>,
+    /// C2b graceful-shutdown draining flag. Set to `true` when a shutdown signal
+    /// fires (C2a, a later task). The `/ready` handler returns 503 while draining
+    /// so load balancers stop routing new connections before we close existing ones.
+    /// Always `false` at startup; the flag is only toggled by the shutdown sequence.
+    pub draining: Arc<AtomicBool>,
 }
 
 impl AppState {

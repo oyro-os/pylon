@@ -91,6 +91,10 @@ async fn main() -> anyhow::Result<()> {
     // runtime handle exists to serve the handed-off fds.
     let (rest_tx, rest_rx) =
         tokio::sync::mpsc::unbounded_channel::<pylon::transport::RestConn>();
+    // C2b: shared draining flag (always false at startup; set true by the shutdown
+    // sequence in C2a). Created here so it lives for the entire server lifetime and
+    // can be cloned into AppState and the future shutdown sequence.
+    let draining = Arc::new(AtomicBool::new(false));
     let rest_state = AppState {
         config: config.clone(),
         apps: apps.clone(),
@@ -100,6 +104,7 @@ async fn main() -> anyhow::Result<()> {
         // SP10: the REST 503 admission gate reads the percore saturation flag (the
         // LocalAdapter's, shared with the sink).
         saturated: Some(local.saturation_flag()),
+        draining,
     };
     let rest_router = build_router(rest_state);
     tokio::spawn(pylon::transport::rest::serve(rest_rx, rest_router));
@@ -190,6 +195,10 @@ async fn run_redis_percore(config: ServerConfig, apps: Arc<dyn AppManager>) -> a
     // the node's `RedisAdapter` (cluster-wide reads/publishes) and reads the percore
     // saturation flag off the shared `local`.
     let (rest_tx, rest_rx) = tokio::sync::mpsc::unbounded_channel::<pylon::transport::RestConn>();
+    // C2b: shared draining flag (always false at startup; set true by the shutdown
+    // sequence in C2a). Created here so it lives for the entire server lifetime and
+    // can be cloned into AppState and the future shutdown sequence.
+    let draining = Arc::new(AtomicBool::new(false));
     let rest_state = AppState {
         config: config.clone(),
         apps: apps.clone(),
@@ -197,6 +206,7 @@ async fn run_redis_percore(config: ServerConfig, apps: Arc<dyn AppManager>) -> a
         conn_counts: conn_counts.clone(),
         webhooks: webhooks.clone(),
         saturated: Some(local.saturation_flag()),
+        draining,
     };
     tokio::spawn(pylon::transport::rest::serve(
         rest_rx,
