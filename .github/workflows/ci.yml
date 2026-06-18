@@ -47,5 +47,8 @@ jobs:
       - name: Clippy
         run: cargo clippy --all-targets --locked -- -D warnings
 
+      # Serial: the cross-node cluster tests share the single Redis service and
+      # assert on short timing windows, so they must not run concurrently with
+      # each other (they flake under parallel Redis contention otherwise).
       - name: Test
-        run: cargo test --locked
+        run: cargo test --locked -- --test-threads=1
