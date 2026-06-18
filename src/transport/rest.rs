@@ -379,9 +379,9 @@ impl AsyncWrite for TlsRestStream {
         // safely buffered in out_ct/rustls even if the socket is not writable
         // yet, so if poll_flush_ct returns Pending we still report the plaintext
         // bytes as accepted — the caller will drive flush to completion.
-        match this.poll_flush_ct(cx) {
-            Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-            _ => {} // Pending or Ok(()) — either way, plaintext was accepted.
+        // Pending or Ok(()) — either way, plaintext was accepted.
+        if let Poll::Ready(Err(e)) = this.poll_flush_ct(cx) {
+            return Poll::Ready(Err(e));
         }
 
         Poll::Ready(Ok(n))

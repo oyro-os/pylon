@@ -420,7 +420,7 @@ pub fn run(mut cfg: WorkerConfig, shutdown: Arc<AtomicBool>) -> std::io::Result<
             }
             // Decide whether the drain is complete: all bytes flushed, deadline
             // expired, or grace_ms == 0 (immediate mode).
-            let expired = drain_deadline.map_or(true, |d| Instant::now() >= d);
+            let expired = drain_deadline.is_none_or(|d| Instant::now() >= d);
             if inflight_bytes == 0 || expired {
                 // 3. Final cleanup: run on_close hooks, decrement conn_counts,
                 //    deindex channels, deregister sockets — so per-app counters and

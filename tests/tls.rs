@@ -566,14 +566,11 @@ async fn rest_large_response_over_native_tls() {
         // Drain replies for a short window so the server's write buffer doesn't back up.
         let confirmed = tokio::time::timeout(Duration::from_millis(100), async {
             let mut cnt = 0usize;
-            loop {
-                match tokio::time::timeout(Duration::from_millis(10), ws.next()).await {
-                    Ok(Some(Ok(Message::Text(t)))) => {
-                        if t.contains("subscription_succeeded") {
-                            cnt += 1;
-                        }
-                    }
-                    _ => break,
+            while let Ok(Some(Ok(Message::Text(t)))) =
+                tokio::time::timeout(Duration::from_millis(10), ws.next()).await
+            {
+                if t.contains("subscription_succeeded") {
+                    cnt += 1;
                 }
             }
             cnt
@@ -584,17 +581,14 @@ async fn rest_large_response_over_native_tls() {
     }
     // Final drain: wait for remaining subscription_succeeded frames.
     let _ = tokio::time::timeout(Duration::from_secs(15), async {
-        loop {
-            match tokio::time::timeout(Duration::from_millis(300), ws.next()).await {
-                Ok(Some(Ok(Message::Text(t)))) => {
-                    if t.contains("subscription_succeeded") {
-                        total_confirmed += 1;
-                        if total_confirmed >= LARGE_N_CHANNELS {
-                            break;
-                        }
-                    }
+        while let Ok(Some(Ok(Message::Text(t)))) =
+            tokio::time::timeout(Duration::from_millis(300), ws.next()).await
+        {
+            if t.contains("subscription_succeeded") {
+                total_confirmed += 1;
+                if total_confirmed >= LARGE_N_CHANNELS {
+                    break;
                 }
-                _ => break,
             }
         }
     })
