@@ -263,14 +263,14 @@ mod tests {
     async fn subscribe_then_broadcast_delegates_to_registry() {
         let reg = Arc::new(Registry::new());
         let adapter = LocalAdapter::new(reg.clone());
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = mpsc::channel(1024);
         let out = adapter
             .subscribe(
                 "app",
                 "c",
                 ConnectionHandle {
                     socket_id: SocketId::generate(),
-                    mailbox: crate::connection::handle::Mailbox::new(tx, None),
+                    mailbox: crate::connection::handle::Mailbox::new(tx, None, None),
                 },
                 None,
             )
@@ -291,14 +291,14 @@ mod tests {
     async fn presence_members_round_trip() {
         let reg = Arc::new(Registry::new());
         let adapter = LocalAdapter::new(reg.clone());
-        let (tx, _rx) = mpsc::unbounded_channel();
+        let (tx, _rx) = mpsc::channel(1024);
         adapter
             .subscribe(
                 "app",
                 "presence-x",
                 ConnectionHandle {
                     socket_id: SocketId::generate(),
-                    mailbox: crate::connection::handle::Mailbox::new(tx, None),
+                    mailbox: crate::connection::handle::Mailbox::new(tx, None, None),
                 },
                 Some(PresenceMember {
                     user_id: "u1".into(),
@@ -387,8 +387,8 @@ mod tests {
     #[tokio::test]
     async fn send_to_user_fans_out_to_all_connections() {
         let adapter = LocalAdapter::new(Arc::new(Registry::new()));
-        let (tx1, mut rx1) = mpsc::unbounded_channel();
-        let (tx2, mut rx2) = mpsc::unbounded_channel();
+        let (tx1, mut rx1) = mpsc::channel(1024);
+        let (tx2, mut rx2) = mpsc::channel(1024);
         let s1 = SocketId::generate();
         let s2 = SocketId::generate();
         adapter
@@ -397,7 +397,7 @@ mod tests {
                 "u",
                 ConnectionHandle {
                     socket_id: s1,
-                    mailbox: crate::connection::handle::Mailbox::new(tx1, None),
+                    mailbox: crate::connection::handle::Mailbox::new(tx1, None, None),
                 },
             )
             .await;
@@ -407,7 +407,7 @@ mod tests {
                 "u",
                 ConnectionHandle {
                     socket_id: s2,
-                    mailbox: crate::connection::handle::Mailbox::new(tx2, None),
+                    mailbox: crate::connection::handle::Mailbox::new(tx2, None, None),
                 },
             )
             .await;
@@ -419,7 +419,7 @@ mod tests {
     #[tokio::test]
     async fn terminate_user_pushes_error_then_close_and_returns_ids() {
         let adapter = LocalAdapter::new(Arc::new(Registry::new()));
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = mpsc::channel(1024);
         let s = SocketId::generate();
         adapter
             .signin_user(
@@ -427,7 +427,7 @@ mod tests {
                 "u",
                 ConnectionHandle {
                     socket_id: s.clone(),
-                    mailbox: crate::connection::handle::Mailbox::new(tx, None),
+                    mailbox: crate::connection::handle::Mailbox::new(tx, None, None),
                 },
             )
             .await;

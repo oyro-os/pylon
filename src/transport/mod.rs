@@ -49,6 +49,8 @@ struct PercoreRegistry {
     accepted_slots: Vec<Arc<AtomicU64>>,
     /// Per-worker cumulative CoDel-dropped-frames counter (B1).
     codel_dropped_slots: Vec<Arc<AtomicU64>>,
+    /// Task 4: per-worker cumulative mailbox-full-drop counter.
+    mailbox_dropped_slots: Vec<Arc<AtomicU64>>,
     budget_factor: Arc<AtomicU32>,
     worker_budget_bytes: u64,
 }
@@ -63,6 +65,8 @@ pub struct PercoreMetricsSnapshot {
     pub accepted: Vec<u64>,
     /// Per-worker cumulative CoDel-dropped-frames count (B1).
     pub codel_dropped: Vec<u64>,
+    /// Task 4: per-worker cumulative mailbox-full-drop count.
+    pub mailbox_dropped: Vec<u64>,
     /// Sum of all workers' inflight bytes.
     pub inflight_total: u64,
     /// Budget factor as a fraction (×1000 fixed-point → 0.0–1.0).
@@ -101,6 +105,11 @@ pub fn percore_metrics_snapshot() -> Option<PercoreMetricsSnapshot> {
         .iter()
         .map(|s| s.load(Ordering::Relaxed))
         .collect();
+    let mailbox_dropped: Vec<u64> = guard
+        .mailbox_dropped_slots
+        .iter()
+        .map(|s| s.load(Ordering::Relaxed))
+        .collect();
     let inflight_total = inflight.iter().sum();
     let budget_factor = guard.budget_factor.load(Ordering::Relaxed) as f64 / 1000.0;
     let worker_budget_bytes = guard.worker_budget_bytes;
@@ -109,6 +118,7 @@ pub fn percore_metrics_snapshot() -> Option<PercoreMetricsSnapshot> {
         dropped,
         accepted,
         codel_dropped,
+        mailbox_dropped,
         inflight_total,
         budget_factor,
         worker_budget_bytes,
@@ -206,6 +216,8 @@ pub fn run_percore(
         // Node ceiling: explicit override or auto-derived from memory budget.
         // `0` = unlimited (no ceiling check).
         max_connections: config.resolved_max_connections(budget),
+        // Task 4: bounded mailbox capacity from config (default 256).
+        mailbox_capacity: config.mailbox_capacity,
     });
     // WS frame cap: bound a single inbound frame's payload. The configured
     // event-payload limit is small (KiB), so use a 1 MiB frame ceiling that
@@ -246,6 +258,12 @@ pub fn run_percore(
         .map(|_| Arc::new(AtomicU64::new(0)))
         .collect();
     let codel_dropped_slots: Vec<Arc<AtomicU64>> = (0..worker_count)
+        .map(|_| Arc::new(AtomicU64::new(0)))
+        .collect();
+    // Task 4: per-worker mailbox-full-drop counters. Each worker's counter Arc is
+    // cloned into every `Mailbox` created on that worker, so the counter tracks
+    // all mailbox drops attributable to that worker.
+    let mailbox_dropped_slots: Vec<Arc<AtomicU64>> = (0..worker_count)
         .map(|_| Arc::new(AtomicU64::new(0)))
         .collect();
 
@@ -353,6 +371,7 @@ pub fn run_percore(
                     worker_slots: Vec::new(),
                     accepted_slots: Vec::new(),
                     codel_dropped_slots: Vec::new(),
+                    mailbox_dropped_slots: Vec::new(),
                     budget_factor: budget_factor.clone(),
                     worker_budget_bytes: per_worker_budget,
                 })
@@ -369,6 +388,9 @@ pub fn run_percore(
         g.codel_dropped_slots.clear();
         g.codel_dropped_slots
             .extend(codel_dropped_slots.iter().cloned());
+        g.mailbox_dropped_slots.clear();
+        g.mailbox_dropped_slots
+            .extend(mailbox_dropped_slots.iter().cloned());
         g.budget_factor = budget_factor.clone();
         g.worker_budget_bytes = per_worker_budget;
     }
@@ -387,6 +409,7 @@ pub fn run_percore(
             inflight_slot: Some(inflight_slots[i].clone()),
             accepted_slot: Some(accepted_slots[i].clone()),
             codel_dropped_slot: Some(codel_dropped_slots[i].clone()),
+            mailbox_dropped_slot: Some(mailbox_dropped_slots[i].clone()),
             codel,
             budget_factor: Some(budget_factor.clone()),
             shutdown_grace_ms: config.shutdown_grace_ms,

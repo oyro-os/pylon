@@ -82,6 +82,7 @@ async fn spawn(activity_timeout: u32, pong_timeout: u32) -> Harness {
         saturated: None,
         clustered: false,
         max_connections: 0,
+        mailbox_capacity: 256,
     });
 
     let port = free_port();
@@ -102,6 +103,7 @@ async fn spawn(activity_timeout: u32, pong_timeout: u32) -> Harness {
                 inflight_slot: None,
                 accepted_slot: None,
                 codel_dropped_slot: None,
+                mailbox_dropped_slot: None,
                 codel: pylon::transport::conn::CodelParams::DEFAULT,
                 budget_factor: None,
                 shutdown_grace_ms: 0,

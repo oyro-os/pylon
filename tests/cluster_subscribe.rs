@@ -120,13 +120,13 @@ async fn fake_subscriber(
     SocketId,
     usize,
     pylon::connection::handle::Mailbox,
-    tokio::sync::mpsc::UnboundedReceiver<pylon::protocol::event::ServerEvent>,
+    tokio::sync::mpsc::Receiver<pylon::protocol::event::ServerEvent>,
 ) {
     let socket_id = SocketId::generate();
-    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let (tx, rx) = tokio::sync::mpsc::channel(1024);
     // No notifier in these bridge tests: they `try_recv` the `rx` directly, so the
     // `Mailbox` just forwards `send` (no wake).
-    let mailbox = pylon::connection::handle::Mailbox::new(tx, None);
+    let mailbox = pylon::connection::handle::Mailbox::new(tx, None, None);
     let handle = ConnectionHandle {
         socket_id: socket_id.clone(),
         mailbox: mailbox.clone(),
@@ -138,7 +138,7 @@ async fn fake_subscriber(
 /// Drain `rx` until a `SubscriptionCount` frame for `channel` is observed (parsing the
 /// registry-mailbox `Raw` frame), returning its `count`, or `None` within `timeout`.
 async fn await_subscription_count(
-    rx: &mut tokio::sync::mpsc::UnboundedReceiver<pylon::protocol::event::ServerEvent>,
+    rx: &mut tokio::sync::mpsc::Receiver<pylon::protocol::event::ServerEvent>,
     channel: &str,
     timeout: Duration,
 ) -> Option<u64> {

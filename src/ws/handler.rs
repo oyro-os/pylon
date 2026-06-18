@@ -8,12 +8,12 @@ use crate::protocol::event::ServerEvent;
 use crate::protocol::socket_id::SocketId;
 use std::collections::HashSet;
 use std::sync::Arc;
-use tokio::sync::mpsc::UnboundedSender;
+use tokio::sync::mpsc::Sender;
 
 pub struct ConnectionContext {
     pub app: Arc<App>,
     pub socket_id: SocketId,
-    pub self_tx: UnboundedSender<ServerEvent>,
+    pub self_tx: Sender<ServerEvent>,
     pub adapter: Arc<dyn Adapter>,
     pub limits: crate::server::config::Limits,
     pub subscribed: HashSet<String>,
@@ -45,6 +45,10 @@ pub struct ConnectionContext {
     /// directly): the resulting `Mailbox` then forwards `send` with no wake, which
     /// is correct because those tests `try_recv` the matching receiver directly.
     pub mailbox_notify: Option<MailboxNotify>,
+    /// Per-worker cumulative counter for mailbox-full drops, shared with the
+    /// `Mailbox`es that this connection hands out via [`handle`](Self::handle).
+    /// `None` in tests that build a `ConnectionContext` without a worker.
+    pub mailbox_dropped: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>,
 }
 
 impl ConnectionContext {
@@ -62,12 +66,16 @@ impl ConnectionContext {
             // A WAKING mailbox: a cross-connection `send` marks this connection
             // dirty + wakes its worker (when `mailbox_notify` is wired), so the
             // worker drains exactly this connection and never scans idle ones.
-            mailbox: Mailbox::new(self.self_tx.clone(), self.mailbox_notify.clone()),
+            mailbox: Mailbox::new(
+                self.self_tx.clone(),
+                self.mailbox_notify.clone(),
+                self.mailbox_dropped.clone(),
+            ),
         }
     }
 
     pub(in crate::ws) fn send_self(&self, event: ServerEvent) {
-        let _ = self.self_tx.send(event);
+        let _ = self.self_tx.try_send(event);
     }
 
     /// Enqueue a webhook trigger (non-blocking; dropped if the mailbox is full).

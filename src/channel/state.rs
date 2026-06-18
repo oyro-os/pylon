@@ -196,19 +196,19 @@ mod tests {
     use tokio::sync::mpsc;
 
     fn handle() -> ConnectionHandle {
-        let (tx, _rx) = mpsc::unbounded_channel();
+        let (tx, _rx) = mpsc::channel(1024);
         ConnectionHandle {
             socket_id: SocketId::generate(),
-            mailbox: crate::connection::handle::Mailbox::new(tx, None),
+            mailbox: crate::connection::handle::Mailbox::new(tx, None, None),
         }
     }
 
-    fn handle_with_rx() -> (ConnectionHandle, mpsc::UnboundedReceiver<ServerEvent>) {
-        let (tx, rx) = mpsc::unbounded_channel();
+    fn handle_with_rx() -> (ConnectionHandle, mpsc::Receiver<ServerEvent>) {
+        let (tx, rx) = mpsc::channel(1024);
         (
             ConnectionHandle {
                 socket_id: SocketId::generate(),
-                mailbox: crate::connection::handle::Mailbox::new(tx, None),
+                mailbox: crate::connection::handle::Mailbox::new(tx, None, None),
             },
             rx,
         )

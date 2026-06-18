@@ -134,6 +134,11 @@ pub struct DispatchEnv {
     /// rejected with code **4100** (`server_over_capacity`). The per-app `capacity`
     /// (code 4004) check continues to apply independently.
     pub max_connections: usize,
+    /// Task 4: capacity (frames) of each per-connection mailbox bounded channel.
+    /// Default 256; configurable via `PYLON_MAILBOX_CAPACITY`. Set once at startup
+    /// and shared across all connections (all workers use the same cap since this
+    /// is in the shared `DispatchEnv`).
+    pub mailbox_capacity: usize,
 }
 
 /// Configuration for a single worker event loop.
@@ -170,6 +175,11 @@ pub struct WorkerConfig {
     /// B1: cumulative CoDel-dropped-frames counter for this worker. Updated after
     /// each flush by folding `conn.take_codel_dropped()`; `None` for test workers.
     pub codel_dropped_slot: Option<Arc<AtomicU64>>,
+    /// Task 4: cumulative mailbox-full-drop counter for this worker. Incremented
+    /// inside each connection's [`Mailbox::send`] on a `try_send` full-error.
+    /// Shared (via `Arc` clone) with every `Mailbox` created by this worker's
+    /// connections. `None` for echo/test workers without mailbox drop tracking.
+    pub mailbox_dropped_slot: Option<Arc<AtomicU64>>,
     /// SP10 §7: CoDel time-in-queue freshness parameters, stamped onto every
     /// connection at accept. `target_ns == 0` disables CoDel (pure drop-head).
     pub codel: crate::transport::conn::CodelParams,
@@ -224,7 +234,7 @@ struct Session {
     ctx: ConnectionContext,
     /// Inbound side of the connection mailbox; the matching sender lives in
     /// `ctx.self_tx` (and is handed to other connections via `ctx.handle()`).
-    rx: mpsc::UnboundedReceiver<ServerEvent>,
+    rx: mpsc::Receiver<ServerEvent>,
     codec: Box<dyn Codec>,
     /// The app id + its connection counter, so disconnect can decrement.
     conn_count: Arc<AtomicUsize>,
@@ -1037,7 +1047,7 @@ fn handle_handshake(
                     dirty: dirty_tx.clone(),
                     waker: mailbox_waker.clone(),
                 };
-                match establish_session(env, &path, notify) {
+                match establish_session(env, &path, notify, cfg.mailbox_dropped_slot.clone()) {
                     Ok(session) => {
                         let established = ServerEvent::ConnectionEstablished {
                             socket_id: session.ctx.socket_id.clone(),
@@ -1097,6 +1107,7 @@ fn establish_session(
     env: &Arc<DispatchEnv>,
     path: &str,
     notify: MailboxNotify,
+    mailbox_dropped: Option<Arc<AtomicU64>>,
 ) -> Result<Session, Reject> {
     use crate::protocol::error::PusherError;
     let (key, protocol) = parse_app_path(path);
@@ -1161,7 +1172,11 @@ fn establish_session(
     }
 
     let socket_id = SocketId::generate();
-    let (tx, rx) = mpsc::unbounded_channel::<ServerEvent>();
+    // Task 4: bounded mailbox — capacity from config (default 256). Under extreme
+    // overload, `Mailbox::send` uses `try_send` and drops on full, bumping the
+    // per-worker `mailbox_dropped` counter. Under normal (non-full) load delivery
+    // is unchanged: `try_send` on a non-full channel is non-blocking and succeeds.
+    let (tx, rx) = mpsc::channel::<ServerEvent>(env.mailbox_capacity);
     let ctx = ConnectionContext {
         app,
         socket_id,
@@ -1184,6 +1199,10 @@ fn establish_session(
         // the dirty queue + the MAILBOX_WAKER). `ctx.handle()` builds a WAKING
         // `Mailbox` from it, so cross-connection sends wake the worker.
         mailbox_notify: Some(notify),
+        // Task 4: shared per-worker drop counter — cloned into every `Mailbox`
+        // this connection hands out, so any full-mailbox drop is attributed to
+        // this worker's `pylon_mailbox_dropped_total` metric.
+        mailbox_dropped,
     };
 
     Ok(Session {
@@ -1995,6 +2014,7 @@ mod tests {
                     inflight_slot: None,
                     accepted_slot: None,
                     codel_dropped_slot: None,
+                    mailbox_dropped_slot: None,
                     codel: crate::transport::conn::CodelParams::DISABLED,
                     budget_factor: None,
                     shutdown_grace_ms: 0,

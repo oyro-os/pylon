@@ -60,8 +60,8 @@ fn app_with_client_messages(enabled: bool) -> App {
     .unwrap()
 }
 
-fn ctx(app: App) -> (ConnectionContext, mpsc::UnboundedReceiver<ServerEvent>) {
-    let (tx, rx) = mpsc::unbounded_channel();
+fn ctx(app: App) -> (ConnectionContext, mpsc::Receiver<ServerEvent>) {
+    let (tx, rx) = mpsc::channel(1024);
     let registry = Arc::new(Registry::new());
     let adapter: Arc<dyn Adapter> = Arc::new(LocalAdapter::new(registry));
     let c = ConnectionContext {
@@ -77,6 +77,7 @@ fn ctx(app: App) -> (ConnectionContext, mpsc::UnboundedReceiver<ServerEvent>) {
         saturated: None,
         clustered: false,
         mailbox_notify: None,
+        mailbox_dropped: None,
         client_event_rate: crate::ws::rate::RateWindow::new(0),
     };
     (c, rx)
@@ -297,7 +298,7 @@ async fn presence_unsubscribe_broadcasts_member_removed_to_others() {
     let registry = Arc::new(Registry::new());
     let adapter: Arc<dyn Adapter> = Arc::new(LocalAdapter::new(registry));
     let mk = |adapter: Arc<dyn Adapter>| {
-        let (tx, rx) = mpsc::unbounded_channel();
+        let (tx, rx) = mpsc::channel(1024);
         let c = ConnectionContext {
             app: std::sync::Arc::new(app(false)),
             socket_id: SocketId::generate(),
@@ -311,6 +312,7 @@ async fn presence_unsubscribe_broadcasts_member_removed_to_others() {
             saturated: None,
             clustered: false,
             mailbox_notify: None,
+            mailbox_dropped: None,
             client_event_rate: crate::ws::rate::RateWindow::new(0),
         };
         (c, rx)
@@ -459,7 +461,7 @@ async fn client_event_on_encrypted_channel_is_dropped() {
     let registry = Arc::new(Registry::new());
     let adapter: Arc<dyn Adapter> = Arc::new(LocalAdapter::new(registry));
     let mk = |adapter: Arc<dyn Adapter>| {
-        let (tx, rx) = mpsc::unbounded_channel();
+        let (tx, rx) = mpsc::channel(1024);
         let c = ConnectionContext {
             app: std::sync::Arc::new(app_with_client_messages(true)),
             socket_id: SocketId::generate(),
@@ -473,6 +475,7 @@ async fn client_event_on_encrypted_channel_is_dropped() {
             saturated: None,
             clustered: false,
             mailbox_notify: None,
+            mailbox_dropped: None,
             client_event_rate: crate::ws::rate::RateWindow::new(0),
         };
         (c, rx)
@@ -660,7 +663,7 @@ async fn presence_over_member_cap_errors() {
     let registry = Arc::new(Registry::new());
     let adapter: Arc<dyn Adapter> = Arc::new(LocalAdapter::new(registry));
     let mk = || {
-        let (tx, rx) = mpsc::unbounded_channel();
+        let (tx, rx) = mpsc::channel(1024);
         let mut limits = crate::server::config::ServerConfig::default().limits();
         limits.max_presence_members = 1;
         let c = ConnectionContext {
@@ -676,6 +679,7 @@ async fn presence_over_member_cap_errors() {
             saturated: None,
             clustered: false,
             mailbox_notify: None,
+            mailbox_dropped: None,
             client_event_rate: crate::ws::rate::RateWindow::new(0),
         };
         (c, rx)
@@ -828,7 +832,7 @@ async fn subscribe_emits_channel_occupied_then_close_emits_vacated() {
         std::sync::Arc::new(crate::adapter::local::LocalAdapter::new(
             std::sync::Arc::new(crate::channel::registry::Registry::new()),
         ));
-    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+    let (tx, _rx) = tokio::sync::mpsc::channel(1024);
     let mut c = crate::ws::handler::ConnectionContext {
         app: std::sync::Arc::new(app),
         socket_id: crate::protocol::socket_id::SocketId::from_raw("1.1"),
@@ -842,6 +846,7 @@ async fn subscribe_emits_channel_occupied_then_close_emits_vacated() {
         saturated: None,
         clustered: false,
         mailbox_notify: None,
+        mailbox_dropped: None,
         client_event_rate: crate::ws::rate::RateWindow::new(0),
     };
 
@@ -902,7 +907,7 @@ async fn rapid_subscribe_unsubscribe_in_window_emits_nothing() {
         std::sync::Arc::new(crate::adapter::local::LocalAdapter::new(
             std::sync::Arc::new(crate::channel::registry::Registry::new()),
         ));
-    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+    let (tx, _rx) = tokio::sync::mpsc::channel(1024);
     let mut c = crate::ws::handler::ConnectionContext {
         app: std::sync::Arc::new(app),
         socket_id: crate::protocol::socket_id::SocketId::from_raw("1.1"),
@@ -916,6 +921,7 @@ async fn rapid_subscribe_unsubscribe_in_window_emits_nothing() {
         saturated: None,
         clustered: false,
         mailbox_notify: None,
+        mailbox_dropped: None,
         client_event_rate: crate::ws::rate::RateWindow::new(0),
     };
 
@@ -952,7 +958,7 @@ async fn presence_first_and_last_emit_member_added_then_removed() {
         std::sync::Arc::new(crate::adapter::local::LocalAdapter::new(
             std::sync::Arc::new(crate::channel::registry::Registry::new()),
         ));
-    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+    let (tx, _rx) = tokio::sync::mpsc::channel(1024);
     let socket = crate::protocol::socket_id::SocketId::from_raw("9.9");
     let cd = r#"{"user_id":"u1"}"#;
     let auth = format!(
@@ -972,6 +978,7 @@ async fn presence_first_and_last_emit_member_added_then_removed() {
         saturated: None,
         clustered: false,
         mailbox_notify: None,
+        mailbox_dropped: None,
         client_event_rate: crate::ws::rate::RateWindow::new(0),
     };
 
@@ -1034,7 +1041,7 @@ async fn client_event_on_presence_includes_user_id_webhook() {
         std::sync::Arc::new(crate::adapter::local::LocalAdapter::new(
             std::sync::Arc::new(crate::channel::registry::Registry::new()),
         ));
-    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+    let (tx, _rx) = tokio::sync::mpsc::channel(1024);
     let cd = r#"{"user_id":"u1"}"#;
     let auth = format!(
         "app-key:{}",
@@ -1053,6 +1060,7 @@ async fn client_event_on_presence_includes_user_id_webhook() {
         saturated: None,
         clustered: false,
         mailbox_notify: None,
+        mailbox_dropped: None,
         client_event_rate: crate::ws::rate::RateWindow::new(0),
     };
     c.dispatch(crate::protocol::command::ClientCommand::Subscribe {
@@ -1094,7 +1102,7 @@ async fn client_event_on_private_omits_user_id_webhook() {
         std::sync::Arc::new(crate::adapter::local::LocalAdapter::new(
             std::sync::Arc::new(crate::channel::registry::Registry::new()),
         ));
-    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+    let (tx, _rx) = tokio::sync::mpsc::channel(1024);
     let auth = format!(
         "app-key:{}",
         crate::auth::signature::channel_signature("app-secret", "9.9", "private-c", None)
@@ -1112,6 +1120,7 @@ async fn client_event_on_private_omits_user_id_webhook() {
         saturated: None,
         clustered: false,
         mailbox_notify: None,
+        mailbox_dropped: None,
         client_event_rate: crate::ws::rate::RateWindow::new(0),
     };
     c.dispatch(crate::protocol::command::ClientCommand::Subscribe {
@@ -1151,7 +1160,7 @@ async fn client_event_webhook_gated_off_when_app_lacks_it() {
         std::sync::Arc::new(crate::adapter::local::LocalAdapter::new(
             std::sync::Arc::new(crate::channel::registry::Registry::new()),
         ));
-    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+    let (tx, _rx) = tokio::sync::mpsc::channel(1024);
     let auth = format!(
         "app-key:{}",
         crate::auth::signature::channel_signature("app-secret", "9.9", "private-c", None)
@@ -1169,6 +1178,7 @@ async fn client_event_webhook_gated_off_when_app_lacks_it() {
         saturated: None,
         clustered: false,
         mailbox_notify: None,
+        mailbox_dropped: None,
         client_event_rate: crate::ws::rate::RateWindow::new(0),
     };
     c.dispatch(crate::protocol::command::ClientCommand::Subscribe {
@@ -1210,7 +1220,7 @@ async fn cache_channel_miss_emits_cache_miss_webhook() {
         std::sync::Arc::new(crate::adapter::local::LocalAdapter::new(
             std::sync::Arc::new(crate::channel::registry::Registry::new()),
         ));
-    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+    let (tx, _rx) = tokio::sync::mpsc::channel(1024);
     let mut c = crate::ws::handler::ConnectionContext {
         app: std::sync::Arc::new(app),
         socket_id: crate::protocol::socket_id::SocketId::from_raw("9.9"),
@@ -1224,6 +1234,7 @@ async fn cache_channel_miss_emits_cache_miss_webhook() {
         saturated: None,
         clustered: false,
         mailbox_notify: None,
+        mailbox_dropped: None,
         client_event_rate: crate::ws::rate::RateWindow::new(0),
     };
     // public cache channel: no auth, miss on first subscribe.
@@ -1538,7 +1549,7 @@ async fn relayed_client_event_frame(
     let registry = Arc::new(Registry::new());
     let adapter: Arc<dyn Adapter> = Arc::new(LocalAdapter::new(registry));
     let mk = |adapter: Arc<dyn Adapter>| {
-        let (tx, rx) = mpsc::unbounded_channel();
+        let (tx, rx) = mpsc::channel(1024);
         let c = ConnectionContext {
             app: std::sync::Arc::new(app_with_client_messages(true)),
             socket_id: SocketId::generate(),
@@ -1552,6 +1563,7 @@ async fn relayed_client_event_frame(
             saturated: None,
             clustered: false,
             mailbox_notify: None,
+            mailbox_dropped: None,
             client_event_rate: crate::ws::rate::RateWindow::new(0),
         };
         (c, rx)
@@ -1616,7 +1628,7 @@ async fn client_event_oversize_name_returns_4301_and_does_not_broadcast() {
     let registry = Arc::new(Registry::new());
     let adapter: Arc<dyn Adapter> = Arc::new(LocalAdapter::new(registry));
     let mk = || {
-        let (tx, rx) = mpsc::unbounded_channel();
+        let (tx, rx) = mpsc::channel(1024);
         let c = ConnectionContext {
             app: std::sync::Arc::new(app_with_client_messages(true)),
             socket_id: SocketId::generate(),
@@ -1630,6 +1642,7 @@ async fn client_event_oversize_name_returns_4301_and_does_not_broadcast() {
             saturated: None,
             clustered: false,
             mailbox_notify: None,
+            mailbox_dropped: None,
             client_event_rate: crate::ws::rate::RateWindow::new(100), // generous budget
         };
         (c, rx)
@@ -1689,11 +1702,8 @@ async fn client_event_oversize_name_returns_4301_and_does_not_broadcast() {
 fn ctx_with_sub_cap(
     app: crate::app::App,
     cap: usize,
-) -> (
-    ConnectionContext,
-    tokio::sync::mpsc::UnboundedReceiver<ServerEvent>,
-) {
-    let (tx, rx) = mpsc::unbounded_channel();
+) -> (ConnectionContext, tokio::sync::mpsc::Receiver<ServerEvent>) {
+    let (tx, rx) = mpsc::channel(1024);
     let registry = Arc::new(Registry::new());
     let adapter: Arc<dyn Adapter> = Arc::new(LocalAdapter::new(registry));
     let mut limits = crate::server::config::ServerConfig::default().limits();
@@ -1711,6 +1721,7 @@ fn ctx_with_sub_cap(
         saturated: None,
         clustered: false,
         mailbox_notify: None,
+        mailbox_dropped: None,
         client_event_rate: crate::ws::rate::RateWindow::new(0),
     };
     (c, rx)
@@ -1834,7 +1845,7 @@ async fn client_event_rate_limit_returns_4301_and_drops() {
     let adapter: Arc<dyn Adapter> = Arc::new(LocalAdapter::new(registry));
 
     // Build sender with a 3-event/second rate window.
-    let (tx_sender, mut rx_sender) = mpsc::unbounded_channel();
+    let (tx_sender, mut rx_sender) = mpsc::channel(1024);
     let mut sender = ConnectionContext {
         app: std::sync::Arc::new(app_with_client_messages(true)),
         socket_id: SocketId::generate(),
@@ -1848,11 +1859,12 @@ async fn client_event_rate_limit_returns_4301_and_drops() {
         saturated: None,
         clustered: false,
         mailbox_notify: None,
+        mailbox_dropped: None,
         client_event_rate: crate::ws::rate::RateWindow::new(3),
     };
 
     // Build receiver (unlimited, just needs to see broadcasts).
-    let (tx_recv, mut rx_recv) = mpsc::unbounded_channel();
+    let (tx_recv, mut rx_recv) = mpsc::channel(1024);
     let mut receiver = ConnectionContext {
         app: std::sync::Arc::new(app_with_client_messages(true)),
         socket_id: SocketId::generate(),
@@ -1866,6 +1878,7 @@ async fn client_event_rate_limit_returns_4301_and_drops() {
         saturated: None,
         clustered: false,
         mailbox_notify: None,
+        mailbox_dropped: None,
         client_event_rate: crate::ws::rate::RateWindow::new(0),
     };
 
@@ -1935,10 +1948,10 @@ fn ctx_saturated(
     app: App,
 ) -> (
     ConnectionContext,
-    mpsc::UnboundedReceiver<ServerEvent>,
+    mpsc::Receiver<ServerEvent>,
     Arc<std::sync::atomic::AtomicBool>,
 ) {
-    let (tx, rx) = mpsc::unbounded_channel();
+    let (tx, rx) = mpsc::channel(1024);
     let registry = Arc::new(Registry::new());
     let adapter: Arc<dyn Adapter> = Arc::new(LocalAdapter::new(registry));
     let flag = Arc::new(std::sync::atomic::AtomicBool::new(true));
@@ -1955,6 +1968,7 @@ fn ctx_saturated(
         saturated: Some(flag.clone()),
         clustered: false,
         mailbox_notify: None,
+        mailbox_dropped: None,
         client_event_rate: crate::ws::rate::RateWindow::new(0),
     };
     (c, rx, flag)

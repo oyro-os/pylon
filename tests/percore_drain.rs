@@ -90,6 +90,7 @@ async fn spawn_with_grace(grace_ms: u64) -> Harness {
         saturated: None,
         clustered: false,
         max_connections: 0,
+        mailbox_capacity: 256,
     });
 
     let port = free_port();
@@ -110,6 +111,7 @@ async fn spawn_with_grace(grace_ms: u64) -> Harness {
                 inflight_slot: None,
                 accepted_slot: None,
                 codel_dropped_slot: None,
+                mailbox_dropped_slot: None,
                 codel: pylon::transport::conn::CodelParams::DEFAULT,
                 budget_factor: None,
                 shutdown_grace_ms: grace_ms,

@@ -154,6 +154,12 @@ pub fn encode(snapshot: &MetricsSnapshot) -> String {
         for (i, &codel) in pc.codel_dropped.iter().enumerate() {
             let _ = writeln!(out, "pylon_codel_dropped_total{{worker=\"{i}\"}} {codel}");
         }
+
+        out.push_str("# HELP pylon_mailbox_dropped_total Frames dropped due to per-connection mailbox full per worker (cumulative)\n");
+        out.push_str("# TYPE pylon_mailbox_dropped_total counter\n");
+        for (i, &mb) in pc.mailbox_dropped.iter().enumerate() {
+            let _ = writeln!(out, "pylon_mailbox_dropped_total{{worker=\"{i}\"}} {mb}");
+        }
     }
 
     // Phase-2 B2: webhook pipeline metrics.
@@ -401,6 +407,7 @@ mod tests {
             dropped: vec![5, 3],
             accepted: vec![10, 20],
             codel_dropped: vec![1, 2],
+            mailbox_dropped: vec![0, 0],
             inflight_total: 300,
             budget_factor: 0.9,
             worker_budget_bytes: 1024 * 1024 * 512,
@@ -495,6 +502,7 @@ mod tests {
             dropped: vec![0, 0],
             accepted: vec![42, 17],
             codel_dropped: vec![3, 0],
+            mailbox_dropped: vec![0, 0],
             inflight_total: 0,
             budget_factor: 1.0,
             worker_budget_bytes: 1,

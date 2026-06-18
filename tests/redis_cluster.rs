@@ -167,10 +167,10 @@ async fn redis_sub_lifecycle_tracks_channels() {
     // A fake connection handle — `ConnectionHandle`'s fields are `pub`, so it is
     // constructible directly from an integration test.
     let socket_id = SocketId::generate();
-    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+    let (tx, _rx) = tokio::sync::mpsc::channel(1024);
     let handle = ConnectionHandle {
         socket_id: socket_id.clone(),
-        mailbox: pylon::connection::handle::Mailbox::new(tx, None),
+        mailbox: pylon::connection::handle::Mailbox::new(tx, None, None),
     };
 
     // Before any subscribe, B must NOT be tracking the msg channel.
@@ -225,12 +225,12 @@ fn tracked_contains(adapter: &RedisAdapter, key: &str) -> bool {
 async fn subscribe_socket(
     adapter: &RedisAdapter,
     channel: &str,
-) -> (SocketId, tokio::sync::mpsc::UnboundedReceiver<ServerEvent>) {
+) -> (SocketId, tokio::sync::mpsc::Receiver<ServerEvent>) {
     let socket_id = SocketId::generate();
-    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let (tx, rx) = tokio::sync::mpsc::channel(1024);
     let handle = ConnectionHandle {
         socket_id: socket_id.clone(),
-        mailbox: pylon::connection::handle::Mailbox::new(tx, None),
+        mailbox: pylon::connection::handle::Mailbox::new(tx, None, None),
     };
     adapter.subscribe(TEST_APP, channel, handle, None).await;
     (socket_id, rx)
@@ -347,10 +347,10 @@ async fn cross_node_broadcast_fans_out_with_dedup_and_exclusion() {
 /// counts, not delivery.
 fn fake_handle() -> (SocketId, ConnectionHandle) {
     let socket_id = SocketId::generate();
-    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+    let (tx, _rx) = tokio::sync::mpsc::channel(1024);
     let handle = ConnectionHandle {
         socket_id: socket_id.clone(),
-        mailbox: pylon::connection::handle::Mailbox::new(tx, None),
+        mailbox: pylon::connection::handle::Mailbox::new(tx, None, None),
     };
     (socket_id, handle)
 }
@@ -775,10 +775,10 @@ fn presence_handle(
     pylon::presence::member::PresenceMember,
 ) {
     let socket_id = SocketId::generate();
-    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+    let (tx, _rx) = tokio::sync::mpsc::channel(1024);
     let handle = ConnectionHandle {
         socket_id: socket_id.clone(),
-        mailbox: pylon::connection::handle::Mailbox::new(tx, None),
+        mailbox: pylon::connection::handle::Mailbox::new(tx, None, None),
     };
     let member = pylon::presence::member::PresenceMember {
         user_id: user_id.into(),
@@ -1150,13 +1150,13 @@ async fn cross_node_user_online_offline_single_emit() {
 fn recording_handle() -> (
     SocketId,
     ConnectionHandle,
-    tokio::sync::mpsc::UnboundedReceiver<ServerEvent>,
+    tokio::sync::mpsc::Receiver<ServerEvent>,
 ) {
     let socket_id = SocketId::generate();
-    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let (tx, rx) = tokio::sync::mpsc::channel(1024);
     let handle = ConnectionHandle {
         socket_id: socket_id.clone(),
-        mailbox: pylon::connection::handle::Mailbox::new(tx, None),
+        mailbox: pylon::connection::handle::Mailbox::new(tx, None, None),
     };
     (socket_id, handle, rx)
 }

@@ -78,6 +78,7 @@ async fn spawn(config: ServerConfig) -> Harness {
         saturated: None,
         clustered: false,
         max_connections: 0,
+        mailbox_capacity: 256,
     });
 
     let port = free_port();
@@ -98,6 +99,7 @@ async fn spawn(config: ServerConfig) -> Harness {
                 inflight_slot: None,
                 accepted_slot: None,
                 codel_dropped_slot: None,
+                mailbox_dropped_slot: None,
                 codel: pylon::transport::conn::CodelParams::DEFAULT,
                 budget_factor: None,
                 shutdown_grace_ms: 0,
@@ -287,6 +289,7 @@ async fn spawn_with_node_ceiling(max_connections: usize) -> Harness {
         saturated: None,
         clustered: false,
         max_connections,
+        mailbox_capacity: 256,
     });
 
     let port = free_port();
@@ -307,6 +310,7 @@ async fn spawn_with_node_ceiling(max_connections: usize) -> Harness {
                 inflight_slot: None,
                 accepted_slot: None,
                 codel_dropped_slot: None,
+                mailbox_dropped_slot: None,
                 codel: pylon::transport::conn::CodelParams::DEFAULT,
                 budget_factor: None,
                 shutdown_grace_ms: 0,
@@ -481,6 +485,7 @@ async fn spawn_with_saturation_flag() -> (Harness, Arc<AtomicBool>) {
         saturated: Some(sat_flag.clone()),
         clustered: false,
         max_connections: 0,
+        mailbox_capacity: 256,
     });
 
     let port = free_port();
@@ -501,6 +506,7 @@ async fn spawn_with_saturation_flag() -> (Harness, Arc<AtomicBool>) {
                 inflight_slot: None,
                 accepted_slot: None,
                 codel_dropped_slot: None,
+                mailbox_dropped_slot: None,
                 codel: pylon::transport::conn::CodelParams::DEFAULT,
                 budget_factor: None,
                 shutdown_grace_ms: 0,

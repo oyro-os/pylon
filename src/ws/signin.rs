@@ -124,7 +124,7 @@ mod tests {
         .unwrap()
     }
 
-    fn ctx() -> (ConnectionContext, mpsc::UnboundedReceiver<ServerEvent>) {
+    fn ctx() -> (ConnectionContext, mpsc::Receiver<ServerEvent>) {
         let adapter: Arc<dyn Adapter> = Arc::new(LocalAdapter::new(Arc::new(Registry::new())));
         ctx_on(adapter, "123.456")
     }
@@ -185,8 +185,8 @@ mod tests {
     fn ctx_on(
         adapter: Arc<dyn Adapter>,
         socket: &str,
-    ) -> (ConnectionContext, mpsc::UnboundedReceiver<ServerEvent>) {
-        let (tx, rx) = mpsc::unbounded_channel();
+    ) -> (ConnectionContext, mpsc::Receiver<ServerEvent>) {
+        let (tx, rx) = mpsc::channel(1024);
         let c = ConnectionContext {
             app: std::sync::Arc::new(app()),
             socket_id: SocketId::from_raw(socket),
@@ -200,6 +200,7 @@ mod tests {
             saturated: None,
             clustered: false,
             mailbox_notify: None,
+            mailbox_dropped: None,
             client_event_rate: crate::ws::rate::RateWindow::new(0),
         };
         (c, rx)

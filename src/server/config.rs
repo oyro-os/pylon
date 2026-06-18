@@ -121,6 +121,12 @@ pub struct ServerConfig {
     /// Enabling mTLS requires both `tls_cert_path` and `tls_key_path` to be set.
     /// `PYLON_TLS_CA`. Empty string treated as None.
     pub tls_ca_path: Option<String>,
+    /// Capacity (frames) of each per-connection mailbox (the bounded channel used
+    /// for cross-connection direct sends: presence rosters, `member_added/removed`,
+    /// `send_to_user`, watchlist events, cluster bridge deliveries). When the mailbox
+    /// is full a `try_send` silently drops the frame and bumps the per-worker
+    /// `pylon_mailbox_dropped_total` counter. `PYLON_MAILBOX_CAPACITY` (default 256).
+    pub mailbox_capacity: usize,
 }
 
 impl Default for ServerConfig {
@@ -178,6 +184,7 @@ impl Default for ServerConfig {
             tls_ca_path: None,
             max_connections: 0,
             expected_per_conn_bytes: 8192,
+            mailbox_capacity: 256,
         }
     }
 }
@@ -428,6 +435,13 @@ impl ServerConfig {
         if let Ok(v) = std::env::var("PYLON_EXPECTED_PER_CONN_BYTES") {
             if let Ok(p) = v.parse() {
                 c.expected_per_conn_bytes = p;
+            }
+        }
+        if let Ok(v) = std::env::var("PYLON_MAILBOX_CAPACITY") {
+            if let Ok(p) = v.parse::<usize>() {
+                if p > 0 {
+                    c.mailbox_capacity = p;
+                }
             }
         }
         c

@@ -13,14 +13,14 @@ fn bench_fanout(c: &mut Criterion) {
         let reg = Registry::new();
         let mut receivers = Vec::new();
         for _ in 0..n {
-            let (tx, rx) = mpsc::unbounded_channel::<ServerEvent>();
+            let (tx, rx) = mpsc::channel::<ServerEvent>(1024);
             receivers.push(rx);
             reg.subscribe(
                 "app",
                 "c",
                 ConnectionHandle {
                     socket_id: SocketId::generate(),
-                    mailbox: pylon::connection::handle::Mailbox::new(tx, None),
+                    mailbox: pylon::connection::handle::Mailbox::new(tx, None, None),
                 },
                 None,
             );

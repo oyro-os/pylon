@@ -139,12 +139,12 @@ mod tests {
     use crate::protocol::event::ServerEvent;
     use tokio::sync::mpsc;
 
-    fn handle() -> (ConnectionHandle, mpsc::UnboundedReceiver<ServerEvent>) {
-        let (tx, rx) = mpsc::unbounded_channel();
+    fn handle() -> (ConnectionHandle, mpsc::Receiver<ServerEvent>) {
+        let (tx, rx) = mpsc::channel(1024);
         (
             ConnectionHandle {
                 socket_id: SocketId::generate(),
-                mailbox: crate::connection::handle::Mailbox::new(tx, None),
+                mailbox: crate::connection::handle::Mailbox::new(tx, None, None),
             },
             rx,
         )
