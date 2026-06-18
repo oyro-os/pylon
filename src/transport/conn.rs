@@ -392,24 +392,30 @@ impl Connection {
     }
 
     /// Plain-TCP flush: drain the out-queue directly to the socket.
+    ///
+    /// Behaviour-identical and allocation-/refcount-free vs the pre-TLS path: the
+    /// front frame's bytes are borrowed from `self.out` and the socket from
+    /// `self.io` SIMULTANEOUSLY — they are disjoint struct fields, which the borrow
+    /// checker permits when each is accessed directly (not through a `&mut self`
+    /// method). So there is NO per-frame `Arc::clone`; the hot path adds zero
+    /// overhead over the original single-field `self.stream.write(&front…)`.
     fn flush_plain(&mut self, now_ns: u64) -> WriteStatus {
         loop {
             // CoDel: before sending the front frame, drop any leading frame that
             // is too stale to be worth sending (skips the mid-write front). When
             // this returns, the front is either fresh-enough to send or the queue
-            // is empty.
+            // is empty. Takes `&mut self` but completes before the disjoint
+            // `self.out` / `self.io` split below, so no borrow conflict.
             self.codel_dequeue(now_ns);
-            if self.out.is_empty() {
+            // Borrow the front frame from `self.out` and the socket from `self.io`
+            // at once: distinct fields, so this is a zero-cost disjoint split.
+            let Some((front, _ts)) = self.out.front() else {
                 break;
-            }
-            let buf_start = self.out_cursor;
-            let front_len = self.out.front().unwrap().0.len();
-            // Clone the Arc (O(1) atomic bump) to release the borrow on self.out
-            // before we take the mutable borrow on self.io below.
-            let front_arc = Arc::clone(&self.out.front().unwrap().0);
-            let buf = &front_arc[buf_start..];
+            };
+            let front_len = front.len();
+            let buf = &front[self.out_cursor..];
             let Io::Plain(stream) = &mut self.io else {
-                unreachable!()
+                unreachable!("flush_plain only called for Io::Plain")
             };
             match stream.write(buf) {
                 Ok(0) => {
@@ -465,65 +471,47 @@ impl Connection {
             }
         }
 
-        // Phase 2: encrypt and send each queued app-data frame.
+        // Phase 2: encrypt and send each queued app-data frame. Like `flush_plain`,
+        // the front frame (`self.out`) and the TLS connection (`self.io`) are
+        // borrowed from disjoint fields at once — no per-frame `Arc::clone`.
         loop {
             self.codel_dequeue(now_ns);
-            if self.out.is_empty() {
+            let Some((front, _ts)) = self.out.front() else {
                 break;
-            }
-            let buf_start = self.out_cursor;
-            let front_len = self.out.front().unwrap().0.len();
-            // Clone the Arc (O(1) atomic bump) to release the borrow on self.out
-            // before the mutable Io borrow below.
-            let front_arc = Arc::clone(&self.out.front().unwrap().0);
-            let buf = &front_arc[buf_start..];
-
-            // Use a local enum to carry the write result out of the Io borrow block.
-            enum TlsWriteResult {
-                Written(usize),
-                WouldBlock,
-                Closed,
-                Interrupted,
-            }
-            let result = {
-                let Io::Tls(stream, tls) = &mut self.io else {
-                    unreachable!()
-                };
-                match tls.writer().write(buf) {
-                    Ok(0) => TlsWriteResult::Closed,
-                    Ok(n) => {
-                        // Flush the freshly encrypted ciphertext to the socket.
-                        while tls.wants_write() {
-                            match tls.write_tls(stream) {
-                                Ok(_) => {}
-                                Err(ref e) if e.kind() == ErrorKind::WouldBlock => {
-                                    return WriteStatus::WouldBlock;
-                                }
-                                Err(_) => return WriteStatus::Closed,
-                            }
-                        }
-                        TlsWriteResult::Written(n)
-                    }
-                    Err(ref e) if e.kind() == ErrorKind::WouldBlock => TlsWriteResult::WouldBlock,
-                    Err(ref e) if e.kind() == ErrorKind::Interrupted => TlsWriteResult::Interrupted,
-                    Err(_) => TlsWriteResult::Closed,
-                }
             };
-
-            match result {
-                TlsWriteResult::Closed => return WriteStatus::Closed,
-                TlsWriteResult::WouldBlock => return WriteStatus::WouldBlock,
-                TlsWriteResult::Interrupted => continue,
-                TlsWriteResult::Written(n) => {
-                    self.out_cursor += n;
-                    if self.out_cursor == front_len {
-                        let sent = front_len;
-                        self.out_bytes -= sent;
-                        self.inflight_delta -= sent as i64;
-                        self.out.pop_front();
-                        self.out_cursor = 0;
+            let front_len = front.len();
+            let buf = &front[self.out_cursor..];
+            let Io::Tls(stream, tls) = &mut self.io else {
+                unreachable!("flush_tls only called for Io::Tls")
+            };
+            let n = match tls.writer().write(buf) {
+                Ok(0) => return WriteStatus::Closed,
+                Ok(n) => {
+                    // Flush the freshly encrypted ciphertext to the socket.
+                    while tls.wants_write() {
+                        match tls.write_tls(stream) {
+                            Ok(_) => {}
+                            Err(ref e) if e.kind() == ErrorKind::WouldBlock => {
+                                return WriteStatus::WouldBlock;
+                            }
+                            Err(_) => return WriteStatus::Closed,
+                        }
                     }
+                    n
                 }
+                Err(ref e) if e.kind() == ErrorKind::WouldBlock => {
+                    return WriteStatus::WouldBlock;
+                }
+                Err(ref e) if e.kind() == ErrorKind::Interrupted => continue,
+                Err(_) => return WriteStatus::Closed,
+            };
+            self.out_cursor += n;
+            if self.out_cursor == front_len {
+                let sent = front_len;
+                self.out_bytes -= sent;
+                self.inflight_delta -= sent as i64;
+                self.out.pop_front();
+                self.out_cursor = 0;
             }
         }
 
