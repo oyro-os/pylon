@@ -41,7 +41,7 @@ impl ConnectionContext {
                 &channel,
                 "LimitReached",
                 "Server is over capacity; try again shortly",
-                4009,
+                4004,
             );
         }
 

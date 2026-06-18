@@ -1961,7 +1961,7 @@ fn ctx_saturated(
 }
 
 /// Under saturation, a NEW public subscribe returns `pusher:subscription_error`
-/// with type "LimitReached" (code 4009) instead of succeeding.
+/// with type "LimitReached" (code 4004) instead of succeeding.
 #[tokio::test]
 async fn subscribe_rejected_under_saturation_public() {
     let (mut c, mut rx, _flag) = ctx_saturated(app(false));
@@ -1982,7 +1982,7 @@ async fn subscribe_rejected_under_saturation_public() {
                 error_type, "LimitReached",
                 "saturation gate must use LimitReached error type"
             );
-            assert_eq!(status, 4009, "saturation gate must use status 4009");
+            assert_eq!(status, 4004, "saturation gate must use status 4004");
             assert_eq!(channel, "public-chan");
         }
         other => panic!("expected SubscriptionError for saturated subscribe, got {other:?}"),
@@ -2012,7 +2012,7 @@ async fn subscribe_rejected_under_saturation_private() {
             error_type, status, ..
         }) => {
             assert_eq!(error_type, "LimitReached");
-            assert_eq!(status, 4009);
+            assert_eq!(status, 4004);
         }
         other => panic!("expected SubscriptionError under saturation, got {other:?}"),
     }
