@@ -1,0 +1,106 @@
+# docker-compose.yml — 2-node pylon cluster (redis adapter) + Redis
+#
+# Usage:
+#   # Copy and edit the apps config first:
+#   cp ../systemd/apps.example.json ./apps.json
+#   # Edit apps.json — change the secret!
+#
+#   docker compose up -d
+#
+# HOST REQUIREMENTS:
+#   • Apply deploy/systemd/99-pylon.sysctl.conf on the Docker host.
+#     (Containers inherit host sysctl values.)
+#   • The `ulimits` below set per-container nofile to 2 000 000.
+#     Ensure the Docker daemon / host allows this:
+#       /etc/docker/daemon.json: {"default-ulimits": {"nofile": {"Name":"nofile","Hard":2000000,"Soft":2000000}}}
+#
+# Health probes:
+#   Liveness:   GET /health
+#   Readiness:  GET /ready  (503 during drain)
+#
+# Note: debian:bookworm-slim does not include curl. The healthcheck uses
+# wget (busybox-style). If wget is also absent in your build, either add
+# `RUN apt-get install -y --no-install-recommends wget` to the Dockerfile
+# runtime stage, or replace the healthcheck command with a small nc / bash
+# TCP check, or add a separate sidecar health binary.
+
+services:
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: redis-server --save "" --appendonly no
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  pylon-1:
+    build:
+      context: ../..
+      dockerfile: deploy/docker/Dockerfile
+    image: pylon:latest
+    restart: unless-stopped
+    depends_on:
+      redis:
+        condition: service_healthy
+    ports:
+      - "7000:7000"
+    environment:
+      PYLON_BIND: "0.0.0.0"
+      PYLON_PORT: "7000"
+      PYLON_ADAPTER: "redis"
+      PYLON_REDIS_URL: "redis://redis:6379"
+      PYLON_REDIS_PREFIX: "pylon"
+      PYLON_APPS_PATH: "/etc/pylon/apps.json"
+      PYLON_WORKERS: "0"
+      PYLON_SHUTDOWN_PREDRAIN_MS: "2000"
+      PYLON_SHUTDOWN_GRACE_MS: "10000"
+    volumes:
+      - ./apps.json:/etc/pylon/apps.json:ro
+    ulimits:
+      nofile:
+        soft: 2000000
+        hard: 2000000
+    stop_grace_period: 20s
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:7000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
+
+  pylon-2:
+    image: pylon:latest
+    restart: unless-stopped
+    depends_on:
+      redis:
+        condition: service_healthy
+      pylon-1:
+        condition: service_started
+    ports:
+      - "7001:7000"
+    environment:
+      PYLON_BIND: "0.0.0.0"
+      PYLON_PORT: "7000"
+      PYLON_ADAPTER: "redis"
+      PYLON_REDIS_URL: "redis://redis:6379"
+      PYLON_REDIS_PREFIX: "pylon"
+      PYLON_APPS_PATH: "/etc/pylon/apps.json"
+      PYLON_WORKERS: "0"
+      PYLON_SHUTDOWN_PREDRAIN_MS: "2000"
+      PYLON_SHUTDOWN_GRACE_MS: "10000"
+    volumes:
+      - ./apps.json:/etc/pylon/apps.json:ro
+    ulimits:
+      nofile:
+        soft: 2000000
+        hard: 2000000
+    stop_grace_period: 20s
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:7000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 5s

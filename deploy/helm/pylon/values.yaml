@@ -1,0 +1,122 @@
+# values.yaml — default configuration for the pylon Helm chart.
+# Override with: helm install pylon ./deploy/helm/pylon -f my-values.yaml
+
+# ── Image ─────────────────────────────────────────────────────────────────────
+image:
+  repository: pylon
+  tag: "latest"
+  pullPolicy: IfNotPresent
+
+# ── Replicas ─────────────────────────────────────────────────────────────────
+replicaCount: 2
+
+# ── Service ───────────────────────────────────────────────────────────────────
+service:
+  type: ClusterIP
+  port: 7000
+
+# ── Pylon configuration ───────────────────────────────────────────────────────
+config:
+  # "local" for single-node; "redis" for multi-replica cluster mode.
+  adapter: local
+
+  # Required when adapter=redis.
+  redisUrl: ""
+  redisPrefix: "pylon"
+
+  # 0 = auto (one worker per logical CPU).
+  workers: 0
+
+  # Memory cap in bytes. 0 = no limit.
+  memoryBudgetBytes: 0
+
+  # Graceful shutdown timing (must sum to less than terminationGracePeriodSeconds).
+  # Pre-drain: wait after SIGTERM before closing connections (LB drain window).
+  shutdownPredrainsMs: 2000
+  # Grace: max time to flush in-flight connections.
+  shutdownGraceMs: 10000
+
+# ── Apps configuration (apps.json) ──────────────────────────────────────────
+# The apps list is mounted into the pod as a ConfigMap.
+# IMPORTANT: secrets (the "secret" field) are stored in this ConfigMap in
+# plain text. For production, use a Kubernetes Secret or an external secret
+# manager and mount it as a file instead.
+apps:
+  - name: my-app
+    id: app
+    key: app-key
+    secret: "CHANGE_ME"
+    capacity: 1000000
+    enable_client_messages: false
+    enabled: true
+    webhooks: []
+
+# ── Resources ─────────────────────────────────────────────────────────────────
+# Tune for your workload. These are conservative starting points.
+resources:
+  requests:
+    cpu: "500m"
+    memory: "512Mi"
+  limits:
+    cpu: "4000m"
+    memory: "8Gi"
+
+# ── Security context ─────────────────────────────────────────────────────────
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 65534    # nobody
+  runAsGroup: 65534
+  fsGroup: 65534
+
+containerSecurityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop:
+      - ALL
+
+# ── Probes ───────────────────────────────────────────────────────────────────
+livenessProbe:
+  httpGet:
+    path: /health
+    port: 7000
+  initialDelaySeconds: 5
+  periodSeconds: 10
+  failureThreshold: 3
+
+readinessProbe:
+  httpGet:
+    path: /ready
+    port: 7000
+  initialDelaySeconds: 3
+  periodSeconds: 5
+  failureThreshold: 2
+
+# ── Autoscaling ───────────────────────────────────────────────────────────────
+autoscaling:
+  enabled: false
+  minReplicas: 2
+  maxReplicas: 10
+  targetCPUUtilizationPercentage: 70
+  # targetMemoryUtilizationPercentage: 80
+
+# ── Node tuning NOTE ─────────────────────────────────────────────────────────
+# Kubernetes cannot fully set per-pod sysctl values for most network settings.
+# The following MUST be applied at the node level before deploying pylon:
+#
+#   1. Apply deploy/systemd/99-pylon.sysctl.conf to every node:
+#        sysctl -w net.core.somaxconn=65535
+#        sysctl -w fs.file-max=12000500
+#        ... (see 99-pylon.sysctl.conf for the full list)
+#
+#   2. Ensure the container runtime sets nofile ≥ 2 000 000 per container.
+#      For containerd, set in /etc/containerd/config.toml or via the node's
+#      /etc/security/limits.conf. For docker-shim, set default-ulimits in
+#      /etc/docker/daemon.json.
+#
+#   3. If your nodes support it, you may use a DaemonSet + privileged initContainer
+#      to apply sysctls at runtime, or configure the kubelet's
+#      --allowed-unsafe-sysctls flag for net.* settings.
+#
+# Some "safe" sysctls (net.ipv4.tcp_rmem etc.) can be set via pod spec
+# securityContext.sysctls if allowed by the cluster admin.

@@ -1,0 +1,12 @@
+[
+  {
+    "name": "my-app",
+    "id": "app",
+    "key": "app-key",
+    "secret": "CHANGE_ME",
+    "capacity": 1000000,
+    "enable_client_messages": false,
+    "enabled": true,
+    "webhooks": []
+  }
+]

@@ -1,0 +1,95 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "pylon.fullname" . }}
+  labels:
+    {{- include "pylon.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "pylon.selectorLabels" . | nindent 6 }}
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      # Replace one pod at a time; keep the rest serving traffic.
+      maxSurge: 1
+      maxUnavailable: 0
+  template:
+    metadata:
+      labels:
+        {{- include "pylon.selectorLabels" . | nindent 8 }}
+    spec:
+      # Must be >= PYLON_SHUTDOWN_PREDRAIN_MS + PYLON_SHUTDOWN_GRACE_MS + slack.
+      # Default: 2000 + 10000 ms = 12 s; 30 s gives ample slack.
+      terminationGracePeriodSeconds: 30
+
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+
+      containers:
+        - name: pylon
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+
+          ports:
+            - name: ws
+              containerPort: 7000
+              protocol: TCP
+
+          env:
+            - name: PYLON_BIND
+              value: "0.0.0.0"
+            - name: PYLON_PORT
+              value: "7000"
+            - name: PYLON_ADAPTER
+              value: {{ .Values.config.adapter | quote }}
+            {{- if .Values.config.redisUrl }}
+            - name: PYLON_REDIS_URL
+              value: {{ .Values.config.redisUrl | quote }}
+            {{- end }}
+            {{- if .Values.config.redisPrefix }}
+            - name: PYLON_REDIS_PREFIX
+              value: {{ .Values.config.redisPrefix | quote }}
+            {{- end }}
+            - name: PYLON_WORKERS
+              value: {{ .Values.config.workers | quote }}
+            - name: PYLON_APPS_PATH
+              value: "/etc/pylon/apps.json"
+            - name: PYLON_SHUTDOWN_PREDRAIN_MS
+              value: {{ .Values.config.shutdownPredrainsMs | quote }}
+            - name: PYLON_SHUTDOWN_GRACE_MS
+              value: {{ .Values.config.shutdownGraceMs | quote }}
+            {{- if .Values.config.memoryBudgetBytes }}
+            - name: PYLON_MEMORY_BUDGET_BYTES
+              value: {{ .Values.config.memoryBudgetBytes | quote }}
+            {{- end }}
+
+          volumeMounts:
+            - name: apps-config
+              mountPath: /etc/pylon
+              readOnly: true
+
+          livenessProbe:
+            {{- toYaml .Values.livenessProbe | nindent 12 }}
+
+          readinessProbe:
+            {{- toYaml .Values.readinessProbe | nindent 12 }}
+
+          # lifecycle.preStop: optional extra pre-drain buffer if your ingress
+          # is slow to deregister pods from the LB.  Leave commented unless needed.
+          # lifecycle:
+          #   preStop:
+          #     exec:
+          #       command: ["/bin/sh", "-c", "sleep 2"]
+
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+
+          securityContext:
+            {{- toYaml .Values.containerSecurityContext | nindent 12 }}
+
+      volumes:
+        - name: apps-config
+          configMap:
+            name: {{ include "pylon.fullname" . }}-apps

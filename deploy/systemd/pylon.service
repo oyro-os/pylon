@@ -1,0 +1,53 @@
+[Unit]
+Description=Pylon — high-performance Pusher-compatible WebSocket server
+Documentation=https://github.com/oyro-os/pylon
+After=network-online.target
+Wants=network-online.target
+# If using the redis adapter, uncomment:
+# After=network-online.target redis.service
+# Wants=network-online.target
+# Requires=redis.service
+
+[Service]
+Type=exec
+
+# Binary and config
+ExecStart=/usr/local/bin/pylon
+EnvironmentFile=/etc/pylon/pylon.env
+
+# Run as a dedicated non-root user.
+# Create before enabling:
+#   useradd --system --no-create-home --shell /sbin/nologin pylon
+User=pylon
+Group=pylon
+
+# File-descriptor limit — must cover the target WebSocket connection count
+# plus headroom for sockets, epoll fds, timer fds, etc.
+LimitNOFILE=2000000
+
+# Graceful shutdown:
+#   SIGTERM → /ready becomes 503 (pre-drain window, default 2 s)
+#           → workers send WS Close frames and flush (grace window, default 10 s)
+#   Total worst-case: ~12 s. TimeoutStopSec gives extra slack.
+KillSignal=SIGTERM
+TimeoutStopSec=20
+
+# Restart on failure (not on clean exit / SIGTERM)
+Restart=on-failure
+RestartSec=2
+
+# Security hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+# apps.json is read-only; pylon does not write to the filesystem at runtime.
+# If you configure PYLON_APPS_PATH to a writable path, add it to ReadWritePaths.
+# ReadWritePaths=/var/lib/pylon
+
+# Kernel TCP/socket tuning is handled by /etc/sysctl.d/99-pylon.sysctl.conf.
+# Apply once after install: sysctl --system
+# (The unit does NOT call sysctl itself; that is boot-time / cloud-init work.)
+
+[Install]
+WantedBy=multi-user.target
