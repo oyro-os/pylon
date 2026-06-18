@@ -257,7 +257,11 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 3, "two retries then success");
         // A 2xx (after retries) bumps delivered_ok exactly once, never failed.
         assert_eq!(metrics.delivered_ok.load(Ordering::Relaxed), 1, "one ok");
-        assert_eq!(metrics.delivered_failed.load(Ordering::Relaxed), 0, "no failed");
+        assert_eq!(
+            metrics.delivered_failed.load(Ordering::Relaxed),
+            0,
+            "no failed"
+        );
     }
 
     #[tokio::test]
@@ -283,7 +287,11 @@ mod tests {
         );
         // A permanent 4xx bumps delivered_failed exactly once, never ok.
         assert_eq!(metrics.delivered_ok.load(Ordering::Relaxed), 0, "no ok");
-        assert_eq!(metrics.delivered_failed.load(Ordering::Relaxed), 1, "one failed");
+        assert_eq!(
+            metrics.delivered_failed.load(Ordering::Relaxed),
+            1,
+            "one failed"
+        );
     }
 
     #[test]

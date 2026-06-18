@@ -54,9 +54,17 @@ pub fn recommend(
     let box_ram_per_core = box_ram_bytes / (physical_cores.max(1) as u64);
     let ram_per_core_needed = ram_bytes / cores;
 
-    let binding = if ram_per_core_needed > box_ram_per_core { "memory" } else { "cpu" };
+    let binding = if ram_per_core_needed > box_ram_per_core {
+        "memory"
+    } else {
+        "cpu"
+    };
 
-    Recommendation { ram_bytes, cores, binding }
+    Recommendation {
+        ram_bytes,
+        cores,
+        binding,
+    }
 }
 
 // ── human ────────────────────────────────────────────────────────────────────
@@ -124,9 +132,14 @@ pub fn human(env: &Envelope, rec: Option<&Recommendation>) -> String {
             } else {
                 b.per_core_busy.len()
             };
-            let cores_str: Vec<String> =
-                b.per_core_busy[..show].iter().map(|v| format!("{}%", v.round() as u64)).collect();
-            lines.push(format!("              per-core busy: [{}]", cores_str.join(" ")));
+            let cores_str: Vec<String> = b.per_core_busy[..show]
+                .iter()
+                .map(|v| format!("{}%", v.round() as u64))
+                .collect();
+            lines.push(format!(
+                "              per-core busy: [{}]",
+                cores_str.join(" ")
+            ));
         }
     }
 
@@ -211,9 +224,9 @@ pub fn json(env: &Envelope, rec: Option<&Recommendation>) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::conn_ramp::StopReason;
     use super::super::rate_ramp::{TputStep, TputStop};
+    use super::*;
 
     #[test]
     fn memory_bound_recommends_ram_and_flags_binding() {

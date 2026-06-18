@@ -24,8 +24,8 @@
 mod common;
 
 use common::{
-    connect, established_socket_id, next_event_named, next_json, send_json,
-    spawn_percore_cluster, Ws, KEY, SECRET,
+    connect, established_socket_id, next_event_named, next_json, send_json, spawn_percore_cluster,
+    Ws, KEY, SECRET,
 };
 use pylon::auth::signature::{hmac_sha256_hex, md5_hex};
 use serde_json::{json, Value};
@@ -155,7 +155,12 @@ async fn cross_node_broadcast_reaches_both_nodes() {
 /// elapses. Returns whether the wanted count was observed. Tolerates interleaved
 /// frames and earlier (smaller) counts — cross-node count updates arrive after a
 /// Redis round-trip, so this polls rather than asserting on the first frame.
-async fn await_subscription_count(ws: &mut Ws, channel: &str, want: u64, deadline: Duration) -> bool {
+async fn await_subscription_count(
+    ws: &mut Ws,
+    channel: &str,
+    want: u64,
+    deadline: Duration,
+) -> bool {
     let stop = tokio::time::Instant::now() + deadline;
     while tokio::time::Instant::now() < stop {
         // Bounded read; `next_json` panics on a hard timeout, so race it against the

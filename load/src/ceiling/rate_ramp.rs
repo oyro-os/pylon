@@ -128,8 +128,7 @@ pub async fn run(child: &PylonChild, opts: &RateRampOpts) -> TputCeiling {
     .await;
     wait_subscribed(&h.counters, opts.tput_conns as u64, Duration::from_secs(60)).await;
 
-    let channels_vec: Vec<String> =
-        (0..ch_count).map(|i| format!("bench-{i}")).collect();
+    let channels_vec: Vec<String> = (0..ch_count).map(|i| format!("bench-{i}")).collect();
 
     let recipients_per_event = (opts.tput_conns / ch_count).max(1) as u64;
 
@@ -239,7 +238,11 @@ pub async fn run(child: &PylonChild, opts: &RateRampOpts) -> TputCeiling {
 
     h.drain().await;
 
-    TputCeiling { best, steps, stop_reason: final_stop }
+    TputCeiling {
+        best,
+        steps,
+        stop_reason: final_stop,
+    }
 }
 
 // ── Unit tests ───────────────────────────────────────────────────────────────
@@ -249,7 +252,10 @@ mod tests {
     use super::*;
     #[test]
     fn stops_on_drops() {
-        assert!(matches!(tput_should_stop(0.5, 10, 100, 50.0, 1000, 0), Some(TputStop::Drops)));
+        assert!(matches!(
+            tput_should_stop(0.5, 10, 100, 50.0, 1000, 0),
+            Some(TputStop::Drops)
+        ));
     }
     #[test]
     fn stops_on_latency() {

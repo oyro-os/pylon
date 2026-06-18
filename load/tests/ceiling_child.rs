@@ -1,9 +1,15 @@
-use pylon_load::ceiling::child::{ChildOpts, PylonChild, write_temp_apps, default_pylon_bin};
+use pylon_load::ceiling::child::{default_pylon_bin, write_temp_apps, ChildOpts, PylonChild};
 
 #[tokio::test]
 async fn spawns_pins_reads_and_tears_down() {
     let apps = write_temp_apps().unwrap();
-    let opts = ChildOpts { pylon_bin: default_pylon_bin(), port: 7700, workers: 2, cores: "0-1".into(), apps_path: apps.clone() };
+    let opts = ChildOpts {
+        pylon_bin: default_pylon_bin(),
+        port: 7700,
+        workers: 2,
+        cores: "0-1".into(),
+        apps_path: apps.clone(),
+    };
     let child = PylonChild::spawn(&opts).await.expect("spawn");
     let pid = child.pid();
     // listening
@@ -14,6 +20,12 @@ async fn spawns_pins_reads_and_tears_down() {
     drop(child);
     // after drop, the pid is gone (poll briefly)
     std::thread::sleep(std::time::Duration::from_millis(500));
-    assert!(!std::path::Path::new(&format!("/proc/{pid}")).exists(), "child not reaped");
-    assert!(!std::path::Path::new(&apps).exists(), "temp apps not cleaned");
+    assert!(
+        !std::path::Path::new(&format!("/proc/{pid}")).exists(),
+        "child not reaped"
+    );
+    assert!(
+        !std::path::Path::new(&apps).exists(),
+        "temp apps not cleaned"
+    );
 }

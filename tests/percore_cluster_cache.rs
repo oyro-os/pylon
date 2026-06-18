@@ -19,8 +19,8 @@
 mod common;
 
 use common::{
-    connect, established_socket_id, next_event_named, next_json, send_json,
-    spawn_percore_cluster, Ws, KEY, SECRET,
+    connect, established_socket_id, next_event_named, next_json, send_json, spawn_percore_cluster,
+    Ws, KEY, SECRET,
 };
 use pylon::auth::signature::{hmac_sha256_hex, md5_hex};
 use serde_json::json;

@@ -8,8 +8,8 @@ use pylon::channel::registry::Registry;
 use pylon::server::config::ServerConfig;
 use pylon::server::router::{build_router, AppState};
 use std::net::SocketAddr;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize};
+use std::sync::Arc;
 
 const APPS: &str = r#"[
     {"name":"HealthTest","id":"happ1","key":"happ-key","secret":"happ-secret",
@@ -22,8 +22,7 @@ async fn spawn() -> SocketAddr {
     let apps: Arc<dyn AppManager> = Arc::new(StaticFileAppManager::from_json(APPS).unwrap());
     let local = Arc::new(LocalAdapter::new(Arc::new(Registry::new())));
     let adapter: Arc<dyn Adapter> = local.clone();
-    let conn_counts: Arc<dashmap::DashMap<String, Arc<AtomicUsize>>> =
-        Arc::new(Default::default());
+    let conn_counts: Arc<dashmap::DashMap<String, Arc<AtomicUsize>>> = Arc::new(Default::default());
     let webhooks = pylon::webhook::WebhookHandle::null();
 
     let port = {
@@ -37,8 +36,7 @@ async fn spawn() -> SocketAddr {
         ..ServerConfig::default()
     };
 
-    let (rest_tx, rest_rx) =
-        tokio::sync::mpsc::unbounded_channel::<pylon::transport::RestConn>();
+    let (rest_tx, rest_rx) = tokio::sync::mpsc::unbounded_channel::<pylon::transport::RestConn>();
     let rest_state = AppState {
         config: config.clone(),
         apps: apps.clone(),
@@ -49,7 +47,10 @@ async fn spawn() -> SocketAddr {
         draining: Arc::new(AtomicBool::new(false)),
         cluster_metrics: None,
     };
-    tokio::spawn(pylon::transport::rest::serve(rest_rx, build_router(rest_state)));
+    tokio::spawn(pylon::transport::rest::serve(
+        rest_rx,
+        build_router(rest_state),
+    ));
 
     let shutdown = Arc::new(AtomicBool::new(false));
     let worker_shutdown = shutdown.clone();
@@ -113,9 +114,16 @@ async fn ready_returns_200_when_fleet_is_up() {
         .send()
         .await
         .unwrap();
-    assert_eq!(resp.status(), 200, "GET /ready must return 200 when fleet is up");
+    assert_eq!(
+        resp.status(),
+        200,
+        "GET /ready must return 200 when fleet is up"
+    );
     let body = resp.text().await.unwrap();
-    assert_eq!(body, "ready", "GET /ready body must be 'ready'; got: {body}");
+    assert_eq!(
+        body, "ready",
+        "GET /ready body must be 'ready'; got: {body}"
+    );
 }
 
 /// GET /readyz (alias) → 200 "ready" when percore fleet is up.
@@ -127,5 +135,9 @@ async fn readyz_returns_200_when_fleet_is_up() {
         .send()
         .await
         .unwrap();
-    assert_eq!(resp.status(), 200, "GET /readyz must return 200 when fleet is up");
+    assert_eq!(
+        resp.status(),
+        200,
+        "GET /readyz must return 200 when fleet is up"
+    );
 }

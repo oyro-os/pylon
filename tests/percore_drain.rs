@@ -77,8 +77,7 @@ async fn spawn_with_grace(grace_ms: u64) -> Harness {
     // can call adapter.broadcast() to push events to subscribed connections.
     let adapter_arc: Arc<dyn Adapter> = Arc::new(LocalAdapter::new(registry));
     let adapter_for_harness = adapter_arc.clone();
-    let conn_counts: Arc<dashmap::DashMap<String, Arc<AtomicUsize>>> =
-        Arc::new(Default::default());
+    let conn_counts: Arc<dashmap::DashMap<String, Arc<AtomicUsize>>> = Arc::new(Default::default());
     let env = Arc::new(DispatchEnv {
         apps,
         adapter: adapter_arc,
@@ -133,11 +132,13 @@ async fn spawn_with_grace(grace_ms: u64) -> Harness {
 
 async fn connect(port: u16) -> Ws {
     let url = format!("ws://127.0.0.1:{port}/app/app-key?protocol=7");
-    let (ws, _) =
-        tokio::time::timeout(Duration::from_secs(5), tokio_tungstenite::connect_async(url))
-            .await
-            .expect("connect within 5s")
-            .expect("ws handshake");
+    let (ws, _) = tokio::time::timeout(
+        Duration::from_secs(5),
+        tokio_tungstenite::connect_async(url),
+    )
+    .await
+    .expect("connect within 5s")
+    .expect("ws handshake");
     ws
 }
 
@@ -261,7 +262,10 @@ async fn graceful_drain_sends_pusher_error_4200_and_close_4200() {
             .get(APP_ID)
             .map(|v| v.load(Ordering::SeqCst))
             .unwrap_or(0);
-        assert_eq!(count, N, "all {N} connections should be counted before drain");
+        assert_eq!(
+            count, N,
+            "all {N} connections should be counted before drain"
+        );
     }
 
     // Trigger the graceful shutdown. Workers will: deregister the listener, queue

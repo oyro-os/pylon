@@ -40,8 +40,7 @@ const TEST_APP: &str = "app";
 
 /// Test Redis URL: `PYLON_TEST_REDIS_URL` or the documented test default (port 6390).
 fn test_redis_url() -> String {
-    std::env::var("PYLON_TEST_REDIS_URL")
-        .unwrap_or_else(|_| "redis://127.0.0.1:6390".to_string())
+    std::env::var("PYLON_TEST_REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6390".to_string())
 }
 
 /// A random, run-unique key prefix for isolation on a shared Redis.
@@ -224,7 +223,10 @@ async fn clustered_count_and_occupied_single_node() {
         // A node-local subscriber: drives the registry-mailbox delivery AND gives us
         // the node_first edge to pass to the bridge.
         let (sid, local_count, mailbox, mut rx) = fake_subscriber(&node.local, channel).await;
-        assert_eq!(local_count, 1, "first node-local subscriber → local count 1");
+        assert_eq!(
+            local_count, 1,
+            "first node-local subscriber → local count 1"
+        );
 
         // Fire the fire-and-forget Subscribe the percore ClusterAdapter would fire.
         node.bridge
@@ -275,10 +277,13 @@ async fn cross_node_count_and_single_occupied_emit() {
         // Node A: first cluster subscriber → count 1, occupied once.
         let (sid_a, ca, mailbox_a, mut rx_a) = fake_subscriber(&node_a.local, channel).await;
         assert_eq!(ca, 1, "A first node-local subscriber → local count 1");
-        node_a
-            .bridge
-            .handle()
-            .subscribe(Arc::from(TEST_APP), Arc::from(channel), sid_a, mailbox_a, true);
+        node_a.bridge.handle().subscribe(
+            Arc::from(TEST_APP),
+            Arc::from(channel),
+            sid_a,
+            mailbox_a,
+            true,
+        );
         let count_a = await_subscription_count(&mut rx_a, channel, Duration::from_secs(3)).await;
         assert_eq!(count_a, Some(1), "A's bridge broadcasts cluster count 1");
 
@@ -286,10 +291,13 @@ async fn cross_node_count_and_single_occupied_emit() {
         // and NOT a 0→1 cluster edge (occupied must NOT fire again).
         let (sid_b, cb, mailbox_b, mut rx_b) = fake_subscriber(&node_b.local, channel).await;
         assert_eq!(cb, 1, "B first node-local subscriber → its local count 1");
-        node_b
-            .bridge
-            .handle()
-            .subscribe(Arc::from(TEST_APP), Arc::from(channel), sid_b, mailbox_b, true);
+        node_b.bridge.handle().subscribe(
+            Arc::from(TEST_APP),
+            Arc::from(channel),
+            sid_b,
+            mailbox_b,
+            true,
+        );
         let count_b = await_subscription_count(&mut rx_b, channel, Duration::from_secs(3)).await;
         assert_eq!(
             count_b,

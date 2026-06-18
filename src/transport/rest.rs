@@ -446,14 +446,22 @@ pub async fn serve(mut rx: UnboundedReceiver<RestConn>, router: Router) {
 /// the live rustls session and the prefix in a [`TlsRestStream`], and serve THAT
 /// with the same hyper-util auto server. The decrypted prefix bytes are replayed
 /// first, then further reads pull plaintext through the TLS session.
-async fn serve_one(conn: RestConn, router: Router) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let RestConn { fd_stream, prefix, tls } = conn;
+async fn serve_one(
+    conn: RestConn,
+    router: Router,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let RestConn {
+        fd_stream,
+        prefix,
+        tls,
+    } = conn;
     // It already came from mio (non-blocking), but be explicit for tokio.
     fd_stream.set_nonblocking(true)?;
     let tokio_stream = tokio::net::TcpStream::from_std(fd_stream)?;
 
     let service = hyper_util::service::TowerToHyperService::new(router);
-    let builder = hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new());
+    let builder =
+        hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new());
 
     match tls {
         None => {

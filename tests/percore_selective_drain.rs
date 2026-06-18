@@ -27,7 +27,9 @@ use pylon::auth::signature::user_signature;
 use pylon::channel::registry::Registry;
 use pylon::protocol::event::ServerEvent;
 use pylon::server::config::ServerConfig;
-use pylon::transport::worker::{percore_selective_drain_visits, run, DispatchEnv, Mode, WorkerConfig};
+use pylon::transport::worker::{
+    percore_selective_drain_visits, run, DispatchEnv, Mode, WorkerConfig,
+};
 use serde_json::{json, Value};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -211,9 +213,7 @@ async fn selective_drain_skips_idle_connections() {
 
     // Fire the cross-connection delivery and time how long it takes to arrive.
     let started = Instant::now();
-    h.adapter
-        .send_to_user("app", "U", ServerEvent::Pong)
-        .await;
+    h.adapter.send_to_user("app", "U", ServerEvent::Pong).await;
 
     // Both active connections must receive the Pong PROMPTLY. We require it within
     // a window comfortably under the 50ms idle poll — only the `MAILBOX_WAKER`
@@ -276,6 +276,9 @@ async fn no_loss_under_many_cross_connection_sends() {
     // strand one of these and the `next_json` timeout would fail the test.
     for (i, ws) in active.iter_mut().enumerate() {
         let f = next_json(ws).await;
-        assert_eq!(f["event"], "pusher:pong", "connection {i} lost its delivery");
+        assert_eq!(
+            f["event"], "pusher:pong",
+            "connection {i} lost its delivery"
+        );
     }
 }

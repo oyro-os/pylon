@@ -1,4 +1,4 @@
-use pylon_load::ceiling::child::{ChildOpts, PylonChild, default_pylon_bin, write_temp_apps};
+use pylon_load::ceiling::child::{default_pylon_bin, write_temp_apps, ChildOpts, PylonChild};
 use pylon_load::ceiling::openloop::publish_openloop;
 use pylon_load::metrics::Counters;
 use std::sync::Arc;
@@ -23,10 +23,16 @@ async fn openloop_reaches_target_rate() {
         "app".into(),
         "app-key".into(),
         "app-secret".into(),
-        vec!["c0".into(), "c1".into(), "c2".into(), "c3".into(), "c4".into()],
-        500,   // target_rate
-        128,   // max_inflight
-        3,     // secs
+        vec![
+            "c0".into(),
+            "c1".into(),
+            "c2".into(),
+            "c3".into(),
+            "c4".into(),
+        ],
+        500, // target_rate
+        128, // max_inflight
+        3,   // secs
         counters,
         std::time::Instant::now(), // epoch (this test asserts rate, not latency)
     )
@@ -38,7 +44,10 @@ async fn openloop_reaches_target_rate() {
         "open-loop should attempt >= 1200 publishes in 3s at 500 msg/s, got {}",
         result.attempted
     );
-    assert!(result.succeeded > 0, "at least some publishes should return 200, got 0");
+    assert!(
+        result.succeeded > 0,
+        "at least some publishes should return 200, got 0"
+    );
 
     // child drops here — teardown is automatic
     drop(child);

@@ -14,7 +14,7 @@ use anyhow::Result;
 use clap::{Parser, ValueEnum};
 
 use pylon_load::ceiling::{
-    child::{write_temp_apps, ChildOpts, PylonChild, default_pylon_bin},
+    child::{default_pylon_bin, write_temp_apps, ChildOpts, PylonChild},
     conn_ramp::{self, ConnRampOpts},
     rate_ramp::{self, RateRampOpts},
     report::{human, json, recommend, Envelope},
@@ -259,9 +259,14 @@ async fn main() -> Result<()> {
         env.conn.as_ref(),
         env.tput.as_ref(),
     ) {
-        (Some(tc), Some(tr), Some(c), Some(t)) => {
-            Some(recommend(c, t, spec.physical_cores, spec.total_ram_bytes, tc, tr))
-        }
+        (Some(tc), Some(tr), Some(c), Some(t)) => Some(recommend(
+            c,
+            t,
+            spec.physical_cores,
+            spec.total_ram_bytes,
+            tc,
+            tr,
+        )),
         _ => None,
     };
 

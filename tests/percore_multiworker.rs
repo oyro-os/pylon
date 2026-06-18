@@ -91,8 +91,7 @@ async fn spawn() -> Harness {
     // REST plane: the worker hands plain-HTTP (publish) connections to this task,
     // which serves them with the same axum router the legacy transport uses. The
     // router shares the SAME adapter, so a REST publish routes through the sink.
-    let (rest_tx, rest_rx) =
-        tokio::sync::mpsc::unbounded_channel::<pylon::transport::RestConn>();
+    let (rest_tx, rest_rx) = tokio::sync::mpsc::unbounded_channel::<pylon::transport::RestConn>();
     let rest_state = AppState {
         config: config.clone(),
         apps: apps.clone(),
@@ -168,7 +167,10 @@ async fn established_socket_id(ws: &mut Ws) -> String {
 }
 
 fn auth_token(socket_id: &str, channel: &str) -> String {
-    format!("{KEY}:{}", channel_signature(SECRET, socket_id, channel, None))
+    format!(
+        "{KEY}:{}",
+        channel_signature(SECRET, socket_id, channel, None)
+    )
 }
 
 /// Sign a REST request the Pusher way (matches `tests/rest.rs`).

@@ -8,6 +8,7 @@
 mod common;
 use common::*;
 
+use futures_util::StreamExt;
 use pylon::auth::signature::{hmac_sha256_hex, md5_hex, user_signature};
 use pylon::server::config::ServerConfig;
 use serde_json::{json, Value};
@@ -15,7 +16,6 @@ use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::time::Duration;
 use tokio_tungstenite::tungstenite::Message;
-use futures_util::StreamExt;
 
 /// Spawn the standard capacity-2 app on the selected transport.
 async fn spawn(config: ServerConfig) -> SocketAddr {

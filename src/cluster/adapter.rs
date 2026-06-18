@@ -206,12 +206,8 @@ impl Adapter for ClusterAdapter {
         // bridge, NOT from this node-local outcome.
         let out = self.local.signin_user(app, user_id, handle).await;
         let node_first = out.first_for_user;
-        self.handle.signin(
-            Arc::from(app),
-            user_id.to_string(),
-            socket_id,
-            node_first,
-        );
+        self.handle
+            .signin(Arc::from(app), user_id.to_string(), socket_id, node_first);
         out
     }
 
@@ -267,13 +263,8 @@ impl Adapter for ClusterAdapter {
         // Record watchers node-locally + learn which users this node now NEWLY watches
         // (the 0→1 watcher edges that drive the bridge's per-user watch Redis SUBSCRIBE).
         let (online, newly) = self.local.watch_edges(app, handle, watched.clone());
-        self.handle.watch(
-            Arc::from(app),
-            socket_id,
-            watched,
-            newly,
-            mailbox,
-        );
+        self.handle
+            .watch(Arc::from(app), socket_id, watched, newly, mailbox);
         // Return the NODE-LOCAL online set. The handler ignores it in cluster mode — the
         // authoritative CLUSTER online snapshot is sent by the bridge via the mailbox.
         online
@@ -283,8 +274,7 @@ impl Adapter for ClusterAdapter {
         // Drop this connection's watch state node-locally + learn the users whose LOCAL
         // watcher set dropped to empty here (1→0), which the bridge UNSUBSCRIBEs.
         let gone = self.local.unwatch_edges(app, socket_id);
-        self.handle
-            .unwatch(Arc::from(app), socket_id.clone(), gone);
+        self.handle.unwatch(Arc::from(app), socket_id.clone(), gone);
     }
 
     async fn watchers_of(&self, app: &str, user_id: &str) -> Vec<ConnectionHandle> {

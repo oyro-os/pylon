@@ -12,8 +12,8 @@ pub mod transport;
 use crate::app::AppManager;
 use dispatcher::{Clock, WebhookDispatcher};
 use event::WebhookEvent;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use tokio::sync::mpsc;
 use transport::WebhookTransport;
 
@@ -78,9 +78,7 @@ impl WebhookHandle {
     /// §8). `Sender::capacity()` returns the remaining permits, so this is the
     /// number of events queued but not yet drained by the dispatcher.
     pub fn queue_depth(&self) -> u64 {
-        self.metrics
-            .max_capacity
-            .saturating_sub(self.tx.capacity()) as u64
+        self.metrics.max_capacity.saturating_sub(self.tx.capacity()) as u64
     }
 
     /// Non-blocking enqueue. Drops + logs on a full or closed mailbox.

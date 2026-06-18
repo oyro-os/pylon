@@ -120,8 +120,7 @@ async fn spawn_with(config: ServerConfig) -> Harness {
     let conn_counts = Arc::new(Default::default());
     let webhooks = pylon::webhook::WebhookHandle::null();
 
-    let (rest_tx, rest_rx) =
-        tokio::sync::mpsc::unbounded_channel::<pylon::transport::RestConn>();
+    let (rest_tx, rest_rx) = tokio::sync::mpsc::unbounded_channel::<pylon::transport::RestConn>();
     let rest_state = AppState {
         config: config.clone(),
         apps: apps.clone(),
@@ -446,7 +445,10 @@ async fn overload_targeted_shed_fast_gets_all_slow_gets_freshest() {
             fast_got.len()
         );
         let expected: Vec<u64> = (1..=N_PUB).collect();
-        assert_eq!(fast_got, expected, "fast subscriber frames out of order / missing");
+        assert_eq!(
+            fast_got, expected,
+            "fast subscriber frames out of order / missing"
+        );
 
         // SLOW: drain whatever it managed to queue (drop-head kept the newest).
         let mut slow_got: Vec<u64> = Vec::new();
@@ -575,7 +577,10 @@ async fn overload_publish_returns_503_then_200_after() {
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
-        assert!(got_200, "after the flood, POST /events must return 200 again");
+        assert!(
+            got_200,
+            "after the flood, POST /events must return 200 again"
+        );
 
         drop(subs);
         drop(h);
@@ -601,11 +606,11 @@ async fn overload_total_inflight_stays_within_budget() {
     let _guard = HARNESS_LOCK.lock().await;
     // A small, explicit budget so the bound is tight and the test is fast.
     const BUDGET: u64 = 16 << 20; // 16 MiB across all workers (4 MiB/worker)
-    // Size the per-conn cap so the per-worker drop-head caps SUM to the per-worker
-    // budget: 4 MiB/worker ÷ 50 expected ≈ 84 KiB; with ~50 subs/worker that's
-    // 50 × 84 KiB ≈ 4 MiB = per-worker budget, so total inflight is bounded by
-    // both the graduated shed (new enqueues) AND the per-conn drop-head (already
-    // queued) — the two together hold the total at/under the budget.
+                                  // Size the per-conn cap so the per-worker drop-head caps SUM to the per-worker
+                                  // budget: 4 MiB/worker ÷ 50 expected ≈ 84 KiB; with ~50 subs/worker that's
+                                  // 50 × 84 KiB ≈ 4 MiB = per-worker budget, so total inflight is bounded by
+                                  // both the graduated shed (new enqueues) AND the per-conn drop-head (already
+                                  // queued) — the two together hold the total at/under the budget.
     let config = ServerConfig {
         memory_budget_bytes: BUDGET,
         expected_conns_per_worker: 50,
@@ -667,7 +672,10 @@ async fn overload_total_inflight_stays_within_budget() {
         }
         // We must have actually accumulated SOME queued bytes (proving the path
         // was exercised, not a no-op where everything drained instantly).
-        assert!(max_seen > 0, "no inflight bytes ever observed; flood was a no-op");
+        assert!(
+            max_seen > 0,
+            "no inflight bytes ever observed; flood was a no-op"
+        );
 
         drop(subs);
         drop(h);

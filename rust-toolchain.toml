@@ -1,0 +1,8 @@
+# Pin the Rust toolchain so local builds, CI, and release artifacts all use the
+# same compiler, rustfmt, and clippy. This prevents formatting/lint drift across
+# toolchain versions (rustfmt defaults change between releases). Bump
+# deliberately, and run `cargo fmt --all` when you do.
+[toolchain]
+channel = "1.96.0"
+components = ["rustfmt", "clippy"]
+profile = "minimal"

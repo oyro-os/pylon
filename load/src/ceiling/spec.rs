@@ -11,7 +11,11 @@ pub struct BoxSpec {
 
 pub fn parse_mem_total_kb(meminfo: &str) -> Option<u64> {
     meminfo.lines().find_map(|l| {
-        l.strip_prefix("MemTotal:")?.split_whitespace().next()?.parse().ok()
+        l.strip_prefix("MemTotal:")?
+            .split_whitespace()
+            .next()?
+            .parse()
+            .ok()
     })
 }
 
@@ -58,7 +62,11 @@ pub fn parse_physical_cores(cpuinfo: &str) -> Option<usize> {
 
 pub fn parse_cgroup_max(s: &str) -> Option<u64> {
     let t = s.trim();
-    if t == "max" { None } else { t.parse().ok() }
+    if t == "max" {
+        None
+    } else {
+        t.parse().ok()
+    }
 }
 
 pub fn detect() -> BoxSpec {
@@ -74,7 +82,13 @@ pub fn detect() -> BoxSpec {
         .unwrap_or_default()
         .trim()
         .to_string();
-    BoxSpec { logical_cores, physical_cores, total_ram_bytes, cgroup_mem_limit, kernel }
+    BoxSpec {
+        logical_cores,
+        physical_cores,
+        total_ram_bytes,
+        cgroup_mem_limit,
+        kernel,
+    }
 }
 
 pub fn effective_mem_bytes(s: &BoxSpec) -> u64 {

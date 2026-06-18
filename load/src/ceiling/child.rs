@@ -41,7 +41,9 @@ impl PylonChild {
         let mut child = cmd.spawn().context("failed to spawn pylon via taskset")?;
 
         // The child is the process-group leader because we called process_group(0).
-        let pid = child.id().context("child exited before we could read its PID")?;
+        let pid = child
+            .id()
+            .context("child exited before we could read its PID")?;
         let pgid = pid;
 
         // Poll until the child is listening or we time out (20 s — debug builds and
@@ -75,7 +77,11 @@ impl PylonChild {
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
 
-        Ok(PylonChild { child, pgid, apps_path: opts.apps_path.clone() })
+        Ok(PylonChild {
+            child,
+            pgid,
+            apps_path: opts.apps_path.clone(),
+        })
     }
 
     /// Return the child PID.
@@ -132,8 +138,7 @@ impl Drop for PylonChild {
 
 /// Write a throwaway apps JSON file to a temp path and return the path.
 pub fn write_temp_apps() -> anyhow::Result<String> {
-    let path = std::env::temp_dir()
-        .join(format!("pylon-ceiling-apps-{}.json", std::process::id()));
+    let path = std::env::temp_dir().join(format!("pylon-ceiling-apps-{}.json", std::process::id()));
     let json = r#"[{"name":"T","id":"app","key":"app-key","secret":"app-secret","capacity":2000000,"client_messages_enabled":true}]"#;
     std::fs::write(&path, json).context("write temp apps")?;
     path.to_str()

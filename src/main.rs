@@ -1,5 +1,6 @@
 //! pylon binary entrypoint.
 
+use dashmap::DashMap;
 use pylon::adapter::local::LocalAdapter;
 use pylon::adapter::Adapter;
 use pylon::app::static_file::StaticFileAppManager;
@@ -9,13 +10,12 @@ use pylon::cluster::adapter::ClusterAdapter;
 use pylon::server::config::ServerConfig;
 use pylon::server::router::{build_router, AppState};
 use pylon::server::shutdown::shutdown_signal;
-use std::time::Duration;
 use pylon::webhook::dispatcher::SystemClock;
 use pylon::webhook::transport::{HttpTransport, WebhookTransport};
 use pylon::webhook::{OccupancySource, WebhookHandle};
-use dashmap::DashMap;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
@@ -96,8 +96,7 @@ async fn main() -> anyhow::Result<()> {
     // over `rest_tx` to a tokio task that serves them with the axum `Router`. The
     // task is spawned HERE, on the runtime, BEFORE the blocking worker call — so a
     // runtime handle exists to serve the handed-off fds.
-    let (rest_tx, rest_rx) =
-        tokio::sync::mpsc::unbounded_channel::<pylon::transport::RestConn>();
+    let (rest_tx, rest_rx) = tokio::sync::mpsc::unbounded_channel::<pylon::transport::RestConn>();
     // C2b: shared draining flag (always false at startup; set true by the shutdown
     // sequence in C2a). Created here so it lives for the entire server lifetime and
     // can be cloned into AppState and the future shutdown sequence.

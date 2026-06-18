@@ -152,7 +152,9 @@ async fn cross_node_watchlist_online() {
     let (mut w, sid_w) = connect_established(addr_a).await;
     signin(&mut w, &sid_w, r#"{"id":"W","watchlist":["U"]}"#).await;
     assert!(
-        next_watchlist(&mut w, Duration::from_millis(500)).await.is_none(),
+        next_watchlist(&mut w, Duration::from_millis(500))
+            .await
+            .is_none(),
         "w must receive no watchlist snapshot while U is offline"
     );
 
@@ -272,7 +274,10 @@ async fn cross_node_send_to_user() {
     let stop = tokio::time::Instant::now() + Duration::from_secs(5);
     loop {
         let remaining = stop.saturating_duration_since(tokio::time::Instant::now());
-        assert!(!remaining.is_zero(), "u must receive the cross-node server-to-user event");
+        assert!(
+            !remaining.is_zero(),
+            "u must receive the cross-node server-to-user event"
+        );
         let frame = match tokio::time::timeout(remaining, next_json(&mut u)).await {
             Ok(f) => f,
             Err(_) => panic!("u must receive the cross-node server-to-user event"),

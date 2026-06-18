@@ -122,10 +122,13 @@ async fn spawn(activity_timeout: u32, pong_timeout: u32) -> Harness {
 
 async fn connect(port: u16) -> Ws {
     let url = format!("ws://127.0.0.1:{port}/app/app-key?protocol=7");
-    let (ws, _) = tokio::time::timeout(Duration::from_secs(5), tokio_tungstenite::connect_async(url))
-        .await
-        .expect("connect within 5s")
-        .expect("ws handshake");
+    let (ws, _) = tokio::time::timeout(
+        Duration::from_secs(5),
+        tokio_tungstenite::connect_async(url),
+    )
+    .await
+    .expect("connect within 5s")
+    .expect("ws handshake");
     ws
 }
 
@@ -199,7 +202,9 @@ async fn responsive_connection_stays_alive() {
                         .unwrap();
                     }
                 }
-                Some(Ok(Message::Close(_))) | None => return Err("server closed a live connection"),
+                Some(Ok(Message::Close(_))) | None => {
+                    return Err("server closed a live connection")
+                }
                 Some(Ok(_)) => {}
                 Some(Err(e)) => return Err(Box::leak(format!("ws error: {e}").into_boxed_str())),
             }
@@ -218,9 +223,11 @@ async fn responsive_connection_stays_alive() {
 
     // Confirm the socket is still usable: a pusher:ping we send is answered with
     // a pusher:pong, proving the connection is live (not half-closed).
-    ws.send(Message::Text(r#"{"event":"pusher:ping","data":{}}"#.to_string()))
-        .await
-        .unwrap();
+    ws.send(Message::Text(
+        r#"{"event":"pusher:ping","data":{}}"#.to_string(),
+    ))
+    .await
+    .unwrap();
     let pong = tokio::time::timeout(Duration::from_secs(3), async {
         loop {
             match ws.next().await.unwrap().unwrap() {
@@ -237,7 +244,10 @@ async fn responsive_connection_stays_alive() {
     })
     .await
     .expect("pong within 3s");
-    assert!(pong, "live connection should answer a pusher:ping with pusher:pong");
+    assert!(
+        pong,
+        "live connection should answer a pusher:ping with pusher:pong"
+    );
 
     drop(h);
 }

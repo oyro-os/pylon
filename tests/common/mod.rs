@@ -15,6 +15,7 @@
 
 #![allow(dead_code)] // each test crate uses a different subset of these helpers
 
+use dashmap::DashMap;
 use futures_util::{SinkExt, StreamExt};
 use pylon::adapter::local::LocalAdapter;
 use pylon::adapter::Adapter;
@@ -27,7 +28,6 @@ use pylon::cluster::bridge::{self, ClusterBridge};
 use pylon::server::config::ServerConfig;
 use pylon::server::router::{build_router, AppState};
 use pylon::webhook::WebhookHandle;
-use dashmap::DashMap;
 use serde_json::Value;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -138,8 +138,7 @@ pub async fn spawn_percore(spec: SpawnSpec) -> SocketAddr {
 
     // REST handoff plane: the worker hands plain-HTTP connections to this axum
     // router via `rest_tx`; `rest::serve` drives them on the tokio runtime.
-    let (rest_tx, rest_rx) =
-        tokio::sync::mpsc::unbounded_channel::<pylon::transport::RestConn>();
+    let (rest_tx, rest_rx) = tokio::sync::mpsc::unbounded_channel::<pylon::transport::RestConn>();
     let rest_state = AppState {
         config: config.clone(),
         apps: apps.clone(),
@@ -191,8 +190,7 @@ pub async fn spawn_percore(spec: SpawnSpec) -> SocketAddr {
 /// documented test default (port 6390 — NOT the 6379 production default, so a
 /// real Redis never gets clobbered by a stray run).
 fn cluster_test_redis_url() -> String {
-    std::env::var("PYLON_TEST_REDIS_URL")
-        .unwrap_or_else(|_| "redis://127.0.0.1:6390".to_string())
+    std::env::var("PYLON_TEST_REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6390".to_string())
 }
 
 /// A guard the test holds for the lifetime of a clustered percore node. It owns
@@ -280,8 +278,7 @@ pub async fn spawn_percore_cluster_with(
     config.port = port;
     config.workers = 1;
 
-    let apps: Arc<dyn AppManager> =
-        Arc::new(StaticFileAppManager::from_json(APPS).unwrap());
+    let apps: Arc<dyn AppManager> = Arc::new(StaticFileAppManager::from_json(APPS).unwrap());
     let conn_counts: Arc<DashMap<String, Arc<AtomicUsize>>> = Arc::new(Default::default());
     let webhooks = WebhookHandle::null();
 
@@ -296,8 +293,7 @@ pub async fn spawn_percore_cluster_with(
 
     // REST plane: drives the node's `RedisAdapter` (full async; blocking on Redis
     // is fine on the tokio runtime) for cluster-wide channel reads + REST publishes.
-    let (rest_tx, rest_rx) =
-        tokio::sync::mpsc::unbounded_channel::<pylon::transport::RestConn>();
+    let (rest_tx, rest_rx) = tokio::sync::mpsc::unbounded_channel::<pylon::transport::RestConn>();
     let rest_state = AppState {
         config: config.clone(),
         apps: apps.clone(),
@@ -308,7 +304,10 @@ pub async fn spawn_percore_cluster_with(
         draining: Arc::new(AtomicBool::new(false)),
         cluster_metrics: None,
     };
-    tokio::spawn(pylon::transport::rest::serve(rest_rx, build_router(rest_state)));
+    tokio::spawn(pylon::transport::rest::serve(
+        rest_rx,
+        build_router(rest_state),
+    ));
 
     // Worker: a `ClusterAdapter` over the shared `local` + the bridge handle. With
     // `Some(local)` the sharded sink installs on the SAME `local` the bridge's

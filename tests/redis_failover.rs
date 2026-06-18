@@ -62,8 +62,7 @@ fn signed_query(method: &str, path: &str, body: &[u8]) -> String {
 /// POST a signed Pusher event to `addr` and assert HTTP 200.
 async fn publish_event(addr: SocketAddr, event_name: &str, channel: &str, data: &str) {
     let path = format!("/apps/{APP_ID}/events");
-    let body =
-        json!({ "name": event_name, "data": data, "channels": [channel] }).to_string();
+    let body = json!({ "name": event_name, "data": data, "channels": [channel] }).to_string();
     let q = signed_query("POST", &path, body.as_bytes());
     let resp = reqwest::Client::new()
         .post(format!("http://{addr}{path}?{q}"))
@@ -88,8 +87,7 @@ async fn connect_and_subscribe(addr: SocketAddr, channel: &str) -> common::Ws {
         json!({ "event": "pusher:subscribe", "data": { "channel": channel } }),
     )
     .await;
-    let succeeded =
-        next_event_named(&mut ws, "pusher_internal:subscription_succeeded").await;
+    let succeeded = next_event_named(&mut ws, "pusher_internal:subscription_succeeded").await;
     assert_eq!(
         succeeded["channel"], channel,
         "subscription_succeeded must name the channel"
@@ -176,7 +174,10 @@ async fn redis_failover_cross_node_resumes() {
         .args(["restart", "pylon-test-redis"])
         .status()
         .expect("docker restart must be accessible");
-    assert!(bounce.success(), "docker restart pylon-test-redis must succeed");
+    assert!(
+        bounce.success(),
+        "docker restart pylon-test-redis must succeed"
+    );
     eprintln!("[redis_failover] docker restart exited OK; waiting for PONG …");
 
     // Poll until Redis is back (bounded to 30 s).

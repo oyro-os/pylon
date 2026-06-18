@@ -458,7 +458,10 @@ pub fn run(mut cfg: WorkerConfig, shutdown: Arc<AtomicBool>) -> std::io::Result<
         // in release (compiles out under `#[cfg(debug_assertions)]`).
         debug_assert_eq!(
             inflight_bytes,
-            conns.iter().map(|(_, e)| e.conn.out_bytes() as u64).sum::<u64>(),
+            conns
+                .iter()
+                .map(|(_, e)| e.conn.out_bytes() as u64)
+                .sum::<u64>(),
             "incremental inflight_bytes drifted from the true out_bytes sum",
         );
 
@@ -540,7 +543,15 @@ pub fn run(mut cfg: WorkerConfig, shutdown: Arc<AtomicBool>) -> std::io::Result<
 
                     // A peer hangup / error: tear down regardless of r/w intent.
                     if event.is_error() || event.is_read_closed() || event.is_write_closed() {
-                        remove(&poll, &mut conns, key, &mut local_subs, &mut sid_to_token, &mut wheel, &mut inflight_bytes);
+                        remove(
+                            &poll,
+                            &mut conns,
+                            key,
+                            &mut local_subs,
+                            &mut sid_to_token,
+                            &mut wheel,
+                            &mut inflight_bytes,
+                        );
                         continue;
                     }
 
@@ -563,7 +574,15 @@ pub fn run(mut cfg: WorkerConfig, shutdown: Arc<AtomicBool>) -> std::io::Result<
                             &mailbox_waker,
                         ) {
                             Action::Close => {
-                                remove(&poll, &mut conns, key, &mut local_subs, &mut sid_to_token, &mut wheel, &mut inflight_bytes);
+                                remove(
+                                    &poll,
+                                    &mut conns,
+                                    key,
+                                    &mut local_subs,
+                                    &mut sid_to_token,
+                                    &mut wheel,
+                                    &mut inflight_bytes,
+                                );
                                 continue;
                             }
                             Action::Handoff(prefix) => {
@@ -608,7 +627,15 @@ pub fn run(mut cfg: WorkerConfig, shutdown: Arc<AtomicBool>) -> std::io::Result<
                         fold_delta(&mut conns, key, &mut inflight_bytes);
                         fold_codel(&mut conns, key, &mut codel_dropped_total);
                         if action == Action::Close {
-                            remove(&poll, &mut conns, key, &mut local_subs, &mut sid_to_token, &mut wheel, &mut inflight_bytes);
+                            remove(
+                                &poll,
+                                &mut conns,
+                                key,
+                                &mut local_subs,
+                                &mut sid_to_token,
+                                &mut wheel,
+                                &mut inflight_bytes,
+                            );
                         }
                     }
                 }
@@ -713,7 +740,15 @@ pub fn run(mut cfg: WorkerConfig, shutdown: Arc<AtomicBool>) -> std::io::Result<
                         // bytes still queued on the connection being torn down.
                         fold_delta(&mut conns, key, &mut inflight_bytes);
                         fold_codel(&mut conns, key, &mut codel_dropped_total);
-                        remove(&poll, &mut conns, key, &mut local_subs, &mut sid_to_token, &mut wheel, &mut inflight_bytes);
+                        remove(
+                            &poll,
+                            &mut conns,
+                            key,
+                            &mut local_subs,
+                            &mut sid_to_token,
+                            &mut wheel,
+                            &mut inflight_bytes,
+                        );
                         work = true;
                     }
                 }
@@ -825,12 +860,12 @@ fn queue_shutdown_error(conns: &mut slab::Slab<Entry>, key: usize, now_ns: u64) 
     // fall back to the same raw-JSON form used by `queue_reject` when no
     // codec has been negotiated yet (connection still handshaking).
     let text = if let Some(session) = entry.session.as_ref() {
-        session
-            .codec
-            .encode(&ServerEvent::Error(crate::protocol::error::PusherError::new(
+        session.codec.encode(&ServerEvent::Error(
+            crate::protocol::error::PusherError::new(
                 4200,
                 "Server is shutting down; please reconnect",
-            )))
+            ),
+        ))
     } else {
         // No codec yet (connection in handshaking state): hand-build the
         // raw JSON that the v7 codec would have produced. The data field is
@@ -1431,7 +1466,15 @@ fn drain_dirty_sessions(
         fold_delta(conns, key, inflight_bytes);
         fold_codel(conns, key, codel_total);
         if result.action == Action::Close {
-            remove(poll, conns, key, local_subs, sid_to_token, wheel, inflight_bytes);
+            remove(
+                poll,
+                conns,
+                key,
+                local_subs,
+                sid_to_token,
+                wheel,
+                inflight_bytes,
+            );
             continue;
         }
         // A `subscribed` change made during this mailbox drain (a `SubscriptionError`
@@ -1548,9 +1591,10 @@ fn handoff_rest(
         crate::transport::conn::IoHandoff::Plain(mio_stream) => {
             (crate::transport::rest::mio_to_std(mio_stream), None)
         }
-        crate::transport::conn::IoHandoff::Tls(mio_stream, tls_conn) => {
-            (crate::transport::rest::mio_to_std(mio_stream), Some(tls_conn))
-        }
+        crate::transport::conn::IoHandoff::Tls(mio_stream, tls_conn) => (
+            crate::transport::rest::mio_to_std(mio_stream),
+            Some(tls_conn),
+        ),
     };
     if let Err(e) = tx.send(crate::transport::rest::RestConn {
         fd_stream: std_stream,
@@ -1830,8 +1874,7 @@ fn drain_broadcasts(
             // accurate within this drain — and so the post-drain flush's send delta
             // (taken below) composes correctly without double-counting.
             let _dropped = entry.conn.queue(msg.frame.clone(), now_ns);
-            *inflight_bytes =
-                inflight_bytes.wrapping_add(entry.conn.take_inflight_delta() as u64);
+            *inflight_bytes = inflight_bytes.wrapping_add(entry.conn.take_inflight_delta() as u64);
             touched.insert(token);
         }
     }
@@ -1847,8 +1890,7 @@ fn drain_broadcasts(
             let action = flush_and_arm(poll, entry, now_ns);
             // INCREMENTAL INFLIGHT: the flush sent bytes out (negative delta); fold
             // it into the running total so it reflects the post-send queue depth.
-            *inflight_bytes =
-                inflight_bytes.wrapping_add(entry.conn.take_inflight_delta() as u64);
+            *inflight_bytes = inflight_bytes.wrapping_add(entry.conn.take_inflight_delta() as u64);
             // B1: fold any CoDel drops that happened during this flush.
             let cd = entry.conn.take_codel_dropped();
             if cd > 0 {
@@ -1862,7 +1904,15 @@ fn drain_broadcasts(
     // Closing connections subtract their still-queued bytes inside `remove`, so the
     // running total never leaks upward when a backpressured peer is torn down.
     for token in to_close {
-        remove(poll, conns, token, local_subs, sid_to_token, wheel, inflight_bytes);
+        remove(
+            poll,
+            conns,
+            token,
+            local_subs,
+            sid_to_token,
+            wheel,
+            inflight_bytes,
+        );
     }
     wrote
 }

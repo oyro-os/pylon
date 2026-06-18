@@ -9,13 +9,13 @@
 mod common;
 use common::*;
 
+use futures_util::StreamExt;
 use pylon::auth::signature::user_signature;
 use pylon::server::config::ServerConfig;
 use serde_json::{json, Value};
 use std::net::SocketAddr;
 use std::time::Duration;
 use tokio_tungstenite::tungstenite::Message;
-use futures_util::StreamExt;
 
 // capacity 10: this suite runs several simultaneous clients
 const APPS_C10: &str = r#"[

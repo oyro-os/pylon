@@ -342,7 +342,8 @@ mod tests {
             clock: Arc::new(FixedClock(1700000000000)),
             batch_ms: 50,
             vacated_grace_ms: 0,
-            occupancy: None,        };
+            occupancy: None,
+        };
         let task = tokio::spawn(dispatcher.run());
 
         // Three triggers inside ONE window: occ + vac (cancel) + miss (survives).
@@ -399,7 +400,8 @@ mod tests {
             clock: Arc::new(FixedClock(1)),
             batch_ms: 50,
             vacated_grace_ms: 0,
-            occupancy: None,        };
+            occupancy: None,
+        };
         let task = tokio::spawn(dispatcher.run());
 
         tx.send(occ()).await.unwrap();
@@ -450,7 +452,8 @@ mod tests {
             clock: Arc::new(FixedClock(1700000000000)),
             batch_ms: 50,
             vacated_grace_ms: 3000,
-            occupancy: Some(occupancy),        };
+            occupancy: Some(occupancy),
+        };
         let task = tokio::spawn(dispatcher.run());
 
         tx.send(vac()).await.unwrap();
@@ -494,7 +497,8 @@ mod tests {
             clock: Arc::new(FixedClock(1700000000000)),
             batch_ms: 50,
             vacated_grace_ms: 3000,
-            occupancy: Some(occupancy),        };
+            occupancy: Some(occupancy),
+        };
         let task = tokio::spawn(dispatcher.run());
 
         tx.send(vac()).await.unwrap();
@@ -533,7 +537,8 @@ mod tests {
             clock: Arc::new(FixedClock(1700000000000)),
             batch_ms: 50,
             vacated_grace_ms: 0,
-            occupancy: None,        };
+            occupancy: None,
+        };
         let task = tokio::spawn(dispatcher.run());
 
         tx.send(vac()).await.unwrap();

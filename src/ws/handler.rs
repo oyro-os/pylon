@@ -139,13 +139,11 @@ impl ConnectionContext {
                             )
                             .await;
                         if self.app.has_member_removed_webhooks {
-                            self.emit_webhook(
-                                crate::webhook::event::WebhookEvent::MemberRemoved {
-                                    app: self.app.id.clone(),
-                                    channel: channel.clone(),
-                                    user_id: uid,
-                                },
-                            );
+                            self.emit_webhook(crate::webhook::event::WebhookEvent::MemberRemoved {
+                                app: self.app.id.clone(),
+                                channel: channel.clone(),
+                                user_id: uid,
+                            });
                         }
                     }
                 }

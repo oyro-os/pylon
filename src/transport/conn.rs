@@ -712,20 +712,18 @@ impl Connection {
         let mut chunk = [0u8; 16 * 1024];
 
         match &mut self.io {
-            Io::Plain(stream) => {
-                loop {
-                    match stream.read(&mut chunk) {
-                        Ok(0) => {
-                            hit_eof = true;
-                            break;
-                        }
-                        Ok(n) => scratch.extend_from_slice(&chunk[..n]),
-                        Err(ref e) if e.kind() == ErrorKind::WouldBlock => break,
-                        Err(ref e) if e.kind() == ErrorKind::Interrupted => continue,
-                        Err(_) => return Err(ConnError::Closed),
+            Io::Plain(stream) => loop {
+                match stream.read(&mut chunk) {
+                    Ok(0) => {
+                        hit_eof = true;
+                        break;
                     }
+                    Ok(n) => scratch.extend_from_slice(&chunk[..n]),
+                    Err(ref e) if e.kind() == ErrorKind::WouldBlock => break,
+                    Err(ref e) if e.kind() == ErrorKind::Interrupted => continue,
+                    Err(_) => return Err(ConnError::Closed),
                 }
-            }
+            },
             Io::Tls(stream, tls) => {
                 // Ingest ciphertext from the socket into the rustls state machine.
                 loop {
@@ -776,9 +774,7 @@ impl Connection {
                 Ok(f) => frames.push(f),
                 Err(ParseError::Incomplete) => break,
                 Err(ParseError::Protocol(m)) => return Err(ConnError::Protocol(m)),
-                Err(ParseError::TooLarge) => {
-                    return Err(ConnError::Protocol("frame too large"))
-                }
+                Err(ParseError::TooLarge) => return Err(ConnError::Protocol("frame too large")),
             }
         }
 
@@ -1061,7 +1057,7 @@ mod tests {
     fn queue_drops_oldest_when_over_cap_keeping_newest() {
         let (mio_s, _peer) = pair(); // existing test helper
         let mut c = Connection::new(mio_s, 100); // 100-byte cap
-        // frames of 40 bytes each; 3 of them = 120 > 100 → oldest dropped, newest kept
+                                                 // frames of 40 bytes each; 3 of them = 120 > 100 → oldest dropped, newest kept
         let f = |n: u8| -> std::sync::Arc<[u8]> {
             std::sync::Arc::from(vec![n; 40].into_boxed_slice())
         };
@@ -1092,8 +1088,8 @@ mod tests {
         }
         assert!(c.out_cursor() > 0, "front still mid-write");
         assert!(c.front_is_the_huge_frame()); // i.e. index 0 is untouched
-        // Keep the peer alive until here so the socket doesn't close mid-test and
-        // turn the partial write into a Closed status.
+                                              // Keep the peer alive until here so the socket doesn't close mid-test and
+                                              // turn the partial write into a Closed status.
         let _ = peer.peer_addr();
         drop(peer);
     }
@@ -1114,7 +1110,11 @@ mod tests {
         let mut running: i64 = 0;
         let take = |c: &mut Connection, running: &mut i64| {
             *running += c.take_inflight_delta();
-            assert_eq!(*running, c.out_bytes() as i64, "delta sum must track out_bytes");
+            assert_eq!(
+                *running,
+                c.out_bytes() as i64,
+                "delta sum must track out_bytes"
+            );
         };
 
         // queue N bytes → delta +N.
@@ -1130,7 +1130,11 @@ mod tests {
         let dropped = c.queue(f(3, 40), 0); // 120 > 100 → drop f(1) (40), add f(3) (40)
         assert_eq!(dropped, 1);
         // Net out_bytes unchanged (80), so the delta over this op is 0 (+40 − 40).
-        assert_eq!(c.take_inflight_delta(), 0, "drop-head: +40 added − 40 evicted = 0 net");
+        assert_eq!(
+            c.take_inflight_delta(),
+            0,
+            "drop-head: +40 added − 40 evicted = 0 net"
+        );
         // running stays at 80 (matches out_bytes).
         assert_eq!(running, c.out_bytes() as i64);
 
@@ -1178,9 +1182,17 @@ mod tests {
         assert_eq!(running, c.out_bytes() as i64);
         let dropped_before = c.codel_dropped();
         assert_eq!(c.flush(now), WriteStatus::Drained);
-        assert_eq!(c.codel_dropped(), dropped_before + 1, "older stale frame dropped");
+        assert_eq!(
+            c.codel_dropped(),
+            dropped_before + 1,
+            "older stale frame dropped"
+        );
         running += c.take_inflight_delta(); // −10 (CoDel drop) and −10 (sent)
-        assert_eq!(running, c.out_bytes() as i64, "delta tracks CoDel drop + send");
+        assert_eq!(
+            running,
+            c.out_bytes() as i64,
+            "delta tracks CoDel drop + send"
+        );
         assert_eq!(c.out_bytes(), 0);
     }
 
@@ -1292,10 +1304,26 @@ mod tests {
         assert_eq!(c.out_bytes(), 20);
         assert_eq!(c.flush(now), WriteStatus::Drained);
         drain_tags(&mut peer, &mut got);
-        assert_eq!(c.codel_dropped(), before_dropped + 1, "older stale frame dropped");
-        assert_eq!(c.out_bytes(), 0, "queue fully drained (one dropped, one sent)");
-        assert_eq!(got.len(), before_got + 1, "the freshest frame still reached peer");
-        assert_eq!(*got.last().unwrap(), 99, "freshest-wins: newest frame delivered");
+        assert_eq!(
+            c.codel_dropped(),
+            before_dropped + 1,
+            "older stale frame dropped"
+        );
+        assert_eq!(
+            c.out_bytes(),
+            0,
+            "queue fully drained (one dropped, one sent)"
+        );
+        assert_eq!(
+            got.len(),
+            before_got + 1,
+            "the freshest frame still reached peer"
+        );
+        assert_eq!(
+            *got.last().unwrap(),
+            99,
+            "freshest-wins: newest frame delivered"
+        );
 
         // ── Phase 3: latency recovers. Drive a full interval with sojourn = 1 ms
         // (< target). The interval minimum is now 1 ms ≤ target, so crossing the
@@ -1311,7 +1339,11 @@ mod tests {
         }
         assert!(!c.is_overloaded(), "interval min 1 ms ≤ target ⇒ recovered");
         let recovered_sent = got.len();
-        assert_eq!(c.codel_dropped(), before_dropped + 1, "no new drops once fresh");
+        assert_eq!(
+            c.codel_dropped(),
+            before_dropped + 1,
+            "no new drops once fresh"
+        );
 
         // A frame that WOULD have been dropped while overloaded (sojourn 12 ms) is
         // now sent, because the queue recovered.
@@ -1430,11 +1462,7 @@ mod tests {
 
     /// Repeatedly read (sleeping briefly between tries to let the loopback
     /// deliver) until at least `want` frames have been collected.
-    fn read_until_frames(
-        conn: &mut Connection,
-        scratch: &mut BytesMut,
-        want: usize,
-    ) -> Vec<Frame> {
+    fn read_until_frames(conn: &mut Connection, scratch: &mut BytesMut, want: usize) -> Vec<Frame> {
         let mut collected = Vec::new();
         for _ in 0..1000 {
             let frames = conn.read_frames(scratch, 1 << 20).expect("read_frames ok");

@@ -10,7 +10,9 @@ pub struct Latency {
 impl Default for Latency {
     fn default() -> Self {
         // 1µs..60s, 3 significant figures.
-        Self { hist: Mutex::new(Histogram::<u64>::new_with_bounds(1_000, 60_000_000_000, 3).unwrap()) }
+        Self {
+            hist: Mutex::new(Histogram::<u64>::new_with_bounds(1_000, 60_000_000_000, 3).unwrap()),
+        }
     }
 }
 

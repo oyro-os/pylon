@@ -41,8 +41,7 @@ async fn spawn() -> SocketAddr {
         ..ServerConfig::default()
     };
 
-    let (rest_tx, rest_rx) =
-        tokio::sync::mpsc::unbounded_channel::<pylon::transport::RestConn>();
+    let (rest_tx, rest_rx) = tokio::sync::mpsc::unbounded_channel::<pylon::transport::RestConn>();
     let rest_state = AppState {
         config: config.clone(),
         apps: apps.clone(),
@@ -53,7 +52,10 @@ async fn spawn() -> SocketAddr {
         draining: Arc::new(AtomicBool::new(false)),
         cluster_metrics: None,
     };
-    tokio::spawn(pylon::transport::rest::serve(rest_rx, build_router(rest_state)));
+    tokio::spawn(pylon::transport::rest::serve(
+        rest_rx,
+        build_router(rest_state),
+    ));
 
     let shutdown = Arc::new(AtomicBool::new(false));
     let worker_shutdown = shutdown.clone();
@@ -80,10 +82,9 @@ async fn spawn() -> SocketAddr {
 }
 
 async fn connect_ws(addr: SocketAddr) -> Ws {
-    let (ws, _) =
-        tokio_tungstenite::connect_async(format!("ws://{addr}/app/mapp-key?protocol=7"))
-            .await
-            .unwrap();
+    let (ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/app/mapp-key?protocol=7"))
+        .await
+        .unwrap();
     ws
 }
 
@@ -105,7 +106,8 @@ async fn metrics_returns_200_with_correct_content_type() {
         .await
         .unwrap();
     assert_eq!(resp.status(), 200, "GET /metrics must return 200");
-    let ct = resp.headers()
+    let ct = resp
+        .headers()
         .get("content-type")
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
@@ -113,7 +115,10 @@ async fn metrics_returns_200_with_correct_content_type() {
         ct.starts_with("text/plain"),
         "Content-Type must be text/plain; got: {ct}"
     );
-    assert!(ct.contains("0.0.4"), "Content-Type must include version=0.0.4; got: {ct}");
+    assert!(
+        ct.contains("0.0.4"),
+        "Content-Type must include version=0.0.4; got: {ct}"
+    );
 }
 
 /// pylon_up 1 is always present.
@@ -128,8 +133,14 @@ async fn metrics_contains_pylon_up() {
         .text()
         .await
         .unwrap();
-    assert!(body.contains("pylon_up 1"), "pylon_up 1 must be present:\n{body}");
-    assert!(body.contains("# TYPE pylon_up gauge"), "TYPE pylon_up must be present:\n{body}");
+    assert!(
+        body.contains("pylon_up 1"),
+        "pylon_up 1 must be present:\n{body}"
+    );
+    assert!(
+        body.contains("# TYPE pylon_up gauge"),
+        "TYPE pylon_up must be present:\n{body}"
+    );
 }
 
 /// After a WebSocket subscribe, per-app connection and subscription gauges appear.

@@ -3,6 +3,7 @@
 //! plain client sends garbage to the TLS port, and REST publish over the same
 //! native-TLS port.
 
+use dashmap::DashMap;
 use futures_util::{SinkExt, StreamExt};
 use pylon::adapter::local::LocalAdapter;
 use pylon::adapter::Adapter;
@@ -14,7 +15,6 @@ use pylon::protocol::event::ServerEvent;
 use pylon::server::config::ServerConfig;
 use pylon::server::router::{build_router, AppState};
 use pylon::webhook::WebhookHandle;
-use dashmap::DashMap;
 use rcgen::generate_simple_self_signed;
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
@@ -38,11 +38,8 @@ const CHANNEL: &str = "tls-channel";
 /// Generate a self-signed cert+key, write PEM files to temp dir. Returns
 /// (cert_der_bytes, cert_pem_path, key_pem_path).
 fn gen_cert() -> (Vec<u8>, PathBuf, PathBuf) {
-    let cert = generate_simple_self_signed(vec![
-        "localhost".to_string(),
-        "127.0.0.1".to_string(),
-    ])
-    .expect("rcgen: generate self-signed cert");
+    let cert = generate_simple_self_signed(vec!["localhost".to_string(), "127.0.0.1".to_string()])
+        .expect("rcgen: generate self-signed cert");
 
     let dir = std::env::temp_dir();
     let pid = std::process::id();
@@ -63,7 +60,9 @@ fn tls_client_config(cert_der: &[u8]) -> Arc<rustls::ClientConfig> {
     let _ = rustls::crypto::ring::default_provider().install_default();
     let mut root_store = rustls::RootCertStore::empty();
     let cert = rustls::pki_types::CertificateDer::from(cert_der.to_vec());
-    root_store.add(cert).expect("add self-signed cert to root store");
+    root_store
+        .add(cert)
+        .expect("add self-signed cert to root store");
     let config = rustls::ClientConfig::builder()
         .with_root_certificates(root_store)
         .with_no_client_auth();
@@ -85,8 +84,7 @@ async fn spawn_tls_server(cert_path: &std::path::Path, key_path: &std::path::Pat
         l.local_addr().unwrap().port()
     };
 
-    let apps: Arc<dyn AppManager> =
-        Arc::new(StaticFileAppManager::from_json(APPS).unwrap());
+    let apps: Arc<dyn AppManager> = Arc::new(StaticFileAppManager::from_json(APPS).unwrap());
     let local = Arc::new(LocalAdapter::new(Arc::new(Registry::new())));
     let adapter: Arc<dyn Adapter> = local.clone();
     let conn_counts: Arc<DashMap<String, Arc<AtomicUsize>>> = Arc::new(Default::default());
@@ -109,8 +107,7 @@ async fn spawn_tls_server(cert_path: &std::path::Path, key_path: &std::path::Pat
     .expect("TLS config should load from test cert/key");
 
     // Wire REST handoff so HTTPS REST requests go through TlsRestStream.
-    let (rest_tx, rest_rx) =
-        tokio::sync::mpsc::unbounded_channel::<pylon::transport::RestConn>();
+    let (rest_tx, rest_rx) = tokio::sync::mpsc::unbounded_channel::<pylon::transport::RestConn>();
     let rest_state = AppState {
         config: config.clone(),
         apps: apps.clone(),
@@ -121,7 +118,10 @@ async fn spawn_tls_server(cert_path: &std::path::Path, key_path: &std::path::Pat
         draining: Arc::new(AtomicBool::new(false)),
         cluster_metrics: None,
     };
-    tokio::spawn(pylon::transport::rest::serve(rest_rx, build_router(rest_state)));
+    tokio::spawn(pylon::transport::rest::serve(
+        rest_rx,
+        build_router(rest_state),
+    ));
 
     let shutdown = Arc::new(AtomicBool::new(false));
     let worker_shutdown = shutdown.clone();
@@ -143,7 +143,10 @@ async fn spawn_tls_server(cert_path: &std::path::Path, key_path: &std::path::Pat
     std::mem::forget((shutdown, handle));
 
     tokio::time::sleep(Duration::from_millis(250)).await;
-    TlsHarness { port, adapter: local }
+    TlsHarness {
+        port,
+        adapter: local,
+    }
 }
 
 /// Build a signed REST query string for the TLS app (`tls-key` / `tls-secret`).
@@ -171,9 +174,8 @@ fn tls_signed_query(method: &str, path: &str, body: &[u8]) -> String {
 
 // ── helper: connect a wss client ───────────────────────────────────────────────
 
-type Ws = tokio_tungstenite::WebSocketStream<
-    tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
->;
+type Ws =
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 
 async fn connect_wss(port: u16, cert_der: &[u8]) -> Ws {
     let client_cfg = tls_client_config(cert_der);
@@ -234,9 +236,11 @@ async fn wss_subscribe_and_receive_broadcast() {
     // 1. Receive connection_established and extract socket_id.
     let text = next_text(&mut ws).await;
     let v: Value = serde_json::from_str(&text).unwrap();
-    assert_eq!(v["event"].as_str().unwrap(), "pusher:connection_established");
-    let data: Value =
-        serde_json::from_str(v["data"].as_str().unwrap()).unwrap();
+    assert_eq!(
+        v["event"].as_str().unwrap(),
+        "pusher:connection_established"
+    );
+    let data: Value = serde_json::from_str(v["data"].as_str().unwrap()).unwrap();
     let _socket_id = data["socket_id"].as_str().unwrap().to_string();
 
     // 2. Subscribe to a channel.
@@ -302,9 +306,9 @@ async fn plain_ws_to_tls_port_fails_server_survives() {
     )
     .await;
     let failed = match plain_result {
-        Err(_) => true,        // timeout
-        Ok(Err(_)) => true,    // connection or handshake error — expected
-        Ok(Ok(_)) => false,    // unexpectedly succeeded
+        Err(_) => true,     // timeout
+        Ok(Err(_)) => true, // connection or handshake error — expected
+        Ok(Ok(_)) => false, // unexpectedly succeeded
     };
     assert!(failed, "plain ws:// to a TLS port must fail");
 
@@ -364,9 +368,8 @@ async fn rest_publish_over_native_tls() {
     );
 
     // ── 2. POST an event via HTTPS REST to the same TLS port ─────────────────
-    let body =
-        json!({"name":"tls-rest-event","data":"{\"from\":\"https\"}","channels":[CHANNEL]})
-            .to_string();
+    let body = json!({"name":"tls-rest-event","data":"{\"from\":\"https\"}","channels":[CHANNEL]})
+        .to_string();
     let path = format!("/apps/{APP_ID}/events");
     let q = tls_signed_query("POST", &path, body.as_bytes());
 
@@ -454,8 +457,7 @@ async fn spawn_tls_server_large(
         &config.tls_ca_path,
     )
     .expect("TLS config should load");
-    let (rest_tx, rest_rx) =
-        tokio::sync::mpsc::unbounded_channel::<pylon::transport::RestConn>();
+    let (rest_tx, rest_rx) = tokio::sync::mpsc::unbounded_channel::<pylon::transport::RestConn>();
     let rest_state = AppState {
         config: config.clone(),
         apps: apps.clone(),
@@ -466,7 +468,10 @@ async fn spawn_tls_server_large(
         draining: Arc::new(AtomicBool::new(false)),
         cluster_metrics: None,
     };
-    tokio::spawn(pylon::transport::rest::serve(rest_rx, build_router(rest_state)));
+    tokio::spawn(pylon::transport::rest::serve(
+        rest_rx,
+        build_router(rest_state),
+    ));
     let shutdown = Arc::new(AtomicBool::new(false));
     let worker_shutdown = shutdown.clone();
     let local_for_sink = Some(local.clone());
@@ -486,7 +491,10 @@ async fn spawn_tls_server_large(
     });
     std::mem::forget((shutdown, handle));
     tokio::time::sleep(Duration::from_millis(250)).await;
-    TlsHarness { port, adapter: local }
+    TlsHarness {
+        port,
+        adapter: local,
+    }
 }
 
 fn large_signed_query(method: &str, path: &str, body: &[u8]) -> String {
@@ -533,9 +541,7 @@ async fn rest_large_response_over_native_tls() {
         );
         let (ws, _) = tokio::time::timeout(
             Duration::from_secs(10),
-            tokio_tungstenite::connect_async_tls_with_config(
-                &url, None, false, Some(connector),
-            ),
+            tokio_tungstenite::connect_async_tls_with_config(&url, None, false, Some(connector)),
         )
         .await
         .expect("wss connect: timeout")

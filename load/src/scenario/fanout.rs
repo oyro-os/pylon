@@ -13,13 +13,17 @@ pub async fn run(cli: &Cli) -> anyhow::Result<()> {
     let mut h = Harness::new(epoch);
     let channel = "bench-fanout".to_string();
     let ch = channel.clone();
-    h.spawn_clients(cli, &cli.url, cli.conns, move |_| ch.clone()).await;
+    h.spawn_clients(cli, &cli.url, cli.conns, move |_| ch.clone())
+        .await;
     wait_subscribed(&h.counters, cli.conns as u64, Duration::from_secs(60)).await;
-    eprintln!("subscribed {} clients", h.counters.subscribed.load(Ordering::Relaxed));
+    eprintln!(
+        "subscribed {} clients",
+        h.counters.subscribed.load(Ordering::Relaxed)
+    );
 
-    let sampler = cli.server_pid.map(|pid| {
-        tokio::spawn(sample_proc(pid, Duration::from_secs(cli.secs)))
-    });
+    let sampler = cli
+        .server_pid
+        .map(|pid| tokio::spawn(sample_proc(pid, Duration::from_secs(cli.secs))));
 
     // Spawn `publishers` concurrent publisher tasks. Each owns its own `Publisher` and
     // ticker (at `rate` events/sec) and fans out to the SAME channel, all sharing the
@@ -61,7 +65,11 @@ pub async fn run(cli: &Cli) -> anyhow::Result<()> {
     // allow in-flight deliveries to land
     tokio::time::sleep(Duration::from_millis(500)).await;
 
-    let proc = if let Some(s) = sampler { s.await.ok().flatten() } else { None };
+    let proc = if let Some(s) = sampler {
+        s.await.ok().flatten()
+    } else {
+        None
+    };
     // single channel → every connection is a recipient of every event
     report("fanout", cli, &h, proc, cli.conns as u64);
     h.drain().await;
@@ -70,14 +78,26 @@ pub async fn run(cli: &Cli) -> anyhow::Result<()> {
 
 /// `recipients_per_event` = how many connections each published event is expected to reach
 /// (all connections for single-channel fan-out; conns/channels for the many-channels case).
-pub fn report(name: &str, cli: &Cli, h: &Harness, proc: Option<(u64, f64)>, recipients_per_event: u64) {
+pub fn report(
+    name: &str,
+    cli: &Cli,
+    h: &Harness,
+    proc: Option<(u64, f64)>,
+    recipients_per_event: u64,
+) {
     let c = &h.counters;
     let sent = c.sent.load(Ordering::Relaxed);
     let recv = c.received.load(Ordering::Relaxed);
     let (count, p50, p99, p999, max) = h.lat.summary_us();
     println!("=== scenario: {name} ===");
-    println!("conns={} subscribed={} sent={} received={} (expected≈{})",
-        cli.conns, c.subscribed.load(Ordering::Relaxed), sent, recv, sent * recipients_per_event);
+    println!(
+        "conns={} subscribed={} sent={} received={} (expected≈{})",
+        cli.conns,
+        c.subscribed.load(Ordering::Relaxed),
+        sent,
+        recv,
+        sent * recipients_per_event
+    );
     println!("latency µs: count={count} p50={p50} p99={p99} p99.9={p999} max={max}");
     if let Some((rss_mb, cpu)) = proc {
         println!("server: peak_rss={rss_mb}MB mean_cpu={cpu:.1}%");

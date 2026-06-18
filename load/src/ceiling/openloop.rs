@@ -47,7 +47,10 @@ pub async fn publish_openloop(
                 continue; // in-flight full → shed this tick
             }
         };
-        let (p, ch) = (pubr.clone(), channels[(seq as usize) % channels.len()].clone());
+        let (p, ch) = (
+            pubr.clone(),
+            channels[(seq as usize) % channels.len()].clone(),
+        );
         let payload = stamp_payload(seq, epoch.elapsed().as_nanos());
         let (att, ok, c) = (attempted.clone(), succeeded.clone(), counters.clone());
         tokio::spawn(async move {

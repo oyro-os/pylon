@@ -239,7 +239,12 @@ impl RedisAdapter {
     ///
     /// [`with_local`]: RedisAdapter::with_local
     pub async fn new(cfg: &ServerConfig) -> anyhow::Result<Self> {
-        Self::with_local(cfg, Arc::new(LocalAdapter::new(Arc::new(Registry::new()))), None).await
+        Self::with_local(
+            cfg,
+            Arc::new(LocalAdapter::new(Arc::new(Registry::new()))),
+            None,
+        )
+        .await
     }
 
     /// Connect to Redis (per `cfg.redis_url` / `cfg.redis_pool_size`) and build the

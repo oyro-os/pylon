@@ -248,7 +248,10 @@ mod tests {
         assert_eq!(psi_full_avg10(some_first), Some(0.0));
 
         // Only a `some` line (e.g. `/proc/pressure/cpu` has no `full`): None.
-        assert_eq!(psi_full_avg10("some avg10=3.21 avg60=0 avg300=0 total=0\n"), None);
+        assert_eq!(
+            psi_full_avg10("some avg10=3.21 avg60=0 avg300=0 total=0\n"),
+            None
+        );
 
         // Leading whitespace tolerated; integer avg10 parses as float.
         assert_eq!(

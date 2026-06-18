@@ -652,9 +652,18 @@ mod tests {
         std::env::set_var("PYLON_TLS_KEY", "");
         std::env::set_var("PYLON_TLS_CA", "");
         let c2 = ServerConfig::from_env();
-        assert!(c2.tls_cert_path.is_none(), "empty PYLON_TLS_CERT should be None");
-        assert!(c2.tls_key_path.is_none(), "empty PYLON_TLS_KEY should be None");
-        assert!(c2.tls_ca_path.is_none(), "empty PYLON_TLS_CA should be None");
+        assert!(
+            c2.tls_cert_path.is_none(),
+            "empty PYLON_TLS_CERT should be None"
+        );
+        assert!(
+            c2.tls_key_path.is_none(),
+            "empty PYLON_TLS_KEY should be None"
+        );
+        assert!(
+            c2.tls_ca_path.is_none(),
+            "empty PYLON_TLS_CA should be None"
+        );
         std::env::remove_var("PYLON_TLS_CERT");
         std::env::remove_var("PYLON_TLS_KEY");
         std::env::remove_var("PYLON_TLS_CA");

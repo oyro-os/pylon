@@ -1,4 +1,4 @@
-use pylon_load::ceiling::child::{ChildOpts, PylonChild, default_pylon_bin, write_temp_apps};
+use pylon_load::ceiling::child::{default_pylon_bin, write_temp_apps, ChildOpts, PylonChild};
 use pylon_load::ceiling::{conn_ramp, rate_ramp, spec};
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -30,7 +30,11 @@ async fn ceiling_smoke_produces_sane_envelope() {
         },
     )
     .await;
-    assert!(conn.max_conns >= 200, "expected >=200 conns, got {}", conn.max_conns);
+    assert!(
+        conn.max_conns >= 200,
+        "expected >=200 conns, got {}",
+        conn.max_conns
+    );
     assert!(conn.bytes_per_conn > 0, "bytes_per_conn should be >0");
 
     // Throughput-ceiling sweep: small, short. Stops on MaxRate (p99 budget large).

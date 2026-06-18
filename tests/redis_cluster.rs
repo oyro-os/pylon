@@ -1469,15 +1469,24 @@ async fn cluster_subscribe_returns_cluster_count_without_local() {
         let (count_b, occ_b) = adapter_b
             .cluster_subscribe(TEST_APP, "public-room", &sock_b, true)
             .await;
-        assert_eq!(count_b, 2, "second cluster member on another node → count 2");
-        assert!(!occ_b, "a non-0→1 cluster_subscribe must NOT report occupied");
+        assert_eq!(
+            count_b, 2,
+            "second cluster member on another node → count 2"
+        );
+        assert!(
+            !occ_b,
+            "a non-0→1 cluster_subscribe must NOT report occupied"
+        );
 
         // `cluster_unsubscribe` mirrors it: 2→1 (not vacated), then 1→0 (vacated).
         let (rem_b, vac_b) = adapter_b
             .cluster_unsubscribe(TEST_APP, "public-room", &sock_b, true)
             .await;
         assert_eq!(rem_b, 1, "one cluster member remains → count 1");
-        assert!(!vac_b, "a non-1→0 cluster_unsubscribe must NOT report vacated");
+        assert!(
+            !vac_b,
+            "a non-1→0 cluster_unsubscribe must NOT report vacated"
+        );
 
         let (rem_a, vac_a) = adapter_a
             .cluster_unsubscribe(TEST_APP, "public-room", &sock_a, true)
@@ -1506,7 +1515,10 @@ async fn cluster_presence_capacity_is_cluster_wide() {
             .cluster_presence_join(TEST_APP, "presence-room", &m1, &s1)
             .await
             .expect("cluster_presence_join on A must succeed");
-        assert!(first1, "u1's first cluster connection must be first_for_user");
+        assert!(
+            first1,
+            "u1's first cluster connection must be first_for_user"
+        );
 
         let (s2, _h2, m2) = presence_handle("u2", serde_json::json!({"name":"Bob"}));
         adapter_b
@@ -1524,19 +1536,28 @@ async fn cluster_presence_capacity_is_cluster_wide() {
         let (_c, u2_member) = adapter_a
             .cluster_presence_capacity(TEST_APP, "presence-room", "u2")
             .await;
-        assert!(u2_member, "u2 (joined on B) must read as already a member on A");
+        assert!(
+            u2_member,
+            "u2 (joined on B) must read as already a member on A"
+        );
 
         let (_c, u3_member) = adapter_a
             .cluster_presence_capacity(TEST_APP, "presence-room", "u3")
             .await;
-        assert!(!u3_member, "an unseen user must NOT read as already a member");
+        assert!(
+            !u3_member,
+            "an unseen user must NOT read as already a member"
+        );
 
         // Leaving drops the cluster count back down (last_for_user edge).
         let last1 = adapter_a
             .cluster_presence_leave(TEST_APP, "presence-room", "u1", &s1)
             .await
             .expect("cluster_presence_leave must succeed");
-        assert!(last1, "u1's only cluster connection leaving → last_for_user");
+        assert!(
+            last1,
+            "u1's only cluster connection leaving → last_for_user"
+        );
         let (count_after, _) = adapter_a
             .cluster_presence_capacity(TEST_APP, "presence-room", "u1")
             .await;

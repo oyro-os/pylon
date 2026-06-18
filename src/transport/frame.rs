@@ -300,10 +300,7 @@ mod tests {
     fn encode_text_unmasked_frame() {
         let mut out = BytesMut::new();
         encode_text(&mut out, b"Hello");
-        assert_eq!(
-            &out[..],
-            &[0x81, 0x05, b'H', b'e', b'l', b'l', b'o'][..]
-        );
+        assert_eq!(&out[..], &[0x81, 0x05, b'H', b'e', b'l', b'l', b'o'][..]);
     }
 
     // ---- Test 3: extended length 126 (200-byte payload) --------------------
@@ -353,21 +350,28 @@ mod tests {
     fn incomplete_leaves_buffer_untouched() {
         // Truncated header (1 byte).
         let mut buf = BytesMut::from(&[0x81][..]);
-        assert_eq!(parse(&mut buf, 1 << 20).unwrap_err(), ParseError::Incomplete);
+        assert_eq!(
+            parse(&mut buf, 1 << 20).unwrap_err(),
+            ParseError::Incomplete
+        );
         assert_eq!(buf.len(), 1);
 
         // Full header + key but truncated payload (declares 5, supplies 2).
-        let mut buf = BytesMut::from(
-            &[0x81, 0x85, 0x37, 0xfa, 0x21, 0x3d, 0x7f, 0x9f][..],
-        );
+        let mut buf = BytesMut::from(&[0x81, 0x85, 0x37, 0xfa, 0x21, 0x3d, 0x7f, 0x9f][..]);
         let before = buf.len();
-        assert_eq!(parse(&mut buf, 1 << 20).unwrap_err(), ParseError::Incomplete);
+        assert_eq!(
+            parse(&mut buf, 1 << 20).unwrap_err(),
+            ParseError::Incomplete
+        );
         assert_eq!(buf.len(), before);
 
         // Truncated extended-length field (126 but only 1 length byte).
         let mut buf = BytesMut::from(&[0x81, 0x80 | 126, 0x00][..]);
         let before = buf.len();
-        assert_eq!(parse(&mut buf, 1 << 20).unwrap_err(), ParseError::Incomplete);
+        assert_eq!(
+            parse(&mut buf, 1 << 20).unwrap_err(),
+            ParseError::Incomplete
+        );
         assert_eq!(buf.len(), before);
     }
 

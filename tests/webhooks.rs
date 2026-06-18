@@ -81,7 +81,9 @@ async fn spawn_pylon(receiver: SocketAddr) -> SocketAddr {
     let local = Arc::new(LocalAdapter::new(Arc::new(Registry::new())));
     let webhooks = pylon::webhook::spawn(
         apps.clone(),
-        |metrics| Arc::new(HttpTransport::new(3, 50, 5000, 100, metrics)) as Arc<dyn WebhookTransport>,
+        |metrics| {
+            Arc::new(HttpTransport::new(3, 50, 5000, 100, metrics)) as Arc<dyn WebhookTransport>
+        },
         Arc::new(SystemClock),
         30, // 30ms batch window
         1024,

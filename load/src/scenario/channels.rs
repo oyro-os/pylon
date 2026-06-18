@@ -10,11 +10,21 @@ pub async fn run(cli: &Cli) -> anyhow::Result<()> {
     let epoch = Instant::now();
     let mut h = Harness::new(epoch);
     let m = cli.channels.max(1);
-    h.spawn_clients(cli, &cli.url, cli.conns, move |i| format!("bench-{}", i % m)).await;
+    h.spawn_clients(cli, &cli.url, cli.conns, move |i| {
+        format!("bench-{}", i % m)
+    })
+    .await;
     wait_subscribed(&h.counters, cli.conns as u64, Duration::from_secs(120)).await;
 
-    let pubr = Publisher::new(cli.rest.clone(), cli.app_id.clone(), cli.key.clone(), cli.secret.clone());
-    let sampler = cli.server_pid.map(|pid| tokio::spawn(sample_proc(pid, Duration::from_secs(cli.secs))));
+    let pubr = Publisher::new(
+        cli.rest.clone(),
+        cli.app_id.clone(),
+        cli.key.clone(),
+        cli.secret.clone(),
+    );
+    let sampler = cli
+        .server_pid
+        .map(|pid| tokio::spawn(sample_proc(pid, Duration::from_secs(cli.secs))));
 
     let interval = Duration::from_secs_f64(1.0 / cli.rate.max(1) as f64);
     let mut ticker = tokio::time::interval(interval);
@@ -24,13 +34,21 @@ pub async fn run(cli: &Cli) -> anyhow::Result<()> {
         ticker.tick().await;
         let channel = format!("bench-{}", (seq as usize) % m);
         let payload = stamp_payload(seq, epoch.elapsed().as_nanos());
-        if pubr.publish(&channel, "bench", &payload, crate::pusher::unix_now()).await.is_ok() {
+        if pubr
+            .publish(&channel, "bench", &payload, crate::pusher::unix_now())
+            .await
+            .is_ok()
+        {
             h.counters.sent.fetch_add(1, Ordering::Relaxed);
         }
         seq += 1;
     }
     tokio::time::sleep(Duration::from_millis(500)).await;
-    let proc = if let Some(s) = sampler { s.await.ok().flatten() } else { None };
+    let proc = if let Some(s) = sampler {
+        s.await.ok().flatten()
+    } else {
+        None
+    };
     // conns are spread across `m` channels → each event reaches ~conns/m subscribers
     super::fanout::report("channels", cli, &h, proc, (cli.conns / m) as u64);
     h.drain().await;

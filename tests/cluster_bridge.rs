@@ -28,8 +28,7 @@ use uuid::Uuid;
 
 /// Test Redis URL: `PYLON_TEST_REDIS_URL` or the documented test default (port 6390).
 fn test_redis_url() -> String {
-    std::env::var("PYLON_TEST_REDIS_URL")
-        .unwrap_or_else(|_| "redis://127.0.0.1:6390".to_string())
+    std::env::var("PYLON_TEST_REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6390".to_string())
 }
 
 /// A random, run-unique key prefix for isolation on a shared Redis.
@@ -60,7 +59,11 @@ fn redis_host_port() -> String {
 /// unreachable Redis; we skip instead so the gate is green where no Redis is provisioned.
 fn redis_reachable() -> bool {
     use std::net::ToSocketAddrs;
-    match redis_host_port().to_socket_addrs().ok().and_then(|mut it| it.next()) {
+    match redis_host_port()
+        .to_socket_addrs()
+        .ok()
+        .and_then(|mut it| it.next())
+    {
         Some(sa) => TcpStream::connect_timeout(&sa, Duration::from_millis(500)).is_ok(),
         None => false,
     }
@@ -86,10 +89,8 @@ async fn cluster_bridge_starts_clones_publishes_and_drops_cleanly() {
         let webhooks = WebhookHandle::null();
         // The bridge resolves per-app flags itself; a single app is enough for the smoke.
         let apps: Arc<dyn AppManager> = Arc::new(
-            StaticFileAppManager::from_json(
-                r#"[{"name":"T","id":"app","key":"k","secret":"s"}]"#,
-            )
-            .expect("apps json must parse"),
+            StaticFileAppManager::from_json(r#"[{"name":"T","id":"app","key":"k","secret":"s"}]"#)
+                .expect("apps json must parse"),
         );
 
         // 1. Start: a real connect to the test Redis must succeed. Webhooks are attached

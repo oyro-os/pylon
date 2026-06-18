@@ -100,7 +100,8 @@ pub async fn run(child: &PylonChild, spec: &BoxSpec, opts: &ConnRampOpts) -> Con
 
     loop {
         // Spawn one batch of subscribers, all on channel "ceil".
-        h.spawn_clients(&cli, &opts.url, opts.conn_batch, |_| "ceil".to_string()).await;
+        h.spawn_clients(&cli, &opts.url, opts.conn_batch, |_| "ceil".to_string())
+            .await;
         total += opts.conn_batch;
 
         // Wait for the batch to subscribe (up to 30 s).
@@ -143,7 +144,11 @@ pub async fn run(child: &PylonChild, spec: &BoxSpec, opts: &ConnRampOpts) -> Con
     } else {
         0
     };
-    let conns_per_gb = if bytes_per_conn > 0 { (1u64 << 30) / bytes_per_conn } else { 0 };
+    let conns_per_gb = if bytes_per_conn > 0 {
+        (1u64 << 30) / bytes_per_conn
+    } else {
+        0
+    };
 
     h.drain().await;
 
@@ -164,17 +169,26 @@ mod tests {
 
     #[test]
     fn stops_on_mem_ceiling() {
-        assert!(matches!(should_stop(900, 800, 0, 100, 1000, 0), Some(StopReason::MemCeiling)));
+        assert!(matches!(
+            should_stop(900, 800, 0, 100, 1000, 0),
+            Some(StopReason::MemCeiling)
+        ));
     }
 
     #[test]
     fn stops_on_failures() {
-        assert!(matches!(should_stop(100, 800, 200, 100, 1000, 0), Some(StopReason::ConnectFailures)));
+        assert!(matches!(
+            should_stop(100, 800, 200, 100, 1000, 0),
+            Some(StopReason::ConnectFailures)
+        ));
     }
 
     #[test]
     fn stops_on_max_conns() {
-        assert!(matches!(should_stop(100, 800, 0, 100, 1000, 1000), Some(StopReason::MaxConns)));
+        assert!(matches!(
+            should_stop(100, 800, 0, 100, 1000, 1000),
+            Some(StopReason::MaxConns)
+        ));
     }
 
     #[test]

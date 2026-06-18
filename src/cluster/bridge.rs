@@ -610,13 +610,15 @@ pub fn start(
                 // the error back so `start` returns `Err` instead of hanging.
                 // Pass `thread_redis_connected` so the node-heartbeat loop inside the adapter
                 // updates it after each tick (true = ok, false = error).
-                let adapter = match RedisAdapter::with_local(&cfg, local, Some(thread_redis_connected)).await {
-                    Ok(a) => Arc::new(a),
-                    Err(e) => {
-                        let _ = ready_tx.send(Err(e));
-                        return;
-                    }
-                };
+                let adapter =
+                    match RedisAdapter::with_local(&cfg, local, Some(thread_redis_connected)).await
+                    {
+                        Ok(a) => Arc::new(a),
+                        Err(e) => {
+                            let _ = ready_tx.send(Err(e));
+                            return;
+                        }
+                    };
 
                 // The sweeper + the drain loop's occupied/vacated webhooks both need the
                 // `WebhookHandle`, but it may not exist yet (the dispatcher's occupancy
@@ -642,11 +644,9 @@ pub fn start(
                     }
                     // A short timeout makes the loop re-check the shutdown flag promptly even
                     // when idle, without a busy spin.
-                    let next = tokio::time::timeout(
-                        std::time::Duration::from_millis(100),
-                        rx.recv(),
-                    )
-                    .await;
+                    let next =
+                        tokio::time::timeout(std::time::Duration::from_millis(100), rx.recv())
+                            .await;
                     match next {
                         // Channel closed: all handles dropped — nothing more can arrive.
                         Ok(None) => break,
@@ -687,7 +687,11 @@ pub fn start(
     };
 
     let node_id: Arc<str> = Arc::from(adapter.node_id());
-    let handle = ClusterHandle { tx, node_id, metrics: metrics.clone() };
+    let handle = ClusterHandle {
+        tx,
+        node_id,
+        metrics: metrics.clone(),
+    };
     Ok(ClusterBridge {
         handle,
         metrics,

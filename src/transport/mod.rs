@@ -210,7 +210,10 @@ pub fn run_percore(
     let budget = config.resolved_memory_budget(effective_mem);
     let per_worker_budget = budget / worker_count.max(1) as u64;
     let per_conn_cap = resources::per_conn_cap(per_worker_budget, config.expected_conns_per_worker)
-        .clamp(config.perconn_queue_min_bytes, config.perconn_queue_max_bytes);
+        .clamp(
+            config.perconn_queue_min_bytes,
+            config.perconn_queue_max_bytes,
+        );
     let high_water = per_conn_cap as usize;
 
     // CPU ids to pin to. May be empty if the OS won't report them — workers then
@@ -230,14 +233,17 @@ pub fn run_percore(
     // Per-worker inflight-byte counters (one shared `AtomicU64` per worker). Each
     // worker mirrors its local `inflight_bytes` into its slot every loop; the
     // off-hot-path `percore_total_inflight_bytes()` test hook sums them.
-    let inflight_slots: Vec<Arc<AtomicU64>> =
-        (0..worker_count).map(|_| Arc::new(AtomicU64::new(0))).collect();
+    let inflight_slots: Vec<Arc<AtomicU64>> = (0..worker_count)
+        .map(|_| Arc::new(AtomicU64::new(0)))
+        .collect();
 
     // B1: per-worker accepted-connections and CoDel-dropped-frames counters.
-    let accepted_slots: Vec<Arc<AtomicU64>> =
-        (0..worker_count).map(|_| Arc::new(AtomicU64::new(0))).collect();
-    let codel_dropped_slots: Vec<Arc<AtomicU64>> =
-        (0..worker_count).map(|_| Arc::new(AtomicU64::new(0))).collect();
+    let accepted_slots: Vec<Arc<AtomicU64>> = (0..worker_count)
+        .map(|_| Arc::new(AtomicU64::new(0)))
+        .collect();
+    let codel_dropped_slots: Vec<Arc<AtomicU64>> = (0..worker_count)
+        .map(|_| Arc::new(AtomicU64::new(0)))
+        .collect();
 
     // Build the per-core sharded broadcast plumbing: one `(Sender, Receiver)`
     // pair + `WorkerSlot` per worker. The `Sender`s live in the sink (installed
@@ -337,24 +343,28 @@ pub fn run_percore(
     // value so re-runs in tests see fresh slots).
     {
         let mut g = PERCORE_REGISTRY
-            .get_or_init(|| std::sync::Mutex::new(PercoreRegistry {
-                inflight_slots: Vec::new(),
-                worker_slots: Vec::new(),
-                accepted_slots: Vec::new(),
-                codel_dropped_slots: Vec::new(),
-                budget_factor: budget_factor.clone(),
-                worker_budget_bytes: per_worker_budget,
-            }))
+            .get_or_init(|| {
+                std::sync::Mutex::new(PercoreRegistry {
+                    inflight_slots: Vec::new(),
+                    worker_slots: Vec::new(),
+                    accepted_slots: Vec::new(),
+                    codel_dropped_slots: Vec::new(),
+                    budget_factor: budget_factor.clone(),
+                    worker_budget_bytes: per_worker_budget,
+                })
+            })
             .lock()
             .unwrap();
         g.inflight_slots.clear();
         g.inflight_slots.extend(inflight_slots.iter().cloned());
         g.worker_slots.clear();
-        g.worker_slots.extend(worker_slots_for_metrics.iter().cloned());
+        g.worker_slots
+            .extend(worker_slots_for_metrics.iter().cloned());
         g.accepted_slots.clear();
         g.accepted_slots.extend(accepted_slots.iter().cloned());
         g.codel_dropped_slots.clear();
-        g.codel_dropped_slots.extend(codel_dropped_slots.iter().cloned());
+        g.codel_dropped_slots
+            .extend(codel_dropped_slots.iter().cloned());
         g.budget_factor = budget_factor.clone();
         g.worker_budget_bytes = per_worker_budget;
     }
@@ -493,7 +503,10 @@ mod psi_tests {
         let threshold = 15.0;
         // Under heavy pressure the factor steps down toward the 0.8 floor.
         let f1 = compute_factor(1000, 40.0, threshold);
-        assert!((800..1000).contains(&f1), "stepped down but not below floor: {f1}");
+        assert!(
+            (800..1000).contains(&f1),
+            "stepped down but not below floor: {f1}"
+        );
         // Repeated pressure keeps shrinking but never past 800.
         let mut f = 1000;
         for _ in 0..20 {

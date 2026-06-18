@@ -40,7 +40,11 @@ impl Harness {
         // Smooth ramp: pace spawns in ~100ms slices so the accept rate is steady rather
         // than a burst-then-1s-pause sawtooth. `per_sec` = target new conns/sec (0 = all at
         // once). No pacing when per_sec >= n (the whole set fits in under a second).
-        let per_sec = if cli.ramp_per_sec == 0 { n } else { cli.ramp_per_sec };
+        let per_sec = if cli.ramp_per_sec == 0 {
+            n
+        } else {
+            cli.ramp_per_sec
+        };
         let batch = (per_sec / 10).max(1);
         // Parse client source IPs once. If parsing fails or the list is just the single
         // default 127.0.0.1, keep the OS-default behavior (src_ip = None).
@@ -49,8 +53,8 @@ impl Harness {
             .iter()
             .filter_map(|s| s.parse().ok())
             .collect();
-        let use_binding =
-            ips.len() == cli.client_ips.len() && !(ips.len() == 1 && cli.client_ips[0] == "127.0.0.1");
+        let use_binding = ips.len() == cli.client_ips.len()
+            && !(ips.len() == 1 && cli.client_ips[0] == "127.0.0.1");
         for i in 0..n {
             let src_ip = if use_binding && !ips.is_empty() {
                 Some(ips[i % ips.len()])
@@ -94,12 +98,16 @@ impl Harness {
 pub async fn wait_subscribed(counters: &Counters, target: u64, timeout: Duration) {
     let start = Instant::now();
     loop {
-        let got = counters.subscribed.load(std::sync::atomic::Ordering::Relaxed);
+        let got = counters
+            .subscribed
+            .load(std::sync::atomic::Ordering::Relaxed);
         if got >= target {
             return;
         }
         if start.elapsed() > timeout {
-            let failed = counters.connect_failed.load(std::sync::atomic::Ordering::Relaxed);
+            let failed = counters
+                .connect_failed
+                .load(std::sync::atomic::Ordering::Relaxed);
             eprintln!(
                 "WARNING: TRUNCATED RUN — only {got}/{target} subscribed after {:.0}s \
                  ({failed} connect failures). Results below reflect {got} connections, NOT {target}. \

@@ -208,7 +208,12 @@ mod tests {
     #[test]
     fn parses_rest_request() {
         let req = b"POST /apps/app/events HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\n\r\n";
-        assert_eq!(read_head(req), HeadResult::Rest { consumed: req.len() });
+        assert_eq!(
+            read_head(req),
+            HeadResult::Rest {
+                consumed: req.len()
+            }
+        );
     }
 
     /// 4. A head truncated before CRLFCRLF is `NeedMore`.

@@ -293,7 +293,10 @@ async fn disconnect_cleans_up_subscription() {
 
     // The adapter agrees there are 2 subscribers.
     assert_eq!(
-        h.adapter.channel("app", "my-channel").await.subscription_count,
+        h.adapter
+            .channel("app", "my-channel")
+            .await
+            .subscription_count,
         2
     );
 
@@ -308,7 +311,10 @@ async fn disconnect_cleans_up_subscription() {
 
     // And the adapter's count has dropped to 1.
     assert_eq!(
-        h.adapter.channel("app", "my-channel").await.subscription_count,
+        h.adapter
+            .channel("app", "my-channel")
+            .await
+            .subscription_count,
         1
     );
 }

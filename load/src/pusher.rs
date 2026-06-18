@@ -255,12 +255,22 @@ pub async fn run_client(
 
     // 2. subscribe (signed if private)
     let auth = if cfg.private {
-        Some(channel_auth(&cfg.key, &cfg.secret, &socket_id, &cfg.channel, None))
+        Some(channel_auth(
+            &cfg.key,
+            &cfg.secret,
+            &socket_id,
+            &cfg.channel,
+            None,
+        ))
     } else {
         None
     };
-    ws.send(Message::Text(subscribe_frame(&cfg.channel, auth.as_deref(), None)))
-        .await?;
+    ws.send(Message::Text(subscribe_frame(
+        &cfg.channel,
+        auth.as_deref(),
+        None,
+    )))
+    .await?;
 
     // 3. receive loop
     loop {
@@ -310,7 +320,13 @@ pub struct Publisher {
 
 impl Publisher {
     pub fn new(base: String, app_id: String, key: String, secret: String) -> Self {
-        Self { http: reqwest::Client::new(), base, app_id, key, secret }
+        Self {
+            http: reqwest::Client::new(),
+            base,
+            app_id,
+            key,
+            secret,
+        }
     }
 
     /// Publish `event` to `channel` with a timestamped payload. `now_unix` = wall-clock secs.
@@ -324,8 +340,18 @@ impl Publisher {
         let body = json!({ "name": event, "channel": channel, "data": payload }).to_string();
         let query = sign_post_events(&self.key, &self.secret, &self.app_id, &body, now_unix);
         let url = format!("{}/apps/{}/events?{}", self.base, self.app_id, query);
-        let resp = self.http.post(url).header("Content-Type", "application/json").body(body).send().await?;
-        anyhow::ensure!(resp.status().is_success(), "publish status {}", resp.status());
+        let resp = self
+            .http
+            .post(url)
+            .header("Content-Type", "application/json")
+            .body(body)
+            .send()
+            .await?;
+        anyhow::ensure!(
+            resp.status().is_success(),
+            "publish status {}",
+            resp.status()
+        );
         Ok(())
     }
 }

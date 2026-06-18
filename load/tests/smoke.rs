@@ -47,7 +47,10 @@ async fn fanout_smoke_delivers_to_all() {
     // wait for all K subscribed
     let start = Instant::now();
     while counters.subscribed.load(Ordering::Relaxed) < K as u64 {
-        assert!(start.elapsed() < Duration::from_secs(15), "subscribe timeout");
+        assert!(
+            start.elapsed() < Duration::from_secs(15),
+            "subscribe timeout"
+        );
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
 

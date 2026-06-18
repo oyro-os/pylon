@@ -58,8 +58,7 @@ async fn spawn() -> SocketAddr {
 
     // REST handoff plane: the worker hands plain-HTTP connections to this axum
     // router via `rest_tx`; `rest::serve` drives them on the tokio runtime.
-    let (rest_tx, rest_rx) =
-        tokio::sync::mpsc::unbounded_channel::<pylon::transport::RestConn>();
+    let (rest_tx, rest_rx) = tokio::sync::mpsc::unbounded_channel::<pylon::transport::RestConn>();
     let rest_state = AppState {
         config: config.clone(),
         apps: apps.clone(),
@@ -70,7 +69,10 @@ async fn spawn() -> SocketAddr {
         draining: Arc::new(AtomicBool::new(false)),
         cluster_metrics: None,
     };
-    tokio::spawn(pylon::transport::rest::serve(rest_rx, build_router(rest_state)));
+    tokio::spawn(pylon::transport::rest::serve(
+        rest_rx,
+        build_router(rest_state),
+    ));
 
     // Run the blocking `mio` worker on a dedicated thread.
     let shutdown = Arc::new(AtomicBool::new(false));

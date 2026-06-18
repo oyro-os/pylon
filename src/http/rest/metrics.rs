@@ -5,7 +5,7 @@ use crate::server::router::AppState;
 use crate::transport::percore_metrics_snapshot;
 use crate::webhook::WebhookMetrics;
 use axum::extract::State;
-use axum::http::{HeaderValue, header};
+use axum::http::{header, HeaderValue};
 use axum::response::IntoResponse;
 use std::collections::HashMap;
 use std::fmt::Write;
@@ -58,7 +58,9 @@ pub fn encode(snapshot: &MetricsSnapshot) -> String {
 
     // pylon_saturation_flag (omit if None)
     if let Some(sat) = snapshot.saturation {
-        out.push_str("# HELP pylon_saturation_flag Broadcast pipeline saturation (1 = saturated)\n");
+        out.push_str(
+            "# HELP pylon_saturation_flag Broadcast pipeline saturation (1 = saturated)\n",
+        );
         out.push_str("# TYPE pylon_saturation_flag gauge\n");
         let _ = writeln!(out, "pylon_saturation_flag {}", if sat { 1 } else { 0 });
     }
@@ -72,21 +74,36 @@ pub fn encode(snapshot: &MetricsSnapshot) -> String {
         out.push_str("# TYPE pylon_connections gauge\n");
         for app_id in &app_ids {
             let m = &snapshot.apps[*app_id];
-            let _ = writeln!(out, "pylon_connections{{app=\"{}\"}} {}", escape_label(app_id), m.connections);
+            let _ = writeln!(
+                out,
+                "pylon_connections{{app=\"{}\"}} {}",
+                escape_label(app_id),
+                m.connections
+            );
         }
 
         out.push_str("# HELP pylon_channels_occupied Number of occupied channels per app\n");
         out.push_str("# TYPE pylon_channels_occupied gauge\n");
         for app_id in &app_ids {
             let m = &snapshot.apps[*app_id];
-            let _ = writeln!(out, "pylon_channels_occupied{{app=\"{}\"}} {}", escape_label(app_id), m.channels_occupied);
+            let _ = writeln!(
+                out,
+                "pylon_channels_occupied{{app=\"{}\"}} {}",
+                escape_label(app_id),
+                m.channels_occupied
+            );
         }
 
         out.push_str("# HELP pylon_subscriptions Total channel subscriptions per app\n");
         out.push_str("# TYPE pylon_subscriptions gauge\n");
         for app_id in &app_ids {
             let m = &snapshot.apps[*app_id];
-            let _ = writeln!(out, "pylon_subscriptions{{app=\"{}\"}} {}", escape_label(app_id), m.subscriptions);
+            let _ = writeln!(
+                out,
+                "pylon_subscriptions{{app=\"{}\"}} {}",
+                escape_label(app_id),
+                m.subscriptions
+            );
         }
     }
 
@@ -95,7 +112,10 @@ pub fn encode(snapshot: &MetricsSnapshot) -> String {
         out.push_str("# HELP pylon_broadcast_dropped_total Broadcasts dropped due to full worker hand-off channel (cumulative)\n");
         out.push_str("# TYPE pylon_broadcast_dropped_total counter\n");
         for (i, &dropped) in pc.dropped.iter().enumerate() {
-            let _ = writeln!(out, "pylon_broadcast_dropped_total{{worker=\"{i}\"}} {dropped}");
+            let _ = writeln!(
+                out,
+                "pylon_broadcast_dropped_total{{worker=\"{i}\"}} {dropped}"
+            );
         }
 
         out.push_str("# HELP pylon_inflight_bytes Bytes queued in per-worker outbound buffers\n");
@@ -118,10 +138,15 @@ pub fn encode(snapshot: &MetricsSnapshot) -> String {
         out.push_str("# TYPE pylon_budget_factor gauge\n");
         let _ = writeln!(out, "pylon_budget_factor {:.3}", pc.budget_factor);
 
-        out.push_str("# HELP pylon_accepted_connections_total Cumulative connections accepted per worker\n");
+        out.push_str(
+            "# HELP pylon_accepted_connections_total Cumulative connections accepted per worker\n",
+        );
         out.push_str("# TYPE pylon_accepted_connections_total counter\n");
         for (i, &accepted) in pc.accepted.iter().enumerate() {
-            let _ = writeln!(out, "pylon_accepted_connections_total{{worker=\"{i}\"}} {accepted}");
+            let _ = writeln!(
+                out,
+                "pylon_accepted_connections_total{{worker=\"{i}\"}} {accepted}"
+            );
         }
 
         out.push_str("# HELP pylon_codel_dropped_total Frames dropped by CoDel staleness check per worker (cumulative)\n");
@@ -139,7 +164,9 @@ pub fn encode(snapshot: &MetricsSnapshot) -> String {
         let ok = wh.delivered_ok.load(Ordering::Relaxed);
         let failed = wh.delivered_failed.load(Ordering::Relaxed);
 
-        out.push_str("# HELP pylon_webhook_enqueued_total Total webhook events successfully enqueued\n");
+        out.push_str(
+            "# HELP pylon_webhook_enqueued_total Total webhook events successfully enqueued\n",
+        );
         out.push_str("# TYPE pylon_webhook_enqueued_total counter\n");
         let _ = writeln!(out, "pylon_webhook_enqueued_total {enqueued}");
 
@@ -150,7 +177,10 @@ pub fn encode(snapshot: &MetricsSnapshot) -> String {
         out.push_str("# HELP pylon_webhook_delivered_total Total webhook deliveries by outcome\n");
         out.push_str("# TYPE pylon_webhook_delivered_total counter\n");
         let _ = writeln!(out, "pylon_webhook_delivered_total{{status=\"ok\"}} {ok}");
-        let _ = writeln!(out, "pylon_webhook_delivered_total{{status=\"failed\"}} {failed}");
+        let _ = writeln!(
+            out,
+            "pylon_webhook_delivered_total{{status=\"failed\"}} {failed}"
+        );
 
         // Queue depth gauge: max_capacity − remaining permits, computed by the
         // handler from `WebhookHandle::queue_depth()` (it holds the Sender).
@@ -165,13 +195,19 @@ pub fn encode(snapshot: &MetricsSnapshot) -> String {
     if let Some(ref cm) = snapshot.cluster {
         use std::sync::atomic::Ordering;
         let dropped = cm.cmd_dropped.load(Ordering::Relaxed);
-        let connected = if cm.redis_connected.load(Ordering::Relaxed) { 1u64 } else { 0u64 };
+        let connected = if cm.redis_connected.load(Ordering::Relaxed) {
+            1u64
+        } else {
+            0u64
+        };
 
         out.push_str("# HELP pylon_cluster_cmd_dropped_total Total ClusterCmds dropped on a full bridge channel\n");
         out.push_str("# TYPE pylon_cluster_cmd_dropped_total counter\n");
         let _ = writeln!(out, "pylon_cluster_cmd_dropped_total {dropped}");
 
-        out.push_str("# HELP pylon_redis_connected Redis connection health (1=connected, 0=error)\n");
+        out.push_str(
+            "# HELP pylon_redis_connected Redis connection health (1=connected, 0=error)\n",
+        );
         out.push_str("# TYPE pylon_redis_connected gauge\n");
         let _ = writeln!(out, "pylon_redis_connected {connected}");
     }
@@ -191,7 +227,14 @@ pub async fn get_metrics(State(state): State<AppState>) -> impl IntoResponse {
         let summaries = state.adapter.channels(&app_id, None).await;
         let channels_occupied = summaries.iter().filter(|s| s.occupied).count() as u64;
         let subscriptions: u64 = summaries.iter().map(|s| s.subscription_count as u64).sum();
-        apps.insert(app_id, AppMetrics { connections, channels_occupied, subscriptions });
+        apps.insert(
+            app_id,
+            AppMetrics {
+                connections,
+                channels_occupied,
+                subscriptions,
+            },
+        );
     }
 
     let saturation = state.saturated.as_ref().map(|s| s.load(Ordering::Relaxed));
@@ -205,7 +248,14 @@ pub async fn get_metrics(State(state): State<AppState>) -> impl IntoResponse {
     // Phase-2 B3: cluster metrics (Some on Redis path, None on local path).
     let cluster = state.cluster_metrics.clone();
 
-    let body = encode(&MetricsSnapshot { apps, saturation, percore, webhook, webhook_queue_depth, cluster });
+    let body = encode(&MetricsSnapshot {
+        apps,
+        saturation,
+        percore,
+        webhook,
+        webhook_queue_depth,
+        cluster,
+    });
 
     let mut response = axum::response::Response::new(axum::body::Body::from(body));
     response.headers_mut().insert(
@@ -219,14 +269,29 @@ pub async fn get_metrics(State(state): State<AppState>) -> impl IntoResponse {
 mod tests {
     use super::*;
 
-    fn snapshot_with_one_app(app_id: &str, conns: u64, channels: u64, subs: u64) -> MetricsSnapshot {
+    fn snapshot_with_one_app(
+        app_id: &str,
+        conns: u64,
+        channels: u64,
+        subs: u64,
+    ) -> MetricsSnapshot {
         let mut apps = HashMap::new();
-        apps.insert(app_id.to_string(), AppMetrics {
-            connections: conns,
-            channels_occupied: channels,
-            subscriptions: subs,
-        });
-        MetricsSnapshot { apps, saturation: None, percore: None, webhook: None, webhook_queue_depth: None, cluster: None }
+        apps.insert(
+            app_id.to_string(),
+            AppMetrics {
+                connections: conns,
+                channels_occupied: channels,
+                subscriptions: subs,
+            },
+        );
+        MetricsSnapshot {
+            apps,
+            saturation: None,
+            percore: None,
+            webhook: None,
+            webhook_queue_depth: None,
+            cluster: None,
+        }
     }
 
     #[test]
@@ -234,7 +299,10 @@ mod tests {
         let s = snapshot_with_one_app("app1", 0, 0, 0);
         let text = encode(&s);
         assert!(text.contains("# HELP pylon_up "), "missing HELP pylon_up");
-        assert!(text.contains("# TYPE pylon_up gauge"), "missing TYPE pylon_up");
+        assert!(
+            text.contains("# TYPE pylon_up gauge"),
+            "missing TYPE pylon_up"
+        );
         assert!(text.contains("pylon_up 1\n"), "missing pylon_up 1");
     }
 
@@ -242,11 +310,26 @@ mod tests {
     fn encode_per_app_metrics() {
         let s = snapshot_with_one_app("myapp", 42, 7, 15);
         let text = encode(&s);
-        assert!(text.contains("pylon_connections{app=\"myapp\"} 42\n"), "connections missing: {text}");
-        assert!(text.contains("pylon_channels_occupied{app=\"myapp\"} 7\n"), "channels missing: {text}");
-        assert!(text.contains("pylon_subscriptions{app=\"myapp\"} 15\n"), "subscriptions missing: {text}");
-        assert!(text.contains("# HELP pylon_connections "), "missing HELP connections");
-        assert!(text.contains("# TYPE pylon_connections gauge"), "missing TYPE connections");
+        assert!(
+            text.contains("pylon_connections{app=\"myapp\"} 42\n"),
+            "connections missing: {text}"
+        );
+        assert!(
+            text.contains("pylon_channels_occupied{app=\"myapp\"} 7\n"),
+            "channels missing: {text}"
+        );
+        assert!(
+            text.contains("pylon_subscriptions{app=\"myapp\"} 15\n"),
+            "subscriptions missing: {text}"
+        );
+        assert!(
+            text.contains("# HELP pylon_connections "),
+            "missing HELP connections"
+        );
+        assert!(
+            text.contains("# TYPE pylon_connections gauge"),
+            "missing TYPE connections"
+        );
     }
 
     #[test]
@@ -260,7 +343,10 @@ mod tests {
             cluster: None,
         };
         let text = encode(&s);
-        assert!(text.contains("pylon_saturation_flag 1\n"), "saturation flag missing: {text}");
+        assert!(
+            text.contains("pylon_saturation_flag 1\n"),
+            "saturation flag missing: {text}"
+        );
 
         let s2 = MetricsSnapshot {
             apps: HashMap::new(),
@@ -271,7 +357,10 @@ mod tests {
             cluster: None,
         };
         let text2 = encode(&s2);
-        assert!(text2.contains("pylon_saturation_flag 0\n"), "saturation=0 missing: {text2}");
+        assert!(
+            text2.contains("pylon_saturation_flag 0\n"),
+            "saturation=0 missing: {text2}"
+        );
     }
 
     #[test]
@@ -285,7 +374,10 @@ mod tests {
             cluster: None,
         };
         let text = encode(&s);
-        assert!(!text.contains("pylon_saturation_flag"), "saturation flag must be absent: {text}");
+        assert!(
+            !text.contains("pylon_saturation_flag"),
+            "saturation flag must be absent: {text}"
+        );
     }
 
     #[test]
@@ -322,15 +414,45 @@ mod tests {
             cluster: None,
         };
         let text = encode(&s);
-        assert!(text.contains("pylon_inflight_bytes{worker=\"0\"} 100\n"), "worker 0 inflight: {text}");
-        assert!(text.contains("pylon_inflight_bytes{worker=\"1\"} 200\n"), "worker 1 inflight: {text}");
-        assert!(text.contains("pylon_broadcast_dropped_total{worker=\"0\"} 5\n"), "worker 0 dropped: {text}");
-        assert!(text.contains("pylon_broadcast_dropped_total{worker=\"1\"} 3\n"), "worker 1 dropped: {text}");
-        assert!(text.contains("pylon_inflight_bytes_sum 300\n"), "inflight_total: {text}");
-        assert!(text.contains("pylon_budget_factor 0.900\n"), "budget_factor: {text}");
-        assert!(text.contains(&format!("pylon_worker_budget_bytes {}\n", 1024 * 1024 * 512)), "budget_bytes: {text}");
-        assert!(text.contains("# TYPE pylon_broadcast_dropped_total counter"), "type counter: {text}");
-        assert!(text.contains("# TYPE pylon_inflight_bytes gauge"), "type gauge: {text}");
+        assert!(
+            text.contains("pylon_inflight_bytes{worker=\"0\"} 100\n"),
+            "worker 0 inflight: {text}"
+        );
+        assert!(
+            text.contains("pylon_inflight_bytes{worker=\"1\"} 200\n"),
+            "worker 1 inflight: {text}"
+        );
+        assert!(
+            text.contains("pylon_broadcast_dropped_total{worker=\"0\"} 5\n"),
+            "worker 0 dropped: {text}"
+        );
+        assert!(
+            text.contains("pylon_broadcast_dropped_total{worker=\"1\"} 3\n"),
+            "worker 1 dropped: {text}"
+        );
+        assert!(
+            text.contains("pylon_inflight_bytes_sum 300\n"),
+            "inflight_total: {text}"
+        );
+        assert!(
+            text.contains("pylon_budget_factor 0.900\n"),
+            "budget_factor: {text}"
+        );
+        assert!(
+            text.contains(&format!(
+                "pylon_worker_budget_bytes {}\n",
+                1024 * 1024 * 512
+            )),
+            "budget_bytes: {text}"
+        );
+        assert!(
+            text.contains("# TYPE pylon_broadcast_dropped_total counter"),
+            "type counter: {text}"
+        );
+        assert!(
+            text.contains("# TYPE pylon_inflight_bytes gauge"),
+            "type gauge: {text}"
+        );
     }
 
     #[test]
@@ -344,8 +466,14 @@ mod tests {
             cluster: None,
         };
         let text = encode(&s);
-        assert!(!text.contains("pylon_inflight_bytes"), "percore must be absent: {text}");
-        assert!(!text.contains("pylon_broadcast_dropped_total"), "percore must be absent: {text}");
+        assert!(
+            !text.contains("pylon_inflight_bytes"),
+            "percore must be absent: {text}"
+        );
+        assert!(
+            !text.contains("pylon_broadcast_dropped_total"),
+            "percore must be absent: {text}"
+        );
     }
 
     #[test]
@@ -380,12 +508,30 @@ mod tests {
             cluster: None,
         };
         let text = encode(&s);
-        assert!(text.contains("pylon_accepted_connections_total{worker=\"0\"} 42\n"), "accepted w0: {text}");
-        assert!(text.contains("pylon_accepted_connections_total{worker=\"1\"} 17\n"), "accepted w1: {text}");
-        assert!(text.contains("pylon_codel_dropped_total{worker=\"0\"} 3\n"), "codel_dropped w0: {text}");
-        assert!(text.contains("pylon_codel_dropped_total{worker=\"1\"} 0\n"), "codel_dropped w1: {text}");
-        assert!(text.contains("# TYPE pylon_accepted_connections_total counter"), "type counter accepted: {text}");
-        assert!(text.contains("# TYPE pylon_codel_dropped_total counter"), "type counter codel: {text}");
+        assert!(
+            text.contains("pylon_accepted_connections_total{worker=\"0\"} 42\n"),
+            "accepted w0: {text}"
+        );
+        assert!(
+            text.contains("pylon_accepted_connections_total{worker=\"1\"} 17\n"),
+            "accepted w1: {text}"
+        );
+        assert!(
+            text.contains("pylon_codel_dropped_total{worker=\"0\"} 3\n"),
+            "codel_dropped w0: {text}"
+        );
+        assert!(
+            text.contains("pylon_codel_dropped_total{worker=\"1\"} 0\n"),
+            "codel_dropped w1: {text}"
+        );
+        assert!(
+            text.contains("# TYPE pylon_accepted_connections_total counter"),
+            "type counter accepted: {text}"
+        );
+        assert!(
+            text.contains("# TYPE pylon_codel_dropped_total counter"),
+            "type counter codel: {text}"
+        );
     }
 
     #[test]
@@ -406,13 +552,34 @@ mod tests {
             cluster: None,
         };
         let text = encode(&s);
-        assert!(text.contains("pylon_webhook_enqueued_total 10\n"), "enqueued: {text}");
-        assert!(text.contains("pylon_webhook_dropped_total 2\n"), "dropped: {text}");
-        assert!(text.contains("pylon_webhook_delivered_total{status=\"ok\"} 7\n"), "ok: {text}");
-        assert!(text.contains("pylon_webhook_delivered_total{status=\"failed\"} 1\n"), "failed: {text}");
-        assert!(text.contains("pylon_webhook_queue_depth 3\n"), "queue_depth: {text}");
-        assert!(text.contains("# TYPE pylon_webhook_enqueued_total counter"), "type enqueued: {text}");
-        assert!(text.contains("# TYPE pylon_webhook_delivered_total counter"), "type delivered: {text}");
+        assert!(
+            text.contains("pylon_webhook_enqueued_total 10\n"),
+            "enqueued: {text}"
+        );
+        assert!(
+            text.contains("pylon_webhook_dropped_total 2\n"),
+            "dropped: {text}"
+        );
+        assert!(
+            text.contains("pylon_webhook_delivered_total{status=\"ok\"} 7\n"),
+            "ok: {text}"
+        );
+        assert!(
+            text.contains("pylon_webhook_delivered_total{status=\"failed\"} 1\n"),
+            "failed: {text}"
+        );
+        assert!(
+            text.contains("pylon_webhook_queue_depth 3\n"),
+            "queue_depth: {text}"
+        );
+        assert!(
+            text.contains("# TYPE pylon_webhook_enqueued_total counter"),
+            "type enqueued: {text}"
+        );
+        assert!(
+            text.contains("# TYPE pylon_webhook_delivered_total counter"),
+            "type delivered: {text}"
+        );
     }
 
     #[test]
@@ -426,8 +593,14 @@ mod tests {
             cluster: None,
         };
         let text = encode(&s);
-        assert!(!text.contains("pylon_webhook_enqueued_total"), "webhook must be absent: {text}");
-        assert!(!text.contains("pylon_webhook_queue_depth"), "queue_depth must be absent: {text}");
+        assert!(
+            !text.contains("pylon_webhook_enqueued_total"),
+            "webhook must be absent: {text}"
+        );
+        assert!(
+            !text.contains("pylon_webhook_queue_depth"),
+            "queue_depth must be absent: {text}"
+        );
     }
 
     #[test]
@@ -446,10 +619,22 @@ mod tests {
             cluster: Some(cm),
         };
         let text = encode(&s);
-        assert!(text.contains("pylon_cluster_cmd_dropped_total 5\n"), "cmd_dropped: {text}");
-        assert!(text.contains("pylon_redis_connected 1\n"), "redis_connected 1: {text}");
-        assert!(text.contains("# TYPE pylon_cluster_cmd_dropped_total counter"), "type counter cluster: {text}");
-        assert!(text.contains("# TYPE pylon_redis_connected gauge"), "type gauge redis: {text}");
+        assert!(
+            text.contains("pylon_cluster_cmd_dropped_total 5\n"),
+            "cmd_dropped: {text}"
+        );
+        assert!(
+            text.contains("pylon_redis_connected 1\n"),
+            "redis_connected 1: {text}"
+        );
+        assert!(
+            text.contains("# TYPE pylon_cluster_cmd_dropped_total counter"),
+            "type counter cluster: {text}"
+        );
+        assert!(
+            text.contains("# TYPE pylon_redis_connected gauge"),
+            "type gauge redis: {text}"
+        );
     }
 
     #[test]
@@ -463,7 +648,13 @@ mod tests {
             cluster: None,
         };
         let text = encode(&s);
-        assert!(!text.contains("pylon_cluster_cmd_dropped_total"), "cluster must be absent: {text}");
-        assert!(!text.contains("pylon_redis_connected"), "redis_connected must be absent: {text}");
+        assert!(
+            !text.contains("pylon_cluster_cmd_dropped_total"),
+            "cluster must be absent: {text}"
+        );
+        assert!(
+            !text.contains("pylon_redis_connected"),
+            "redis_connected must be absent: {text}"
+        );
     }
 }

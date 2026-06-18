@@ -49,12 +49,11 @@ pub fn load_server_config(
     // ── 2. Load the certificate chain ────────────────────────────────────────
     let cert_file = File::open(cert_path)
         .with_context(|| format!("PYLON_TLS_CERT: cannot open certificate file '{cert_path}'"))?;
-    let certs: Vec<CertificateDer<'static>> =
-        rustls_pemfile::certs(&mut BufReader::new(cert_file))
-            .collect::<Result<Vec<_>, _>>()
-            .with_context(|| {
-                format!("PYLON_TLS_CERT: failed to parse PEM certificates from '{cert_path}'")
-            })?;
+    let certs: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut BufReader::new(cert_file))
+        .collect::<Result<Vec<_>, _>>()
+        .with_context(|| {
+            format!("PYLON_TLS_CERT: failed to parse PEM certificates from '{cert_path}'")
+        })?;
     if certs.is_empty() {
         return Err(anyhow!(
             "PYLON_TLS_CERT: no certificates found in '{cert_path}'"
@@ -64,12 +63,11 @@ pub fn load_server_config(
     // ── 3. Load the private key ───────────────────────────────────────────────
     let key_file = File::open(key_path)
         .with_context(|| format!("PYLON_TLS_KEY: cannot open private key file '{key_path}'"))?;
-    let key: PrivateKeyDer<'static> =
-        rustls_pemfile::private_key(&mut BufReader::new(key_file))
-            .with_context(|| {
-                format!("PYLON_TLS_KEY: failed to parse PEM private key from '{key_path}'")
-            })?
-            .ok_or_else(|| anyhow!("PYLON_TLS_KEY: no private key found in '{key_path}'"))?;
+    let key: PrivateKeyDer<'static> = rustls_pemfile::private_key(&mut BufReader::new(key_file))
+        .with_context(|| {
+            format!("PYLON_TLS_KEY: failed to parse PEM private key from '{key_path}'")
+        })?
+        .ok_or_else(|| anyhow!("PYLON_TLS_KEY: no private key found in '{key_path}'"))?;
 
     // ── 4. mTLS path: require + verify client certificates ───────────────────
     if let Some(ca) = ca_path {
@@ -88,21 +86,16 @@ pub fn load_server_config(
             added += 1;
         }
         if added == 0 {
-            return Err(anyhow!(
-                "PYLON_TLS_CA: no CA certificates found in '{ca}'"
-            ));
+            return Err(anyhow!("PYLON_TLS_CA: no CA certificates found in '{ca}'"));
         }
 
         // 4b. Build a WebPkiClientVerifier that REQUIRES a valid client cert.
         //     `builder(roots)` uses the process-default CryptoProvider (ring,
         //     installed above). The `std` feature (already enabled) is sufficient —
         //     no extra rustls feature flag is needed for WebPkiClientVerifier.
-        let verifier =
-            rustls::server::WebPkiClientVerifier::builder(Arc::new(roots))
-                .build()
-                .map_err(|e| {
-                    anyhow!("PYLON_TLS_CA: failed to build client-cert verifier: {e}")
-                })?;
+        let verifier = rustls::server::WebPkiClientVerifier::builder(Arc::new(roots))
+            .build()
+            .map_err(|e| anyhow!("PYLON_TLS_CA: failed to build client-cert verifier: {e}"))?;
 
         // 4c. Build the ServerConfig with mTLS client-cert verification.
         let config = RustlsServerConfig::builder()
@@ -123,9 +116,7 @@ pub fn load_server_config(
         .with_no_client_auth()
         .with_single_cert(certs, key)
         .with_context(|| {
-            format!(
-                "failed to build rustls ServerConfig from cert='{cert_path}' key='{key_path}'"
-            )
+            format!("failed to build rustls ServerConfig from cert='{cert_path}' key='{key_path}'")
         })?;
 
     Ok(Arc::new(config))
@@ -249,7 +240,10 @@ mod tests {
         let _ = std::fs::remove_file(&cert_path);
         let _ = std::fs::remove_file(&key_path);
 
-        assert!(result.is_ok(), "expected Ok(Arc<ServerConfig>), got: {result:?}");
+        assert!(
+            result.is_ok(),
+            "expected Ok(Arc<ServerConfig>), got: {result:?}"
+        );
         // The returned Arc should be usable (non-trivial sanity check: it's not null).
         let _ = result.unwrap();
     }
@@ -283,7 +277,10 @@ mod tests {
         let _ = std::fs::remove_file(&key_path);
 
         assert!(result.is_ok(), "expected Ok(Some(…)), got: {result:?}");
-        assert!(result.unwrap().is_some(), "expected Some(Arc<ServerConfig>)");
+        assert!(
+            result.unwrap().is_some(),
+            "expected Some(Arc<ServerConfig>)"
+        );
     }
 
     // ── mTLS helpers ──────────────────────────────────────────────────────────
@@ -305,8 +302,8 @@ mod tests {
 
         // CA key + cert
         let ca_key = KeyPair::generate().expect("rcgen: CA key");
-        let mut ca_params = CertificateParams::new(vec!["pylon-test-ca".to_string()])
-            .expect("rcgen: CA params");
+        let mut ca_params =
+            CertificateParams::new(vec!["pylon-test-ca".to_string()]).expect("rcgen: CA params");
         ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
         let ca_cert = ca_params
             .self_signed(&ca_key)
@@ -321,11 +318,7 @@ mod tests {
             .signed_by(&server_key, &ca_cert, &ca_key)
             .expect("rcgen: server cert signed by CA");
 
-        (
-            ca_cert.pem(),
-            server_cert.pem(),
-            server_key.serialize_pem(),
-        )
+        (ca_cert.pem(), server_cert.pem(), server_key.serialize_pem())
     }
 
     // ── mTLS tests ────────────────────────────────────────────────────────────
