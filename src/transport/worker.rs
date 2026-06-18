@@ -384,11 +384,15 @@ pub fn run(mut cfg: WorkerConfig, shutdown: Arc<AtomicBool>) -> std::io::Result<
                 //    SO_REUSEPORT listener from the poll. The broadcast/mailbox
                 //    waker registration stays so we keep flushing.
                 let _ = poll.registry().deregister(&mut listener);
-                // 2. Queue a WS Close(1001 "going away") on every open connection.
+                // 2. Queue a `pusher:error` 4200 text frame + WS Close(4200) on
+                //    every open connection. pusher-js reads code 4200 as "reconnect
+                //    immediately" → the LB routes the client to a surviving node on
+                //    a rolling restart (vs code 1001 which triggers backoff).
                 //    Collect keys first to avoid aliasing `conns` while iterating.
                 let keys: Vec<usize> = conns.iter().map(|(k, _)| k).collect();
                 for k in keys {
-                    send_close(&poll, &mut conns, k, now_ns, 1001, "Server shutting down");
+                    queue_shutdown_error(&mut conns, k, now_ns);
+                    send_close_4200(&poll, &mut conns, k, now_ns);
                     // INCREMENTAL INFLIGHT: mirror the 4201 path (lines ~668-674).
                     // The Close frame may not flush synchronously (backpressured
                     // client). Without this fold, `inflight_bytes` stays 0 and the
@@ -758,6 +762,65 @@ fn send_close_4201(poll: &Poll, conns: &mut slab::Slab<Entry>, key: usize, now_n
         4201,
         "Pong reply not received: ping was sent to the client, but no reply was received",
     );
+}
+
+/// C2a drain: send a WebSocket Close frame with code `4200` (Pusher
+/// "reconnect immediately") with the canonical shutdown reason text.
+/// pusher-js reads 4200 and reconnects to the LB immediately — this minimises
+/// client disruption on a rolling restart compared to the 1001 generic-gone-away.
+/// The caller is responsible for the subsequent `fold_delta` + eventual `remove`.
+fn send_close_4200(poll: &Poll, conns: &mut slab::Slab<Entry>, key: usize, now_ns: u64) {
+    send_close(
+        poll,
+        conns,
+        key,
+        now_ns,
+        4200,
+        "Server is shutting down; please reconnect",
+    );
+}
+
+/// C2a drain: queue a `pusher:error` 4200 text frame onto `key`'s out-queue
+/// BEFORE the Close frame. This is the belt-and-suspenders convention from
+/// Soketi (which does `ws.end(4200)` after sending the `pusher:error` event).
+/// The frame payload matches the Pusher v7 wire format for connection-level
+/// errors: `{"event":"pusher:error","data":{"code":4200,"message":"…"}}`.
+///
+/// If the connection no longer exists or has no session this is a no-op: the
+/// Close frame alone (code 4200 in the WS Close payload) is sufficient for
+/// pusher-js to recognise the reconnect-immediately signal.
+fn queue_shutdown_error(conns: &mut slab::Slab<Entry>, key: usize, now_ns: u64) {
+    let Some(entry) = conns.get_mut(key) else {
+        return;
+    };
+    // Build the pusher:error 4200 text frame. Use the session codec when
+    // present (so encoding is consistent with every other server event),
+    // fall back to the same raw-JSON form used by `queue_reject` when no
+    // codec has been negotiated yet (connection still handshaking).
+    let text = if let Some(session) = entry.session.as_ref() {
+        session
+            .codec
+            .encode(&ServerEvent::Error(crate::protocol::error::PusherError::new(
+                4200,
+                "Server is shutting down; please reconnect",
+            )))
+    } else {
+        // No codec yet (connection in handshaking state): hand-build the
+        // raw JSON that the v7 codec would have produced. The data field is
+        // a plain JSON object (not double-encoded) — matching `queue_reject`.
+        serde_json::json!({
+            "event": "pusher:error",
+            "data": { "code": 4200_u16, "message": "Server is shutting down; please reconnect" }
+        })
+        .to_string()
+    };
+    let mut out = BytesMut::new();
+    frame::encode_text(&mut out, text.as_bytes());
+    let _ = entry
+        .conn
+        .queue(Arc::from(out.to_vec().into_boxed_slice()), now_ns);
+    // No explicit flush here: the caller queues the Close frame next, and
+    // `send_close` calls `flush_and_arm` which flushes both frames together.
 }
 
 /// Outcome of handling a connection event: keep it, close it, or hand it off to

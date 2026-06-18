@@ -2,8 +2,9 @@
 //!
 //! Verifies that when the shutdown flag is set on a percore worker:
 //!
-//!   (a) Every connected WS client receives a WS **Close** frame (opcode close;
-//!       we assert the code is 1001 "going away").
+//!   (a) Every connected WS client receives a `pusher:error` Text frame with
+//!       code 4200 followed by a WS **Close** frame with close code 4200
+//!       ("reconnect immediately" — Pusher's rolling-restart signal).
 //!   (b) The app's per-app `conn_counts` entry returns to 0 (all `on_close` /
 //!       `remove` paths ran and decremented the counter).
 //!
@@ -177,23 +178,65 @@ async fn subscribe(ws: &mut Ws, channel: &str) {
     }
 }
 
-/// Wait for the WS Close frame on `ws` and return its numeric close code (1001
-/// expected). Returns `None` if the stream ends without a Close frame.
-async fn wait_close(ws: &mut Ws) -> Option<u16> {
+/// The result of waiting for the graceful-drain sequence on a client:
+/// the `pusher:error` event (if any) that arrived before the Close, and the
+/// WS close code.
+struct DrainClose {
+    /// The close code from the WS Close frame (None if the stream ended
+    /// without a Close frame).
+    code: Option<u16>,
+    /// True if a `pusher:error` Text frame with `data.code == 4200` arrived
+    /// immediately before the Close frame (belt-and-suspenders Soketi convention).
+    had_pusher_error_4200: bool,
+}
+
+/// Wait for the graceful-drain sequence on `ws`: an optional `pusher:error`
+/// 4200 Text frame followed by the WS Close frame. Returns a [`DrainClose`]
+/// with the close code and whether the `pusher:error` 4200 event was seen.
+async fn wait_close(ws: &mut Ws) -> DrainClose {
+    let mut had_pusher_error_4200 = false;
     loop {
         match ws.next().await {
-            Some(Ok(Message::Close(Some(cf)))) => return Some(u16::from(cf.code)),
-            Some(Ok(Message::Close(None))) | None => return None,
+            Some(Ok(Message::Close(Some(cf)))) => {
+                return DrainClose {
+                    code: Some(u16::from(cf.code)),
+                    had_pusher_error_4200,
+                }
+            }
+            Some(Ok(Message::Close(None))) | None => {
+                return DrainClose {
+                    code: None,
+                    had_pusher_error_4200,
+                }
+            }
+            Some(Ok(Message::Text(t))) => {
+                // Check if this is the pusher:error 4200 frame that precedes
+                // the Close on a graceful drain.
+                if let Ok(v) = serde_json::from_str::<Value>(&t) {
+                    if v["event"] == "pusher:error" {
+                        let code = v["data"]["code"].as_u64().unwrap_or(0);
+                        if code == 4200 {
+                            had_pusher_error_4200 = true;
+                        }
+                    }
+                }
+            }
             Some(Ok(_)) => {} // ignore other frames while draining
-            Some(Err(_)) => return None,
+            Some(Err(_)) => {
+                return DrainClose {
+                    code: None,
+                    had_pusher_error_4200,
+                }
+            }
         }
     }
 }
 
 /// Main drain test: connect 3 clients, subscribe them, trigger graceful
-/// shutdown, assert each receives Close(1001) and conn_counts returns to 0.
+/// shutdown, assert each receives a `pusher:error` 4200 event followed by
+/// Close(4200), and that conn_counts returns to 0.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn graceful_drain_sends_close_1001_and_cleans_up() {
+async fn graceful_drain_sends_pusher_error_4200_and_close_4200() {
     let _lock = HARNESS_LOCK.lock().await;
     const N: usize = 3;
     // A 2-second grace window: plenty to flush a tiny Close frame, tight enough
@@ -220,27 +263,34 @@ async fn graceful_drain_sends_close_1001_and_cleans_up() {
     }
 
     // Trigger the graceful shutdown. Workers will: deregister the listener, queue
-    // Close(1001) on every open connection, flush, then call remove() on each.
+    // pusher:error(4200) + Close(4200) on every open connection, flush, then call
+    // remove() on each.
     h.shutdown.store(true, Ordering::SeqCst);
 
-    // Each client must receive a WS Close frame within the grace window + slack.
+    // Each client must receive the drain sequence within the grace window + slack.
     let wall = Duration::from_secs(5);
-    let close_codes = tokio::time::timeout(wall, async {
-        let mut codes = Vec::with_capacity(N);
+    let results = tokio::time::timeout(wall, async {
+        let mut results = Vec::with_capacity(N);
         for mut ws in clients {
-            codes.push(wait_close(&mut ws).await);
+            results.push(wait_close(&mut ws).await);
         }
-        codes
+        results
     })
     .await
     .expect("all clients should receive Close frames within 5s");
 
-    // (a) Every client got a Close frame with code 1001.
-    for (i, code) in close_codes.iter().enumerate() {
+    // (a) Every client got a Close frame with code 4200 (Pusher "reconnect
+    // immediately"), preceded by a pusher:error 4200 text event.
+    for (i, result) in results.iter().enumerate() {
         assert_eq!(
-            *code,
-            Some(1001),
-            "client {i} should have received Close(1001), got {code:?}"
+            result.code,
+            Some(4200),
+            "client {i} should have received Close(4200), got {:?}",
+            result.code
+        );
+        assert!(
+            result.had_pusher_error_4200,
+            "client {i} should have received pusher:error(4200) before the Close frame"
         );
     }
 
