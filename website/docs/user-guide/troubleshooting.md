@@ -48,14 +48,14 @@ open connection — they do not close the socket.
     ```js
     const pusher = new Pusher('YOUR_APP_KEY', {
       wsHost: 'your-pylon-host',
-      wsPort: 6001,
+      wsPort: 7000,
       forceTLS: false,      // or true if TLS is in use
       enabledTransports: ['ws'],
       cluster: '',          // must be empty or omitted when using wsHost
     });
     ```
 
-4. **Firewall** — ensure port `PYLON_PORT` (default `6001`) is reachable from
+4. **Firewall** — ensure port `PYLON_PORT` (default `7000`) is reachable from
    the client network.
 
 ---

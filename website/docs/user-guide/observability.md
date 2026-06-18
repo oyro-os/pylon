@@ -1,7 +1,7 @@
 # Observability
 
 Pylon exposes Prometheus metrics, a liveness probe, and a readiness probe on the
-same HTTP port as the REST API (`PYLON_PORT`, default 6001).
+same HTTP port as the REST API (`PYLON_PORT`, default 7000).
 
 ---
 
@@ -11,7 +11,7 @@ Returns a Prometheus text-format (v0.0.4) snapshot. The endpoint is
 unauthenticated by design — restrict access at the network layer if needed.
 
 ```bash
-curl http://localhost:6001/metrics
+curl http://localhost:7000/metrics
 ```
 
 ### Metrics Reference
@@ -74,13 +74,13 @@ scrape_configs:
   - job_name: pylon
     static_configs:
       - targets:
-          - "pylon-host-1:6001"
-          - "pylon-host-2:6001"
+          - "pylon-host-1:7000"
+          - "pylon-host-2:7000"
     # No auth needed; restrict at network layer instead.
 ```
 
 For Kubernetes, use a `ServiceMonitor` (Prometheus Operator) pointing at port
-`6001` with path `/metrics`.
+`7000` with path `/metrics`.
 
 ---
 
@@ -109,7 +109,7 @@ Always returns `200 ok` as long as the process can handle HTTP requests. Use
 this as a **liveness probe**: if it fails, restart the container.
 
 ```bash
-curl -f http://localhost:6001/health
+curl -f http://localhost:7000/health
 ```
 
 Kubernetes liveness probe:
@@ -118,7 +118,7 @@ Kubernetes liveness probe:
 livenessProbe:
   httpGet:
     path: /health
-    port: 6001
+    port: 7000
   initialDelaySeconds: 5
   periodSeconds: 10
 ```
@@ -140,7 +140,7 @@ sending new connections to a node when it returns non-200, which is exactly what
 you want during a [graceful restart](production-tuning.md#graceful-restart).
 
 ```bash
-curl -f http://localhost:6001/ready
+curl -f http://localhost:7000/ready
 ```
 
 Kubernetes readiness probe:
@@ -149,7 +149,7 @@ Kubernetes readiness probe:
 readinessProbe:
   httpGet:
     path: /ready
-    port: 6001
+    port: 7000
   initialDelaySeconds: 3
   periodSeconds: 5
   failureThreshold: 2

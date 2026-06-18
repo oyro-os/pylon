@@ -141,8 +141,8 @@ Override the budget with environment variables:
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `PYLON_MEMORY_BUDGET_MB` | auto (host/cgroup) | Total budget across all workers (MiB) |
-| `PYLON_MEMORY_BUDGET_BYTES` | — | Same, in bytes (takes precedence) |
+| `PYLON_MEMORY_BUDGET_FRACTION` | auto | Budget as a fraction of effective (host/cgroup) memory, range 0.0–1.0; if `PYLON_MEMORY_BUDGET_BYTES` is also set it takes precedence |
+| `PYLON_MEMORY_BUDGET_BYTES` | — | Total budget across all workers in bytes (takes precedence over `PYLON_MEMORY_BUDGET_FRACTION`) |
 
 When a worker's inflight queue approaches its budget, pylon applies backpressure
 and the `pylon_budget_factor` metric drops toward 0.
@@ -174,7 +174,7 @@ Pylon supports zero-dropped-message restarts when used with a process manager:
    traffic here.
 4. Existing connections are closed with Pusher close code **4200** ("server
    restarting — reconnect immediately") within `PYLON_SHUTDOWN_GRACE_MS`
-   milliseconds (default: 5 000 ms).
+   milliseconds (default: 10 000 ms).
 5. The process exits cleanly; the process manager starts the new binary.
 
 ```bash
