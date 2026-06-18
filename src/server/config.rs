@@ -85,6 +85,17 @@ pub struct ServerConfig {
     /// PSI `full avg10` threshold (percent) above which the budget factor is
     /// shrunk. `PYLON_PSI_THRESHOLD` (default 15.0).
     pub psi_threshold: f64,
+    /// C2a: how long (ms) each percore worker waits for in-flight connections to
+    /// drain before force-closing. After `shutdown` is set workers queue a WS
+    /// Close(1001) on every open connection, then keep flushing until
+    /// `inflight_bytes == 0` OR this deadline passes, then clean up and exit.
+    /// `PYLON_SHUTDOWN_GRACE_MS` (default `10000`).
+    pub shutdown_grace_ms: u64,
+    /// C2a: how long (ms) to wait after setting `draining=true` (→ `/ready` 503)
+    /// before setting `shutdown=true` (→ workers begin their bounded drain). Gives
+    /// load balancers time to observe `/ready`=503 and stop sending new traffic.
+    /// `PYLON_SHUTDOWN_PREDRAIN_MS` (default `2000`).
+    pub shutdown_predrain_ms: u64,
 }
 
 impl Default for ServerConfig {
@@ -134,6 +145,8 @@ impl Default for ServerConfig {
             codel_interval_ms: 100,
             psi_backstop: None,
             psi_threshold: 15.0,
+            shutdown_grace_ms: 10_000,
+            shutdown_predrain_ms: 2_000,
         }
     }
 }
@@ -345,6 +358,16 @@ impl ServerConfig {
                 c.psi_threshold = p;
             }
         }
+        if let Ok(v) = std::env::var("PYLON_SHUTDOWN_GRACE_MS") {
+            if let Ok(p) = v.parse() {
+                c.shutdown_grace_ms = p;
+            }
+        }
+        if let Ok(v) = std::env::var("PYLON_SHUTDOWN_PREDRAIN_MS") {
+            if let Ok(p) = v.parse() {
+                c.shutdown_predrain_ms = p;
+            }
+        }
         c
     }
 
@@ -451,6 +474,9 @@ mod tests {
         assert_eq!(c.codel_interval_ms, 100);
         assert_eq!(c.psi_backstop, None); // auto
         assert_eq!(c.psi_threshold, 15.0);
+        // C2a graceful-shutdown defaults.
+        assert_eq!(c.shutdown_grace_ms, 10_000);
+        assert_eq!(c.shutdown_predrain_ms, 2_000);
         // codel_params() folds ms → ns with the folly defaults.
         let p = c.codel_params();
         assert_eq!(p.target_ns, 5_000_000);

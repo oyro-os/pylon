@@ -166,6 +166,11 @@ pub struct WorkerConfig {
     /// to draining nothing here (those tests use no sink, so broadcasts route via
     /// the legacy registry mailbox path instead).
     pub broadcast: Option<BroadcastWiring>,
+    /// C2a: maximum milliseconds the drain phase may run before the worker
+    /// force-closes remaining connections and exits. `0` ⇒ no grace (immediate
+    /// close on shutdown, matching the old behaviour). Echo/test workers can set
+    /// this to `0`; production workers get it from `ServerConfig::shutdown_grace_ms`.
+    pub shutdown_grace_ms: u64,
 }
 
 /// The per-worker half of the sharded broadcast plumbing handed to [`run`].
@@ -355,14 +360,69 @@ pub fn run(mut cfg: WorkerConfig, shutdown: Arc<AtomicBool>) -> std::io::Result<
     // spent queued ACROSS iterations (enqueue in iter N, flush in iter N+k).
     let worker_epoch = Instant::now();
 
+    // C2a: graceful-drain state. `drain_started` gates the one-time setup (deregister
+    // listener, queue Close 1001 on all open connections). `drain_deadline` is the
+    // absolute Instant after which we force-close regardless of inflight bytes.
+    let mut drain_started = false;
+    let mut drain_deadline: Option<Instant> = None;
+
     loop {
         if shutdown.load(Ordering::SeqCst) {
-            tracing::debug!(
-                worker = cfg.worker_id,
-                accepted = accepted_total,
-                "percore worker stopping"
-            );
-            return Ok(());
+            // C2a drain phase — runs only on the shutdown path, zero cost otherwise.
+            let now_ns = worker_epoch.elapsed().as_nanos() as u64;
+            if !drain_started {
+                drain_started = true;
+                drain_deadline = if cfg.shutdown_grace_ms > 0 {
+                    Some(Instant::now() + Duration::from_millis(cfg.shutdown_grace_ms))
+                } else {
+                    None // grace_ms == 0 ⇒ immediate exit (old behaviour)
+                };
+                // 1. Stop accepting new connections: deregister this worker's
+                //    SO_REUSEPORT listener from the poll. The broadcast/mailbox
+                //    waker registration stays so we keep flushing.
+                let _ = poll.registry().deregister(&mut listener);
+                // 2. Queue a WS Close(1001 "going away") on every open connection.
+                //    Collect keys first to avoid aliasing `conns` while iterating.
+                let keys: Vec<usize> = conns.iter().map(|(k, _)| k).collect();
+                for k in keys {
+                    send_close(&poll, &mut conns, k, now_ns, 1001, "Server shutting down");
+                }
+                tracing::info!(
+                    worker = cfg.worker_id,
+                    conns = conns.len(),
+                    "percore worker draining"
+                );
+            }
+            // Decide whether the drain is complete: all bytes flushed, deadline
+            // expired, or grace_ms == 0 (immediate mode).
+            let expired = drain_deadline.map_or(true, |d| Instant::now() >= d);
+            if inflight_bytes == 0 || expired {
+                // 3. Final cleanup: run on_close hooks, decrement conn_counts,
+                //    deindex channels, deregister sockets — so per-app counters and
+                //    presence/channel state return to 0.
+                let keys: Vec<usize> = conns.iter().map(|(k, _)| k).collect();
+                for k in keys {
+                    remove(
+                        &poll,
+                        &mut conns,
+                        k,
+                        &mut local_subs,
+                        &mut sid_to_token,
+                        &mut wheel,
+                        &mut inflight_bytes,
+                    );
+                }
+                tracing::debug!(
+                    worker = cfg.worker_id,
+                    accepted = accepted_total,
+                    "percore worker drained, stopping"
+                );
+                return Ok(());
+            }
+            // else: fall through — the rest of the loop polls writable events and
+            // flushes the queued Close frames + any pending out-bytes. The poll
+            // timeout of 0ms (pending_writes is true while inflight_bytes > 0)
+            // keeps this tight. We re-check inflight_bytes/deadline each iteration.
         }
 
         // Debug-only cross-check: the incrementally-maintained `inflight_bytes`
@@ -650,16 +710,22 @@ fn queue_ping(poll: &Poll, conns: &mut slab::Slab<Entry>, key: usize, now_ns: u6
     true
 }
 
-/// SP11 §4: send a WebSocket Close frame with code `4201` (pong-timeout) with the
-/// canonical Pusher v7 reason text, then let the caller `remove` the connection.
-/// Mirrors the `ServerEvent::Close` arm of [`drain_session`].
-fn send_close_4201(poll: &Poll, conns: &mut slab::Slab<Entry>, key: usize, now_ns: u64) {
+/// Send a WebSocket Close frame with the given `code` and `reason` text, then
+/// let the caller handle the connection (either `remove` it immediately or wait
+/// for flush). Mirrors the `ServerEvent::Close` arm of [`drain_session`].
+fn send_close(
+    poll: &Poll,
+    conns: &mut slab::Slab<Entry>,
+    key: usize,
+    now_ns: u64,
+    code: u16,
+    reason: &str,
+) {
     let Some(entry) = conns.get_mut(key) else {
         return;
     };
-    let reason = "Pong reply not received: ping was sent to the client, but no reply was received";
     let mut frame_body = Vec::with_capacity(2 + reason.len());
-    frame_body.extend_from_slice(&4201u16.to_be_bytes());
+    frame_body.extend_from_slice(&code.to_be_bytes());
     frame_body.extend_from_slice(reason.as_bytes());
     let mut out = BytesMut::new();
     frame::encode(&mut out, true, OpCode::Close, &frame_body);
@@ -668,6 +734,19 @@ fn send_close_4201(poll: &Poll, conns: &mut slab::Slab<Entry>, key: usize, now_n
         .queue(Arc::from(out.to_vec().into_boxed_slice()), now_ns);
     // Flush so the Close frame actually reaches the peer before we deregister.
     let _ = flush_and_arm(poll, entry, now_ns);
+}
+
+/// SP11 §4: send a WebSocket Close frame with code `4201` (pong-timeout) with the
+/// canonical Pusher v7 reason text, then let the caller `remove` the connection.
+fn send_close_4201(poll: &Poll, conns: &mut slab::Slab<Entry>, key: usize, now_ns: u64) {
+    send_close(
+        poll,
+        conns,
+        key,
+        now_ns,
+        4201,
+        "Pong reply not received: ping was sent to the client, but no reply was received",
+    );
 }
 
 /// Outcome of handling a connection event: keep it, close it, or hand it off to
@@ -1683,6 +1762,7 @@ mod tests {
                     inflight_slot: None,
                     codel: crate::transport::conn::CodelParams::DISABLED,
                     budget_factor: None,
+                    shutdown_grace_ms: 0,
                 },
                 sd,
             )

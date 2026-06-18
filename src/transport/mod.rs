@@ -336,6 +336,7 @@ pub fn run_percore(
             inflight_slot: Some(inflight_slots[i].clone()),
             codel,
             budget_factor: Some(budget_factor.clone()),
+            shutdown_grace_ms: config.shutdown_grace_ms,
         };
         let shutdown = shutdown.clone();
         let core = core_ids.get(i % core_ids.len().max(1)).copied();

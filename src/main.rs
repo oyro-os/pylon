@@ -9,6 +9,7 @@ use pylon::cluster::adapter::ClusterAdapter;
 use pylon::server::config::ServerConfig;
 use pylon::server::router::{build_router, AppState};
 use pylon::server::shutdown::shutdown_signal;
+use std::time::Duration;
 use pylon::webhook::dispatcher::SystemClock;
 use pylon::webhook::transport::{HttpTransport, WebhookTransport};
 use pylon::webhook::{OccupancySource, WebhookHandle};
@@ -95,6 +96,8 @@ async fn main() -> anyhow::Result<()> {
     // sequence in C2a). Created here so it lives for the entire server lifetime and
     // can be cloned into AppState and the future shutdown sequence.
     let draining = Arc::new(AtomicBool::new(false));
+    // Clone for use in the shutdown sequence — the original is moved into AppState.
+    let draining_for_shutdown = draining.clone();
     let rest_state = AppState {
         config: config.clone(),
         apps: apps.clone(),
@@ -131,8 +134,15 @@ async fn main() -> anyhow::Result<()> {
         )
     });
 
-    // Wait for Ctrl-C / SIGTERM, then signal the worker to stop and join.
+    // C2a two-phase graceful shutdown:
+    //   1. Set draining=true  → /ready returns 503; LBs stop sending new traffic.
+    //   2. Sleep predrain_ms  → allow LBs to observe the 503.
+    //   3. Set shutdown=true  → workers deregister listeners, queue Close(1001),
+    //      flush in-flight bytes, run on_close cleanup, then exit.
+    //   4. Join the worker.
     shutdown_signal().await;
+    draining_for_shutdown.store(true, Ordering::SeqCst);
+    tokio::time::sleep(Duration::from_millis(config.shutdown_predrain_ms)).await;
     shutdown.store(true, Ordering::SeqCst);
     worker.await??;
     Ok(())
@@ -199,6 +209,8 @@ async fn run_redis_percore(config: ServerConfig, apps: Arc<dyn AppManager>) -> a
     // sequence in C2a). Created here so it lives for the entire server lifetime and
     // can be cloned into AppState and the future shutdown sequence.
     let draining = Arc::new(AtomicBool::new(false));
+    // Clone for use in the shutdown sequence — the original is moved into AppState.
+    let draining_for_shutdown = draining.clone();
     let rest_state = AppState {
         config: config.clone(),
         apps: apps.clone(),
@@ -239,10 +251,16 @@ async fn run_redis_percore(config: ServerConfig, apps: Arc<dyn AppManager>) -> a
         )
     });
 
-    // Wait for Ctrl-C / SIGTERM, then signal the worker to stop and join. `bridge` stays in
-    // scope until AFTER the join, so its `Drop` (which tears down the dedicated Redis
-    // runtime) runs only once the worker has stopped firing commands at it.
+    // C2a two-phase graceful shutdown (same sequence as main()):
+    //   1. Set draining=true  → /ready returns 503; LBs stop sending new traffic.
+    //   2. Sleep predrain_ms  → allow LBs to observe the 503.
+    //   3. Set shutdown=true  → workers drain + close connections, then exit.
+    //   4. Join the worker. `bridge` stays in scope until AFTER the join so its
+    //      Drop (which tears down the dedicated Redis runtime) runs only once the
+    //      worker has stopped firing commands at it.
     shutdown_signal().await;
+    draining_for_shutdown.store(true, Ordering::SeqCst);
+    tokio::time::sleep(Duration::from_millis(config.shutdown_predrain_ms)).await;
     shutdown.store(true, Ordering::SeqCst);
     worker.await??;
     drop(bridge);
