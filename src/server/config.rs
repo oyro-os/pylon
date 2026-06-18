@@ -10,6 +10,7 @@ pub struct Limits {
     pub max_client_events_per_second: u32,
     pub max_presence_user_id_length: usize,
     pub max_presence_user_info_bytes: usize,
+    pub max_subscriptions_per_connection: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -37,6 +38,7 @@ pub struct ServerConfig {
     pub max_client_events_per_second: u32,
     pub max_presence_user_id_length: usize,
     pub max_presence_user_info_bytes: usize,
+    pub max_subscriptions_per_connection: usize,
     // adapter + redis scaling tunables
     pub adapter: String,
     pub redis_url: String,
@@ -137,6 +139,7 @@ impl Default for ServerConfig {
             max_client_events_per_second: 10,
             max_presence_user_id_length: 128,
             max_presence_user_info_bytes: 1024,
+            max_subscriptions_per_connection: 200,
             adapter: "local".into(),
             redis_url: "redis://127.0.0.1:6379".into(),
             redis_prefix: "pylon".into(),
@@ -277,6 +280,11 @@ impl ServerConfig {
         if let Ok(v) = std::env::var("PYLON_MAX_PRESENCE_USER_INFO_BYTES") {
             if let Ok(p) = v.parse() {
                 c.max_presence_user_info_bytes = p;
+            }
+        }
+        if let Ok(v) = std::env::var("PYLON_MAX_SUBSCRIPTIONS_PER_CONNECTION") {
+            if let Ok(p) = v.parse() {
+                c.max_subscriptions_per_connection = p;
             }
         }
         if let Ok(v) = std::env::var("PYLON_ADAPTER") {
@@ -450,6 +458,7 @@ impl ServerConfig {
             max_client_events_per_second: self.max_client_events_per_second,
             max_presence_user_id_length: self.max_presence_user_id_length,
             max_presence_user_info_bytes: self.max_presence_user_info_bytes,
+            max_subscriptions_per_connection: self.max_subscriptions_per_connection,
         }
     }
 }

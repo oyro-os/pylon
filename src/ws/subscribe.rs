@@ -18,6 +18,19 @@ impl ConnectionContext {
             return;
         }
 
+        // Per-connection subscription cap: reject new subscriptions once the limit
+        // is reached. `0` means unlimited. Checked after the idempotency guard so
+        // re-subscribing an already-held channel is always exempt and never errors.
+        let cap = self.limits.max_subscriptions_per_connection;
+        if cap != 0 && self.subscribed.len() >= cap {
+            return self.send_subscription_error(
+                &channel,
+                "LimitReached",
+                "Subscription limit reached for this connection",
+                4004,
+            );
+        }
+
         // Reserved `#` channels are server-managed, never normal subscriptions.
         if let Some(uid) = channel.strip_prefix(SERVER_TO_USER_PREFIX) {
             let ok = self.user.as_ref().is_some_and(|u| u.id == uid);

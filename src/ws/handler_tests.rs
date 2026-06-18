@@ -1682,6 +1682,147 @@ async fn client_event_oversize_name_returns_4301_and_does_not_broadcast() {
     );
 }
 
+// Resource-hardening Task 1 — per-connection subscription cap
+
+/// Build a ConnectionContext with `limits.max_subscriptions_per_connection` set
+/// to the given cap; everything else uses the ServerConfig defaults.
+fn ctx_with_sub_cap(
+    app: crate::app::App,
+    cap: usize,
+) -> (
+    ConnectionContext,
+    tokio::sync::mpsc::UnboundedReceiver<ServerEvent>,
+) {
+    let (tx, rx) = mpsc::unbounded_channel();
+    let registry = Arc::new(Registry::new());
+    let adapter: Arc<dyn Adapter> = Arc::new(LocalAdapter::new(registry));
+    let mut limits = crate::server::config::ServerConfig::default().limits();
+    limits.max_subscriptions_per_connection = cap;
+    let c = ConnectionContext {
+        app: std::sync::Arc::new(app),
+        socket_id: SocketId::generate(),
+        self_tx: tx,
+        adapter,
+        limits,
+        subscribed: HashSet::new(),
+        user: None,
+        webhooks: crate::webhook::WebhookHandle::null(),
+        presence_membership: std::collections::HashMap::new(),
+        saturated: None,
+        clustered: false,
+        mailbox_notify: None,
+        client_event_rate: crate::ws::rate::RateWindow::new(0),
+    };
+    (c, rx)
+}
+
+#[tokio::test]
+async fn subscription_cap_blocks_third_channel_but_allows_resubscribe() {
+    // cap = 2: c1 and c2 succeed, c3 is rejected with LimitReached / 4004.
+    // Re-subscribing c1 after the cap is hit must succeed (idempotent).
+    let (mut c, mut rx) = ctx_with_sub_cap(app(false), 2);
+
+    // Subscribe to c1 → success
+    c.dispatch(ClientCommand::Subscribe {
+        channel: "c1".into(),
+        auth: None,
+        channel_data: None,
+    })
+    .await;
+    assert!(
+        matches!(rx.try_recv(), Ok(ServerEvent::SubscriptionSucceeded { .. })),
+        "c1 must succeed"
+    );
+
+    // Subscribe to c2 → success
+    c.dispatch(ClientCommand::Subscribe {
+        channel: "c2".into(),
+        auth: None,
+        channel_data: None,
+    })
+    .await;
+    assert!(
+        matches!(rx.try_recv(), Ok(ServerEvent::SubscriptionSucceeded { .. })),
+        "c2 must succeed"
+    );
+
+    // Cap is now full (2 subscriptions). Subscribe to c3 → LimitReached
+    c.dispatch(ClientCommand::Subscribe {
+        channel: "c3".into(),
+        auth: None,
+        channel_data: None,
+    })
+    .await;
+    match rx.try_recv() {
+        Ok(ServerEvent::SubscriptionError {
+            channel,
+            error_type,
+            status,
+            ..
+        }) => {
+            assert_eq!(channel, "c3", "error must name the rejected channel");
+            assert_eq!(
+                error_type, "LimitReached",
+                "error_type must be LimitReached"
+            );
+            assert_eq!(status, 4004, "status code must match presence LimitReached");
+        }
+        other => panic!("expected LimitReached SubscriptionError for c3, got {other:?}"),
+    }
+    // c3 must not have been registered
+    assert_eq!(
+        c.subscribed.len(),
+        2,
+        "subscribed set must remain at 2 after c3 rejection"
+    );
+
+    // Re-subscribe to c1 (already held) must NOT produce an error (idempotent)
+    c.dispatch(ClientCommand::Subscribe {
+        channel: "c1".into(),
+        auth: None,
+        channel_data: None,
+    })
+    .await;
+    assert!(
+        rx.try_recv().is_err(),
+        "re-subscribing an already-held channel must be a silent no-op (idempotent)"
+    );
+    assert_eq!(
+        c.subscribed.len(),
+        2,
+        "subscribed count must still be 2 after idempotent re-subscribe"
+    );
+}
+
+#[tokio::test]
+async fn subscription_cap_zero_means_unlimited() {
+    // cap = 0 → unlimited; subscribe to 5 distinct channels — all must succeed.
+    let (mut c, mut rx) = ctx_with_sub_cap(app(false), 0);
+    for i in 0..5usize {
+        c.dispatch(ClientCommand::Subscribe {
+            channel: format!("ch{i}"),
+            auth: None,
+            channel_data: None,
+        })
+        .await;
+        assert!(
+            matches!(rx.try_recv(), Ok(ServerEvent::SubscriptionSucceeded { .. })),
+            "ch{i} must succeed when cap=0 (unlimited)"
+        );
+    }
+    assert_eq!(c.subscribed.len(), 5);
+}
+
+#[tokio::test]
+async fn subscription_cap_default_is_200() {
+    // The default limit must be 200 (not 0, not something else).
+    let limits = crate::server::config::ServerConfig::default().limits();
+    assert_eq!(
+        limits.max_subscriptions_per_connection, 200,
+        "default subscription cap must be 200"
+    );
+}
+
 // P12 — per-connection client-event rate limit (10/s) → in-band 4301 + drop
 
 /// Sender and receiver share an adapter; sender has a tight rate window of 3.
