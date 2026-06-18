@@ -21,6 +21,11 @@ pub async fn publish_openloop(
     max_inflight: usize,
     secs: u64,
     counters: Arc<Counters>,
+    // SHARED epoch — must be the SAME `Instant` the subscriber clients measure latency
+    // against (the Harness epoch). Stamping payloads with a publisher-local epoch
+    // created after the (multi-second) subscribe phase inflates every measured delivery
+    // latency by the subscribe duration, which falsely trips the latency budget.
+    epoch: Instant,
 ) -> OpenLoopResult {
     let pubr = Arc::new(Publisher::new(rest, app_id, key, secret));
     let sem = Arc::new(Semaphore::new(max_inflight));
@@ -31,7 +36,6 @@ pub async fn publish_openloop(
     let mut ticker = tokio::time::interval(interval);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Burst);
     let end = Instant::now() + Duration::from_secs(secs);
-    let epoch = Instant::now();
     let mut seq = 0u64;
     while Instant::now() < end {
         ticker.tick().await;

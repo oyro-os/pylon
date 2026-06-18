@@ -28,6 +28,7 @@ async fn openloop_reaches_target_rate() {
         128,   // max_inflight
         3,     // secs
         counters,
+        std::time::Instant::now(), // epoch (this test asserts rate, not latency)
     )
     .await;
 
