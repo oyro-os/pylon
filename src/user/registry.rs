@@ -162,7 +162,7 @@ mod tests {
     use crate::protocol::event::ServerEvent;
     use tokio::sync::mpsc;
 
-    fn handle() -> (ConnectionHandle, mpsc::Receiver<ServerEvent>) {
+    fn handle() -> (ConnectionHandle, mpsc::Receiver<Box<ServerEvent>>) {
         let (tx, rx) = mpsc::channel(1024);
         (
             ConnectionHandle {

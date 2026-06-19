@@ -124,7 +124,7 @@ mod tests {
         .unwrap()
     }
 
-    fn ctx() -> (ConnectionContext, mpsc::Receiver<ServerEvent>) {
+    fn ctx() -> (ConnectionContext, mpsc::Receiver<Box<ServerEvent>>) {
         let adapter: Arc<dyn Adapter> = Arc::new(LocalAdapter::new(Arc::new(Registry::new())));
         ctx_on(adapter, "123.456")
     }
@@ -141,7 +141,7 @@ mod tests {
     async fn valid_signin_acks_and_registers() {
         let (mut c, mut rx) = ctx();
         c.dispatch(signin_cmd(&c, r#"{"id":"7"}"#)).await;
-        match rx.try_recv() {
+        match rx.try_recv().map(|b| *b) {
             Ok(ServerEvent::SigninSuccess { user_data }) => assert_eq!(user_data, r#"{"id":"7"}"#),
             other => panic!("expected SigninSuccess, got {other:?}"),
         }
@@ -162,9 +162,9 @@ mod tests {
             user_data: r#"{"id":"7"}"#.into(),
         })
         .await;
-        assert!(matches!(rx.try_recv(), Ok(ServerEvent::Error(e)) if e.code == 4009));
+        assert!(matches!(rx.try_recv().map(|b| *b), Ok(ServerEvent::Error(e)) if e.code == 4009));
         assert!(matches!(
-            rx.try_recv(),
+            rx.try_recv().map(|b| *b),
             Ok(ServerEvent::Close { code: 4009, .. })
         ));
         assert!(c.user.is_none());
@@ -175,9 +175,9 @@ mod tests {
         let (mut c, mut rx) = ctx();
         // valid signature over a body that lacks a string id
         c.dispatch(signin_cmd(&c, r#"{"name":"x"}"#)).await;
-        assert!(matches!(rx.try_recv(), Ok(ServerEvent::Error(e)) if e.code == 4009));
+        assert!(matches!(rx.try_recv().map(|b| *b), Ok(ServerEvent::Error(e)) if e.code == 4009));
         assert!(matches!(
-            rx.try_recv(),
+            rx.try_recv().map(|b| *b),
             Ok(ServerEvent::Close { code: 4009, .. })
         ));
     }
@@ -185,7 +185,7 @@ mod tests {
     fn ctx_on(
         adapter: Arc<dyn Adapter>,
         socket: &str,
-    ) -> (ConnectionContext, mpsc::Receiver<ServerEvent>) {
+    ) -> (ConnectionContext, mpsc::Receiver<Box<ServerEvent>>) {
         let (tx, rx) = mpsc::channel(1024);
         let c = ConnectionContext {
             app: std::sync::Arc::new(app()),
@@ -218,8 +218,11 @@ mod tests {
                 user_data: r#"{"id":"C","watchlist":["B"]}"#.into(),
             })
             .await;
-        let _ = rx_watch.try_recv(); // signin_success
-        assert!(rx_watch.try_recv().is_err(), "no snapshot while B offline");
+        let _ = rx_watch.try_recv().map(|b| *b); // signin_success
+        assert!(
+            rx_watch.try_recv().map(|b| *b).is_err(),
+            "no snapshot while B offline"
+        );
 
         // B signs in -> C receives an online watchlist event for B
         let (mut c_b, _rx_b) = ctx_on(adapter.clone(), "2.2");
@@ -229,7 +232,7 @@ mod tests {
             user_data: r#"{"id":"B"}"#.into(),
         })
         .await;
-        match rx_watch.try_recv() {
+        match rx_watch.try_recv().map(|b| *b) {
             Ok(ServerEvent::WatchlistEvents { events }) => {
                 assert_eq!(events[0].name, "online");
                 assert_eq!(events[0].user_ids, vec!["B".to_string()]);
@@ -258,10 +261,10 @@ mod tests {
                 user_data: r#"{"id":"C","watchlist":["B"]}"#.into(),
             })
             .await;
-        while rx_watch.try_recv().is_ok() {} // drain signin_success + online snapshot
+        while rx_watch.try_recv().map(|b| *b).is_ok() {} // drain signin_success + online snapshot
 
         c_b.on_close().await; // B's last connection closes -> offline
-        match rx_watch.try_recv() {
+        match rx_watch.try_recv().map(|b| *b) {
             Ok(ServerEvent::WatchlistEvents { events }) => {
                 assert_eq!(events[0].name, "offline");
                 assert_eq!(events[0].user_ids, vec!["B".to_string()]);
@@ -282,7 +285,7 @@ mod tests {
                 user_data: r#"{"id":"C","watchlist":["B"]}"#.into(),
             })
             .await;
-        while rx_watch.try_recv().is_ok() {} // drain C's signin_success (B offline, no snapshot)
+        while rx_watch.try_recv().map(|b| *b).is_ok() {} // drain C's signin_success (B offline, no snapshot)
 
         // B signs in on connection 1 -> C gets ONE online event.
         let (mut c_b1, _rx_b1) = ctx_on(adapter.clone(), "2.2");
@@ -292,7 +295,7 @@ mod tests {
             user_data: r#"{"id":"B"}"#.into(),
         })
         .await;
-        match rx_watch.try_recv() {
+        match rx_watch.try_recv().map(|b| *b) {
             Ok(ServerEvent::WatchlistEvents { events }) => {
                 assert_eq!(events[0].name, "online");
                 assert_eq!(events[0].user_ids, vec!["B".to_string()]);
@@ -309,7 +312,7 @@ mod tests {
         })
         .await;
         assert!(
-            rx_watch.try_recv().is_err(),
+            rx_watch.try_recv().map(|b| *b).is_err(),
             "second connection must NOT re-emit online to watchers"
         );
     }
@@ -341,18 +344,18 @@ mod tests {
                 user_data: r#"{"id":"C","watchlist":["B"]}"#.into(),
             })
             .await;
-        while rx_watch.try_recv().is_ok() {} // drain signin_success + online snapshot
+        while rx_watch.try_recv().map(|b| *b).is_ok() {} // drain signin_success + online snapshot
 
         // First of B's two connections closes -> NOT last -> no offline.
         c_b1.on_close().await;
         assert!(
-            rx_watch.try_recv().is_err(),
+            rx_watch.try_recv().map(|b| *b).is_err(),
             "non-last connection close must NOT emit offline"
         );
 
         // Second (last) connection closes -> offline emitted exactly once.
         c_b2.on_close().await;
-        match rx_watch.try_recv() {
+        match rx_watch.try_recv().map(|b| *b) {
             Ok(ServerEvent::WatchlistEvents { events }) => {
                 assert_eq!(events[0].name, "offline");
                 assert_eq!(events[0].user_ids, vec!["B".to_string()]);

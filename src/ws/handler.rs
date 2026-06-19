@@ -13,7 +13,7 @@ use tokio::sync::mpsc::Sender;
 pub struct ConnectionContext {
     pub app: Arc<App>,
     pub socket_id: SocketId,
-    pub self_tx: Sender<ServerEvent>,
+    pub self_tx: Sender<Box<ServerEvent>>,
     pub adapter: Arc<dyn Adapter>,
     pub limits: crate::server::config::Limits,
     pub subscribed: HashSet<String>,
@@ -79,7 +79,9 @@ impl ConnectionContext {
         // (mailbox already full) the frame is dropped — count it, exactly like
         // `Mailbox::send`, so the drop is observable via `mailbox_dropped`. A
         // `Closed` error means the connection is already gone (nothing to count).
-        if let Err(tokio::sync::mpsc::error::TrySendError::Full(_)) = self.self_tx.try_send(event) {
+        if let Err(tokio::sync::mpsc::error::TrySendError::Full(_)) =
+            self.self_tx.try_send(Box::new(event))
+        {
             if let Some(ctr) = &self.mailbox_dropped {
                 ctr.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }

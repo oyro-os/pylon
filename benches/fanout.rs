@@ -13,7 +13,7 @@ fn bench_fanout(c: &mut Criterion) {
         let reg = Registry::new();
         let mut receivers = Vec::new();
         for _ in 0..n {
-            let (tx, rx) = mpsc::channel::<ServerEvent>(1024);
+            let (tx, rx) = mpsc::channel::<Box<ServerEvent>>(1024);
             receivers.push(rx);
             reg.subscribe(
                 "app",

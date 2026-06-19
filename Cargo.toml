@@ -102,6 +102,10 @@ socket2 = "0.5"
 name = "fanout"
 harness = false
 
+[[bench]]
+name = "mailbox"
+harness = false
+
 [profile.release]
 lto = true
 codegen-units = 1

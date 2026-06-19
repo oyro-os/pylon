@@ -139,7 +139,7 @@ mod tests {
     use crate::protocol::event::ServerEvent;
     use tokio::sync::mpsc;
 
-    fn handle() -> (ConnectionHandle, mpsc::Receiver<ServerEvent>) {
+    fn handle() -> (ConnectionHandle, mpsc::Receiver<Box<ServerEvent>>) {
         let (tx, rx) = mpsc::channel(1024);
         (
             ConnectionHandle {
@@ -163,7 +163,7 @@ mod tests {
         // `broadcast` encodes once and fans out `Raw` frames; the excluded sender
         // (`sid1`) still gets nothing, and the other subscriber receives the
         // verbatim wire frame for `Pong`.
-        match rx2.try_recv() {
+        match rx2.try_recv().map(|b| *b) {
             Ok(ServerEvent::Raw(f)) => {
                 assert_eq!(&*f, crate::protocol::v7::frames::encode(&ServerEvent::Pong))
             }

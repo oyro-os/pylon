@@ -60,7 +60,7 @@ fn app_with_client_messages(enabled: bool) -> App {
     .unwrap()
 }
 
-fn ctx(app: App) -> (ConnectionContext, mpsc::Receiver<ServerEvent>) {
+fn ctx(app: App) -> (ConnectionContext, mpsc::Receiver<Box<ServerEvent>>) {
     let (tx, rx) = mpsc::channel(1024);
     let registry = Arc::new(Registry::new());
     let adapter: Arc<dyn Adapter> = Arc::new(LocalAdapter::new(registry));
@@ -106,7 +106,7 @@ fn raw_event_is(ev: &ServerEvent, name: &str) -> bool {
 async fn ping_enqueues_pong() {
     let (mut c, mut rx) = ctx(app(false));
     c.dispatch(ClientCommand::Ping).await;
-    assert!(matches!(rx.try_recv(), Ok(ServerEvent::Pong)));
+    assert!(matches!(rx.try_recv().map(|b| *b), Ok(ServerEvent::Pong)));
 }
 
 #[tokio::test]
@@ -119,7 +119,7 @@ async fn public_subscribe_succeeds_and_registers() {
     })
     .await;
     assert!(matches!(
-        rx.try_recv(),
+        rx.try_recv().map(|b| *b),
         Ok(ServerEvent::SubscriptionSucceeded { .. })
     ));
     assert_eq!(c.adapter.channel("app", "room").await.subscription_count, 1);
@@ -136,7 +136,10 @@ async fn public_cache_channel_subscribes_as_public() {
     })
     .await;
     assert!(
-        matches!(rx.try_recv(), Ok(ServerEvent::SubscriptionSucceeded { .. })),
+        matches!(
+            rx.try_recv().map(|b| *b),
+            Ok(ServerEvent::SubscriptionSucceeded { .. })
+        ),
         "bare cache-foo must subscribe as public, not error 4009"
     );
 }
@@ -151,10 +154,10 @@ async fn subscription_count_emitted_when_enabled() {
     })
     .await;
     assert!(matches!(
-        rx.try_recv(),
+        rx.try_recv().map(|b| *b),
         Ok(ServerEvent::SubscriptionSucceeded { .. })
     ));
-    match rx.try_recv() {
+    match rx.try_recv().map(|b| *b) {
         Ok(ev) => {
             let j = raw_json(&ev);
             assert_eq!(j["event"], "pusher_internal:subscription_count");
@@ -175,7 +178,7 @@ async fn private_subscribe_without_auth_errors_non_fatally() {
         channel_data: None,
     })
     .await;
-    match rx.try_recv() {
+    match rx.try_recv().map(|b| *b) {
         Ok(ServerEvent::SubscriptionError {
             channel, status, ..
         }) => {
@@ -199,7 +202,7 @@ async fn private_subscribe_with_valid_auth_succeeds() {
     })
     .await;
     assert!(matches!(
-        rx.try_recv(),
+        rx.try_recv().map(|b| *b),
         Ok(ServerEvent::SubscriptionSucceeded { .. })
     ));
 }
@@ -216,7 +219,7 @@ async fn encrypted_subscribe_with_valid_auth_succeeds() {
         channel_data: None,
     })
     .await;
-    match rx.try_recv() {
+    match rx.try_recv().map(|b| *b) {
         Ok(ServerEvent::SubscriptionSucceeded { channel, presence }) => {
             assert_eq!(channel, "private-encrypted-x");
             assert!(presence.is_none(), "encrypted channels carry no roster");
@@ -241,7 +244,7 @@ async fn encrypted_subscribe_without_auth_errors_non_fatally() {
         channel_data: None,
     })
     .await;
-    match rx.try_recv() {
+    match rx.try_recv().map(|b| *b) {
         Ok(ServerEvent::SubscriptionError {
             channel, status, ..
         }) => {
@@ -264,7 +267,7 @@ async fn presence_subscribe_returns_roster_and_broadcasts_member_added() {
         channel_data: Some(cd.into()),
     })
     .await;
-    match rx.try_recv() {
+    match rx.try_recv().map(|b| *b) {
         Ok(ServerEvent::SubscriptionSucceeded {
             presence: Some(p), ..
         }) => {
@@ -274,7 +277,7 @@ async fn presence_subscribe_returns_roster_and_broadcasts_member_added() {
         other => panic!("expected presence SubscriptionSucceeded, got {other:?}"),
     }
     // Self is excluded from its own member_added, so no further self-delivered event.
-    assert!(rx.try_recv().is_err());
+    assert!(rx.try_recv().map(|b| *b).is_err());
 }
 
 #[tokio::test]
@@ -287,7 +290,7 @@ async fn presence_subscribe_with_bad_auth_errors() {
     })
     .await;
     assert!(matches!(
-        rx.try_recv(),
+        rx.try_recv().map(|b| *b),
         Ok(ServerEvent::SubscriptionError { .. })
     ));
 }
@@ -332,12 +335,12 @@ async fn presence_unsubscribe_broadcasts_member_removed_to_others() {
         .await;
     }
     // Drain a's queued frames (its own subscription_succeeded + member_added for ub).
-    while rxa.try_recv().is_ok() {}
+    while rxa.try_recv().map(|b| *b).is_ok() {}
 
     b.unsubscribe("presence-x".into()).await;
     // a should now see member_removed for ub.
     let mut saw = false;
-    while let Ok(ev) = rxa.try_recv() {
+    while let Ok(ev) = rxa.try_recv().map(|b| *b) {
         if raw_event_is(&ev, "pusher_internal:member_removed") {
             let j = raw_json(&ev);
             let data: serde_json::Value =
@@ -358,7 +361,7 @@ async fn client_event_rejected_when_messaging_disabled() {
         data: serde_json::json!({}),
     })
     .await;
-    match rx.try_recv() {
+    match rx.try_recv().map(|b| *b) {
         Ok(ServerEvent::ClientEventError { code, .. }) => assert_eq!(code, 4301),
         other => panic!("expected 4301, got {other:?}"),
     }
@@ -378,7 +381,7 @@ async fn client_event_oversize_payload_returns_4301() {
         channel_data: None,
     })
     .await;
-    let _ = rx.try_recv(); // drain subscription_succeeded
+    let _ = rx.try_recv().map(|b| *b); // drain subscription_succeeded
 
     // Build a payload that exceeds the default max_event_payload_bytes (10 KiB = 10240 bytes).
     let big_data = serde_json::json!({ "x": "a".repeat(11_000) });
@@ -389,7 +392,7 @@ async fn client_event_oversize_payload_returns_4301() {
     })
     .await;
     // Must receive pusher:error 4301 (was: silence)
-    match rx.try_recv() {
+    match rx.try_recv().map(|b| *b) {
         Ok(ServerEvent::ClientEventError { code, channel, .. }) => {
             assert_eq!(code, 4301, "oversize payload must return 4301");
             assert_eq!(channel, "private-x", "error frame must carry the channel");
@@ -408,7 +411,7 @@ async fn client_event_messaging_disabled_error_carries_channel() {
         data: serde_json::json!({}),
     })
     .await;
-    match rx.try_recv() {
+    match rx.try_recv().map(|b| *b) {
         Ok(ServerEvent::ClientEventError { code, channel, .. }) => {
             assert_eq!(code, 4301);
             assert_eq!(
@@ -430,7 +433,7 @@ async fn client_event_dropped_when_not_subscribed() {
     })
     .await;
     assert!(
-        rx.try_recv().is_err(),
+        rx.try_recv().map(|b| *b).is_err(),
         "unsubscribed client event is silently dropped"
     );
 }
@@ -492,7 +495,7 @@ async fn client_event_on_encrypted_channel_is_dropped() {
         })
         .await;
     }
-    while rxb.try_recv().is_ok() {} // drain b's subscription_succeeded
+    while rxb.try_recv().map(|b| *b).is_ok() {} // drain b's subscription_succeeded
 
     // a sends a client event on the encrypted channel; b must NOT receive it.
     a.dispatch(ClientCommand::ClientEvent {
@@ -502,7 +505,7 @@ async fn client_event_on_encrypted_channel_is_dropped() {
     })
     .await;
     assert!(
-        rxb.try_recv().is_err(),
+        rxb.try_recv().map(|b| *b).is_err(),
         "client events on encrypted channels must not be relayed"
     );
 }
@@ -530,10 +533,10 @@ async fn cache_subscribe_replays_cached_event() {
     .await;
     // First the success frame, then the replayed cached event.
     assert!(matches!(
-        rx.try_recv(),
+        rx.try_recv().map(|b| *b),
         Ok(ServerEvent::SubscriptionSucceeded { .. })
     ));
-    match rx.try_recv() {
+    match rx.try_recv().map(|b| *b) {
         Ok(ServerEvent::ChannelEvent {
             channel,
             event,
@@ -558,10 +561,10 @@ async fn cache_subscribe_with_empty_cache_emits_cache_miss() {
     })
     .await;
     assert!(matches!(
-        rx.try_recv(),
+        rx.try_recv().map(|b| *b),
         Ok(ServerEvent::SubscriptionSucceeded { .. })
     ));
-    match rx.try_recv() {
+    match rx.try_recv().map(|b| *b) {
         Ok(ServerEvent::CacheMiss { channel }) => assert_eq!(channel, "cache-feed"),
         other => panic!("expected CacheMiss, got {other:?}"),
     }
@@ -598,10 +601,10 @@ async fn presence_cache_subscribe_replays_after_join() {
     .await;
     // First the roster success frame, then the replayed cached event.
     assert!(matches!(
-        rx.try_recv(),
+        rx.try_recv().map(|b| *b),
         Ok(ServerEvent::SubscriptionSucceeded { .. })
     ));
-    match rx.try_recv() {
+    match rx.try_recv().map(|b| *b) {
         Ok(ServerEvent::ChannelEvent { channel, event, .. }) => {
             assert_eq!(channel, "presence-cache-room");
             assert_eq!(event, "my-event");
@@ -637,10 +640,10 @@ async fn encrypted_cache_subscribe_replays_after_auth() {
     .await;
     // First subscription_succeeded (no roster), then the verbatim ciphertext replay.
     assert!(matches!(
-        rx.try_recv(),
+        rx.try_recv().map(|b| *b),
         Ok(ServerEvent::SubscriptionSucceeded { .. })
     ));
-    match rx.try_recv() {
+    match rx.try_recv().map(|b| *b) {
         Ok(ServerEvent::ChannelEvent {
             channel,
             event,
@@ -700,7 +703,7 @@ async fn presence_over_member_cap_errors() {
     let (mut b, mut rxb) = mk();
     let cmd_b = sub(&b, "ub");
     b.dispatch(cmd_b).await; // second distinct user exceeds the cap
-    match rxb.try_recv() {
+    match rxb.try_recv().map(|b| *b) {
         Ok(ServerEvent::SubscriptionError {
             error_type, status, ..
         }) => {
@@ -740,7 +743,7 @@ async fn server_to_user_subscribe_succeeds_when_signed_in_and_matches() {
         user_data: r#"{"id":"9"}"#.into(),
     })
     .await;
-    let _ = rx.try_recv(); // drain signin_success
+    let _ = rx.try_recv().map(|b| *b); // drain signin_success
     c.dispatch(ClientCommand::Subscribe {
         channel: "#server-to-user-9".into(),
         auth: None,
@@ -748,7 +751,7 @@ async fn server_to_user_subscribe_succeeds_when_signed_in_and_matches() {
     })
     .await;
     assert!(matches!(
-        rx.try_recv(),
+        rx.try_recv().map(|b| *b),
         Ok(ServerEvent::SubscriptionSucceeded { .. })
     ));
     // Reserved channels never enter the channel registry:
@@ -771,7 +774,7 @@ async fn server_to_user_subscribe_errors_on_mismatch() {
     })
     .await;
     assert!(matches!(
-        rx.try_recv(),
+        rx.try_recv().map(|b| *b),
         Ok(ServerEvent::SubscriptionError { .. })
     ));
 }
@@ -787,8 +790,8 @@ async fn server_to_user_subscribe_errors_when_signed_in_as_different_user() {
         user_data: r#"{"id":"7"}"#.into(),
     })
     .await;
-    let _ = rx.try_recv(); // drain signin_success
-                           // ... then try to subscribe to a DIFFERENT user's channel -> must be rejected.
+    let _ = rx.try_recv().map(|b| *b); // drain signin_success
+                                       // ... then try to subscribe to a DIFFERENT user's channel -> must be rejected.
     c.dispatch(ClientCommand::Subscribe {
         channel: "#server-to-user-9".into(),
         auth: None,
@@ -796,7 +799,7 @@ async fn server_to_user_subscribe_errors_when_signed_in_as_different_user() {
     })
     .await;
     assert!(matches!(
-        rx.try_recv(),
+        rx.try_recv().map(|b| *b),
         Ok(ServerEvent::SubscriptionError { .. })
     ));
 }
@@ -811,7 +814,7 @@ async fn arbitrary_hash_channel_subscribe_errors() {
     })
     .await;
     assert!(matches!(
-        rx.try_recv(),
+        rx.try_recv().map(|b| *b),
         Ok(ServerEvent::SubscriptionError { .. })
     ));
 }
@@ -1264,7 +1267,7 @@ async fn subscribe_over_length_channel_name_errors_4009() {
         channel_data: None,
     })
     .await;
-    match rx.try_recv() {
+    match rx.try_recv().map(|b| *b) {
         Ok(ServerEvent::SubscriptionError {
             channel, status, ..
         }) => {
@@ -1293,7 +1296,7 @@ async fn subscribe_illegal_char_channel_name_errors_4009() {
         channel_data: None,
     })
     .await;
-    match rx.try_recv() {
+    match rx.try_recv().map(|b| *b) {
         Ok(ServerEvent::SubscriptionError {
             channel, status, ..
         }) => {
@@ -1321,7 +1324,7 @@ async fn subscribe_valid_channel_names_still_succeed() {
             })
             .await;
             // Will get an auth error (401) — but NOT a 4009 charset error
-            match rx.try_recv() {
+            match rx.try_recv().map(|b| *b) {
                 Ok(ServerEvent::SubscriptionError { status, .. }) => {
                     assert_ne!(status, 4009, "valid name '{name}' must not get 4009");
                 }
@@ -1335,7 +1338,10 @@ async fn subscribe_valid_channel_names_still_succeed() {
             })
             .await;
             assert!(
-                matches!(rx.try_recv(), Ok(ServerEvent::SubscriptionSucceeded { .. })),
+                matches!(
+                    rx.try_recv().map(|b| *b),
+                    Ok(ServerEvent::SubscriptionSucceeded { .. })
+                ),
                 "valid name '{name}' must subscribe successfully"
             );
         }
@@ -1354,7 +1360,7 @@ async fn subscribe_server_to_user_channel_still_works_after_p8() {
         user_data: r#"{"id":"9"}"#.into(),
     })
     .await;
-    let _ = rx.try_recv(); // drain signin_success
+    let _ = rx.try_recv().map(|b| *b); // drain signin_success
     c.dispatch(ClientCommand::Subscribe {
         channel: "#server-to-user-9".into(),
         auth: None,
@@ -1362,7 +1368,10 @@ async fn subscribe_server_to_user_channel_still_works_after_p8() {
     })
     .await;
     assert!(
-        matches!(rx.try_recv(), Ok(ServerEvent::SubscriptionSucceeded { .. })),
+        matches!(
+            rx.try_recv().map(|b| *b),
+            Ok(ServerEvent::SubscriptionSucceeded { .. })
+        ),
         "#server-to-user- channel must still succeed after P8 charset validation"
     );
 }
@@ -1378,7 +1387,7 @@ async fn subscribe_empty_channel_name_errors_4009() {
         channel_data: None,
     })
     .await;
-    match rx.try_recv() {
+    match rx.try_recv().map(|b| *b) {
         Ok(ServerEvent::SubscriptionError {
             channel, status, ..
         }) => {
@@ -1413,7 +1422,7 @@ async fn sub_count_emitted_after_subscribe(channel: &str, channel_data: Option<&
     })
     .await;
     let mut saw_count = false;
-    while let Ok(ev) = rx.try_recv() {
+    while let Ok(ev) = rx.try_recv().map(|b| *b) {
         if raw_event_is(&ev, "pusher_internal:subscription_count") {
             saw_count = true;
         }
@@ -1468,7 +1477,7 @@ async fn presence_subscribe_with_oversized_user_id_errors() {
     let (mut c, mut rx) = ctx(app(false));
     let cmd = signed_presence_sub(&c, &cd);
     c.dispatch(cmd).await;
-    match rx.try_recv() {
+    match rx.try_recv().map(|b| *b) {
         Ok(ServerEvent::SubscriptionError {
             channel,
             error_type,
@@ -1498,7 +1507,7 @@ async fn presence_subscribe_with_oversized_user_info_errors() {
     let (mut c, mut rx) = ctx(app(false));
     let cmd = signed_presence_sub(&c, &cd);
     c.dispatch(cmd).await;
-    match rx.try_recv() {
+    match rx.try_recv().map(|b| *b) {
         Ok(ServerEvent::SubscriptionError {
             channel,
             error_type,
@@ -1527,7 +1536,7 @@ async fn presence_subscribe_with_valid_sized_data_succeeds() {
     let (mut c, mut rx) = ctx(app(false));
     let cmd = signed_presence_sub(&c, &cd);
     c.dispatch(cmd).await;
-    match rx.try_recv() {
+    match rx.try_recv().map(|b| *b) {
         Ok(ServerEvent::SubscriptionSucceeded { channel, .. }) => {
             assert_eq!(channel, "presence-x");
         }
@@ -1580,7 +1589,7 @@ async fn relayed_client_event_frame(
         })
         .await;
     }
-    while rxb.try_recv().is_ok() {} // drain b's subscription_succeeded + member_added
+    while rxb.try_recv().map(|b| *b).is_ok() {} // drain b's subscription_succeeded + member_added
 
     a.dispatch(ClientCommand::ClientEvent {
         event: "client-foo".into(),
@@ -1589,7 +1598,7 @@ async fn relayed_client_event_frame(
     })
     .await;
 
-    match rxb.try_recv() {
+    match rxb.try_recv().map(|b| *b) {
         Ok(ev) if raw_event_is(&ev, "client-foo") => raw_json(&ev),
         other => panic!("expected relayed client-foo frame, got {other:?}"),
     }
@@ -1662,8 +1671,8 @@ async fn client_event_oversize_name_returns_4301_and_does_not_broadcast() {
         })
         .await;
     }
-    while rx_sender.try_recv().is_ok() {}
-    while rx_receiver.try_recv().is_ok() {}
+    while rx_sender.try_recv().map(|b| *b).is_ok() {}
+    while rx_receiver.try_recv().map(|b| *b).is_ok() {}
 
     // Build an event name that is 201 chars (> default max 200).
     let long_event = "client-".to_string() + &"x".repeat(194); // 7 + 194 = 201
@@ -1678,7 +1687,7 @@ async fn client_event_oversize_name_returns_4301_and_does_not_broadcast() {
         .await;
 
     // Sender must receive a 4301 ClientEventError.
-    match rx_sender.try_recv() {
+    match rx_sender.try_recv().map(|b| *b) {
         Ok(ServerEvent::ClientEventError {
             code, channel: ch, ..
         }) => {
@@ -1690,7 +1699,7 @@ async fn client_event_oversize_name_returns_4301_and_does_not_broadcast() {
 
     // Receiver must NOT have received the event.
     assert!(
-        rx_receiver.try_recv().is_err(),
+        rx_receiver.try_recv().map(|b| *b).is_err(),
         "oversize event name must not be broadcast to receiver"
     );
 }
@@ -1702,7 +1711,10 @@ async fn client_event_oversize_name_returns_4301_and_does_not_broadcast() {
 fn ctx_with_sub_cap(
     app: crate::app::App,
     cap: usize,
-) -> (ConnectionContext, tokio::sync::mpsc::Receiver<ServerEvent>) {
+) -> (
+    ConnectionContext,
+    tokio::sync::mpsc::Receiver<Box<ServerEvent>>,
+) {
     let (tx, rx) = mpsc::channel(1024);
     let registry = Arc::new(Registry::new());
     let adapter: Arc<dyn Adapter> = Arc::new(LocalAdapter::new(registry));
@@ -1741,7 +1753,10 @@ async fn subscription_cap_blocks_third_channel_but_allows_resubscribe() {
     })
     .await;
     assert!(
-        matches!(rx.try_recv(), Ok(ServerEvent::SubscriptionSucceeded { .. })),
+        matches!(
+            rx.try_recv().map(|b| *b),
+            Ok(ServerEvent::SubscriptionSucceeded { .. })
+        ),
         "c1 must succeed"
     );
 
@@ -1753,7 +1768,10 @@ async fn subscription_cap_blocks_third_channel_but_allows_resubscribe() {
     })
     .await;
     assert!(
-        matches!(rx.try_recv(), Ok(ServerEvent::SubscriptionSucceeded { .. })),
+        matches!(
+            rx.try_recv().map(|b| *b),
+            Ok(ServerEvent::SubscriptionSucceeded { .. })
+        ),
         "c2 must succeed"
     );
 
@@ -1764,7 +1782,7 @@ async fn subscription_cap_blocks_third_channel_but_allows_resubscribe() {
         channel_data: None,
     })
     .await;
-    match rx.try_recv() {
+    match rx.try_recv().map(|b| *b) {
         Ok(ServerEvent::SubscriptionError {
             channel,
             error_type,
@@ -1795,7 +1813,7 @@ async fn subscription_cap_blocks_third_channel_but_allows_resubscribe() {
     })
     .await;
     assert!(
-        rx.try_recv().is_err(),
+        rx.try_recv().map(|b| *b).is_err(),
         "re-subscribing an already-held channel must be a silent no-op (idempotent)"
     );
     assert_eq!(
@@ -1817,7 +1835,10 @@ async fn subscription_cap_zero_means_unlimited() {
         })
         .await;
         assert!(
-            matches!(rx.try_recv(), Ok(ServerEvent::SubscriptionSucceeded { .. })),
+            matches!(
+                rx.try_recv().map(|b| *b),
+                Ok(ServerEvent::SubscriptionSucceeded { .. })
+            ),
             "ch{i} must succeed when cap=0 (unlimited)"
         );
     }
@@ -1895,8 +1916,8 @@ async fn client_event_rate_limit_returns_4301_and_drops() {
         .await;
     }
     // Drain subscription_succeeded frames from both.
-    while rx_sender.try_recv().is_ok() {}
-    while rx_recv.try_recv().is_ok() {}
+    while rx_sender.try_recv().map(|b| *b).is_ok() {}
+    while rx_recv.try_recv().map(|b| *b).is_ok() {}
 
     // Fire 4 client events in a burst (all within the same 1-second window).
     for _ in 0..4 {
@@ -1911,7 +1932,7 @@ async fn client_event_rate_limit_returns_4301_and_drops() {
 
     // Receiver must have received exactly 3 ChannelEvent broadcasts (not 4).
     let mut broadcast_count = 0;
-    while let Ok(ev) = rx_recv.try_recv() {
+    while let Ok(ev) = rx_recv.try_recv().map(|b| *b) {
         if raw_event_is(&ev, "client-foo") {
             broadcast_count += 1;
         }
@@ -1923,7 +1944,7 @@ async fn client_event_rate_limit_returns_4301_and_drops() {
 
     // Sender must have received exactly one 4301 ClientEventError.
     let mut rate_errors = 0;
-    while let Ok(ev) = rx_sender.try_recv() {
+    while let Ok(ev) = rx_sender.try_recv().map(|b| *b) {
         if let ServerEvent::ClientEventError {
             code, channel: ch, ..
         } = ev
@@ -1948,7 +1969,7 @@ fn ctx_saturated(
     app: App,
 ) -> (
     ConnectionContext,
-    mpsc::Receiver<ServerEvent>,
+    mpsc::Receiver<Box<ServerEvent>>,
     Arc<std::sync::atomic::AtomicBool>,
 ) {
     let (tx, rx) = mpsc::channel(1024);
@@ -1985,7 +2006,7 @@ async fn subscribe_rejected_under_saturation_public() {
         channel_data: None,
     })
     .await;
-    match rx.try_recv() {
+    match rx.try_recv().map(|b| *b) {
         Ok(ServerEvent::SubscriptionError {
             error_type,
             status,
@@ -2021,7 +2042,7 @@ async fn subscribe_rejected_under_saturation_private() {
         channel_data: None,
     })
     .await;
-    match rx.try_recv() {
+    match rx.try_recv().map(|b| *b) {
         Ok(ServerEvent::SubscriptionError {
             error_type, status, ..
         }) => {
@@ -2046,7 +2067,10 @@ async fn subscribe_succeeds_when_not_saturated() {
     })
     .await;
     assert!(
-        matches!(rx.try_recv(), Ok(ServerEvent::SubscriptionSucceeded { .. })),
+        matches!(
+            rx.try_recv().map(|b| *b),
+            Ok(ServerEvent::SubscriptionSucceeded { .. })
+        ),
         "subscribe must succeed when saturation flag is false"
     );
     assert!(
@@ -2070,7 +2094,7 @@ async fn resub_already_held_channel_is_idempotent_under_saturation() {
     })
     .await;
     // Drain the success.
-    while rx.try_recv().is_ok() {}
+    while rx.try_recv().map(|b| *b).is_ok() {}
     assert!(c.subscribed.contains("public-held"));
 
     // Now set saturation true and re-subscribe the same channel.
@@ -2083,7 +2107,7 @@ async fn resub_already_held_channel_is_idempotent_under_saturation() {
     .await;
     // The idempotency guard must return early (no frame queued, no error).
     assert!(
-        rx.try_recv().is_err(),
+        rx.try_recv().map(|b| *b).is_err(),
         "re-subscribe of an already-held channel must produce no frame (idempotent path)"
     );
     assert!(

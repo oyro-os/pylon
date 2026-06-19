@@ -203,7 +203,7 @@ mod tests {
         }
     }
 
-    fn handle_with_rx() -> (ConnectionHandle, mpsc::Receiver<ServerEvent>) {
+    fn handle_with_rx() -> (ConnectionHandle, mpsc::Receiver<Box<ServerEvent>>) {
         let (tx, rx) = mpsc::channel(1024);
         (
             ConnectionHandle {
@@ -278,7 +278,11 @@ mod tests {
         s.broadcast(&original, None);
 
         for rx in [&mut rx1, &mut rx2] {
-            match rx.try_recv().expect("subscriber received a frame") {
+            match rx
+                .try_recv()
+                .map(|b| *b)
+                .expect("subscriber received a frame")
+            {
                 ServerEvent::Raw(f) => assert_eq!(&*f, expected.as_str()),
                 other => panic!("expected Raw, got {other:?}"),
             }
@@ -315,7 +319,7 @@ mod tests {
 
         let mut delivered = 0;
         for (i, rx) in &mut rxs {
-            match rx.try_recv() {
+            match rx.try_recv().map(|b| *b) {
                 Ok(ServerEvent::Raw(f)) => {
                     assert_eq!(&*f, expected.as_str());
                     delivered += 1;

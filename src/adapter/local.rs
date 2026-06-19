@@ -279,7 +279,7 @@ mod tests {
         adapter.broadcast("app", "c", ServerEvent::Pong, None).await;
         // `broadcast` now encodes once and fans out `Raw` frames; assert the wire
         // bytes match a freshly-encoded `Pong` rather than the structured variant.
-        match rx.try_recv() {
+        match rx.try_recv().map(|b| *b) {
             Ok(ServerEvent::Raw(f)) => {
                 assert_eq!(&*f, crate::protocol::v7::frames::encode(&ServerEvent::Pong))
             }
@@ -412,8 +412,8 @@ mod tests {
             )
             .await;
         adapter.send_to_user("app", "u", ServerEvent::Pong).await;
-        assert!(matches!(rx1.try_recv(), Ok(ServerEvent::Pong)));
-        assert!(matches!(rx2.try_recv(), Ok(ServerEvent::Pong)));
+        assert!(matches!(rx1.try_recv().map(|b| *b), Ok(ServerEvent::Pong)));
+        assert!(matches!(rx2.try_recv().map(|b| *b), Ok(ServerEvent::Pong)));
     }
 
     #[tokio::test]
@@ -433,9 +433,9 @@ mod tests {
             .await;
         let ids = adapter.terminate_user("app", "u").await;
         assert_eq!(ids, vec![s]);
-        assert!(matches!(rx.try_recv(), Ok(ServerEvent::Error(e)) if e.code == 4009));
+        assert!(matches!(rx.try_recv().map(|b| *b), Ok(ServerEvent::Error(e)) if e.code == 4009));
         assert!(matches!(
-            rx.try_recv(),
+            rx.try_recv().map(|b| *b),
             Ok(ServerEvent::Close { code: 4009, .. })
         ));
     }

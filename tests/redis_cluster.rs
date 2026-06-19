@@ -225,7 +225,7 @@ fn tracked_contains(adapter: &RedisAdapter, key: &str) -> bool {
 async fn subscribe_socket(
     adapter: &RedisAdapter,
     channel: &str,
-) -> (SocketId, tokio::sync::mpsc::Receiver<ServerEvent>) {
+) -> (SocketId, tokio::sync::mpsc::Receiver<Box<ServerEvent>>) {
     let socket_id = SocketId::generate();
     let (tx, rx) = tokio::sync::mpsc::channel(1024);
     let handle = ConnectionHandle {
@@ -295,7 +295,7 @@ async fn cross_node_broadcast_fans_out_with_dedup_and_exclusion() {
     // other_a receives EXACTLY ONE event via local delivery. `broadcast` now
     // encodes once and fans out pre-encoded `Raw` frames, so assert the local
     // delivery on its wire content (byte-identical to the cross-node frame).
-    let got = tokio::time::timeout(Duration::from_secs(2), other_a_rx.recv())
+    let got = *tokio::time::timeout(Duration::from_secs(2), other_a_rx.recv())
         .await
         .expect("other_a must receive the local broadcast within 2s")
         .expect("other_a mailbox must yield an event");
@@ -311,7 +311,7 @@ async fn cross_node_broadcast_fans_out_with_dedup_and_exclusion() {
     }
 
     // recv_b receives the event via Redis as a pre-encoded Raw frame.
-    let got_b = tokio::time::timeout(Duration::from_secs(2), recv_b_rx.recv())
+    let got_b = *tokio::time::timeout(Duration::from_secs(2), recv_b_rx.recv())
         .await
         .expect("recv_b must receive the cross-node broadcast within 2s")
         .expect("recv_b mailbox must yield an event");
@@ -1150,7 +1150,7 @@ async fn cross_node_user_online_offline_single_emit() {
 fn recording_handle() -> (
     SocketId,
     ConnectionHandle,
-    tokio::sync::mpsc::Receiver<ServerEvent>,
+    tokio::sync::mpsc::Receiver<Box<ServerEvent>>,
 ) {
     let socket_id = SocketId::generate();
     let (tx, rx) = tokio::sync::mpsc::channel(1024);
@@ -1198,7 +1198,7 @@ async fn send_to_user_reaches_connection_on_another_node() {
         )
         .await;
 
-    let got = with_timeout(async { rx_b.recv().await }).await;
+    let got = with_timeout(async { rx_b.recv().await }).await.map(|b| *b);
     match got {
         Some(ServerEvent::Raw(frame)) => {
             let v: serde_json::Value = serde_json::from_str(&frame).expect("raw frame is JSON");
@@ -1231,12 +1231,12 @@ async fn terminate_user_closes_connection_on_another_node() {
 
     node_a.terminate_user(TEST_APP, "u8").await;
 
-    let first = with_timeout(async { rx_b.recv().await }).await;
+    let first = with_timeout(async { rx_b.recv().await }).await.map(|b| *b);
     assert!(
         matches!(first, Some(ServerEvent::Error(ref e)) if e.code == 4009),
         "expected 4009 error frame on node B, got {first:?}"
     );
-    let second = with_timeout(async { rx_b.recv().await }).await;
+    let second = with_timeout(async { rx_b.recv().await }).await.map(|b| *b);
     assert!(
         matches!(second, Some(ServerEvent::Close { code: 4009, .. })),
         "expected 4009 Close on node B, got {second:?}"
@@ -1284,7 +1284,7 @@ async fn cross_node_watchlist_online_offline() {
         adapter_b.signin_user(TEST_APP, "u7", handle_b).await;
 
         // 3. A's watcher receives a WatchlistEvents "online" for u7.
-        let got = with_timeout(async { rx.recv().await }).await;
+        let got = with_timeout(async { rx.recv().await }).await.map(|b| *b);
         match got {
             Some(ServerEvent::WatchlistEvents { events }) => {
                 assert_eq!(events.len(), 1, "exactly one watchlist change");
@@ -1296,7 +1296,7 @@ async fn cross_node_watchlist_online_offline() {
 
         // 4. B signs out u7 → cluster offline edge → publishes WatchOffline → A gets it.
         adapter_b.signout_user(TEST_APP, "u7", &b_socket).await;
-        let got = with_timeout(async { rx.recv().await }).await;
+        let got = with_timeout(async { rx.recv().await }).await.map(|b| *b);
         match got {
             Some(ServerEvent::WatchlistEvents { events }) => {
                 assert_eq!(events.len(), 1, "exactly one watchlist change");
@@ -1351,7 +1351,7 @@ async fn sweeper_offline_on_user_crash_notifies_watchers() {
         let (_sb, b_handle, _rx_b) = recording_handle();
         adapter_b.signin_user(TEST_APP, "u7", b_handle).await;
 
-        let got = with_timeout(async { rx.recv().await }).await;
+        let got = with_timeout(async { rx.recv().await }).await.map(|b| *b);
         match got {
             Some(ServerEvent::WatchlistEvents { events }) => {
                 assert_eq!(events.len(), 1, "exactly one watchlist change");
@@ -1376,7 +1376,7 @@ async fn sweeper_offline_on_user_crash_notifies_watchers() {
         assert!(acquired, "A must acquire the sweep lease (no other holder)");
 
         // A's watcher receives a WatchlistEvents "offline" for u7.
-        let got = with_timeout(async { rx.recv().await }).await;
+        let got = with_timeout(async { rx.recv().await }).await.map(|b| *b);
         match got {
             Some(ServerEvent::WatchlistEvents { events }) => {
                 assert_eq!(events.len(), 1, "exactly one watchlist change");
@@ -1592,7 +1592,7 @@ async fn cluster_publish_broadcast_fans_out_only_remote() {
             .cluster_publish_broadcast(TEST_APP, "public-room", frame.clone(), None)
             .await;
 
-        let received = tokio::time::timeout(Duration::from_secs(2), rx_b.recv())
+        let received = *tokio::time::timeout(Duration::from_secs(2), rx_b.recv())
             .await
             .expect("B must receive the cross-node broadcast in time")
             .expect("B's mailbox must yield the broadcast");

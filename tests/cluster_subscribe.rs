@@ -120,7 +120,7 @@ async fn fake_subscriber(
     SocketId,
     usize,
     pylon::connection::handle::Mailbox,
-    tokio::sync::mpsc::Receiver<pylon::protocol::event::ServerEvent>,
+    tokio::sync::mpsc::Receiver<Box<pylon::protocol::event::ServerEvent>>,
 ) {
     let socket_id = SocketId::generate();
     let (tx, rx) = tokio::sync::mpsc::channel(1024);
@@ -138,13 +138,13 @@ async fn fake_subscriber(
 /// Drain `rx` until a `SubscriptionCount` frame for `channel` is observed (parsing the
 /// registry-mailbox `Raw` frame), returning its `count`, or `None` within `timeout`.
 async fn await_subscription_count(
-    rx: &mut tokio::sync::mpsc::Receiver<pylon::protocol::event::ServerEvent>,
+    rx: &mut tokio::sync::mpsc::Receiver<Box<pylon::protocol::event::ServerEvent>>,
     channel: &str,
     timeout: Duration,
 ) -> Option<u64> {
     let fut = async {
         loop {
-            match rx.recv().await {
+            match rx.recv().await.map(|b| *b) {
                 Some(pylon::protocol::event::ServerEvent::Raw(frame)) => {
                     let v: Value = match serde_json::from_str(&frame) {
                         Ok(v) => v,

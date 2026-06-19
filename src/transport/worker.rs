@@ -234,7 +234,7 @@ struct Session {
     ctx: ConnectionContext,
     /// Inbound side of the connection mailbox; the matching sender lives in
     /// `ctx.self_tx` (and is handed to other connections via `ctx.handle()`).
-    rx: mpsc::Receiver<ServerEvent>,
+    rx: mpsc::Receiver<Box<ServerEvent>>,
     codec: Box<dyn Codec>,
     /// The app id + its connection counter, so disconnect can decrement.
     conn_count: Arc<AtomicUsize>,
@@ -1179,7 +1179,13 @@ fn establish_session(
     // `.max(1)`: `mpsc::channel(0)` panics. `from_env` already rejects 0, but a
     // direct `WorkerEnv` struct literal could pass it — clamp here so the single
     // point where the capacity reaches tokio is panic-proof regardless of source.
-    let (tx, rx) = mpsc::channel::<ServerEvent>(env.mailbox_capacity.max(1));
+    // Mailbox carries `Box<ServerEvent>` (8 B), not `ServerEvent` (104 B): tokio mpsc
+    // eagerly allocates a 32-slot block per channel at creation, so a bare ServerEvent
+    // makes every connection pay 32*104 ≈ 3.3 KB up front even while idle (profiled as
+    // the single largest per-conn allocation). Boxing shrinks that block ~6x; the heap
+    // event is allocated only when a direct send actually happens (off the broadcast
+    // hot path, which uses the encode-once Arc<[u8]> sink).
+    let (tx, rx) = mpsc::channel::<Box<ServerEvent>>(env.mailbox_capacity.max(1));
     let ctx = ConnectionContext {
         app,
         socket_id,
@@ -1419,7 +1425,7 @@ fn drain_session(poll: &Poll, entry: &mut Entry, now_ns: u64) -> DrainResult {
     let mut wrote = false;
     let mut subs_changed = false;
     while let Ok(ev) = session.rx.try_recv() {
-        match ev {
+        match *ev {
             ServerEvent::Close { code, reason } => {
                 let mut out = BytesMut::new();
                 let mut frame_body = Vec::with_capacity(2 + reason.len());
