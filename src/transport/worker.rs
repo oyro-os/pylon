@@ -357,7 +357,7 @@ pub fn run(mut cfg: WorkerConfig, shutdown: Arc<AtomicBool>) -> std::io::Result<
     // each `(app, channel)`. Populated by reconciling `ctx.subscribed` after each
     // dispatch; consulted when a `BroadcastMsg` arrives to fan the frame out to
     // exactly this worker's local subscribers.
-    let mut local_subs: HashMap<(String, String), HashSet<SocketId>> = HashMap::new();
+    let mut local_subs: HashMap<(Arc<str>, Arc<str>), HashSet<SocketId>> = HashMap::new();
     // Reverse lookup: a subscriber's `socket_id` → its slab token, so a broadcast
     // delivery can find the connection in O(1) without scanning the slab.
     let mut sid_to_token: HashMap<SocketId, usize> = HashMap::new();
@@ -1492,7 +1492,7 @@ fn drain_dirty_sessions(
     conns: &mut slab::Slab<Entry>,
     dirty_rx: &std::sync::mpsc::Receiver<usize>,
     dirty_set: &mut HashSet<usize>,
-    local_subs: &mut HashMap<(String, String), HashSet<SocketId>>,
+    local_subs: &mut HashMap<(Arc<str>, Arc<str>), HashSet<SocketId>>,
     sid_to_token: &mut HashMap<SocketId, usize>,
     wheel: &mut TimerWheel,
     inflight_bytes: &mut u64,
@@ -1713,7 +1713,7 @@ fn remove(
     poll: &Poll,
     conns: &mut slab::Slab<Entry>,
     key: usize,
-    local_subs: &mut HashMap<(String, String), HashSet<SocketId>>,
+    local_subs: &mut HashMap<(Arc<str>, Arc<str>), HashSet<SocketId>>,
     sid_to_token: &mut HashMap<SocketId, usize>,
     wheel: &mut TimerWheel,
     inflight_bytes: &mut u64,
@@ -1748,13 +1748,13 @@ fn remove(
 /// so it removes exactly the entries `reconcile_membership` inserted.
 fn deindex_connection(
     session: &Session,
-    local_subs: &mut HashMap<(String, String), HashSet<SocketId>>,
+    local_subs: &mut HashMap<(Arc<str>, Arc<str>), HashSet<SocketId>>,
     sid_to_token: &mut HashMap<SocketId, usize>,
 ) {
-    let app = session.ctx.app.id.clone();
+    let app: Arc<str> = Arc::from(session.ctx.app.id.as_str());
     let sid = &session.ctx.socket_id;
     for channel in &session.subs {
-        let k = (app.clone(), channel.clone());
+        let k = (Arc::clone(&app), Arc::<str>::from(channel.as_str()));
         if let Some(set) = local_subs.get_mut(&k) {
             set.remove(sid);
             if set.is_empty() {
@@ -1775,25 +1775,25 @@ fn deindex_connection(
 fn reconcile_membership(
     session: &mut Session,
     token: usize,
-    local_subs: &mut HashMap<(String, String), HashSet<SocketId>>,
+    local_subs: &mut HashMap<(Arc<str>, Arc<str>), HashSet<SocketId>>,
     sid_to_token: &mut HashMap<SocketId, usize>,
 ) {
     if session.subs == session.ctx.subscribed {
         return;
     }
-    let app = session.ctx.app.id.clone();
+    let app: Arc<str> = Arc::from(session.ctx.app.id.as_str());
     let sid = &session.ctx.socket_id;
 
     // Added channels: present in ctx.subscribed, absent from the recorded set.
     for channel in session.ctx.subscribed.difference(&session.subs) {
         local_subs
-            .entry((app.clone(), channel.clone()))
+            .entry((Arc::clone(&app), Arc::<str>::from(channel.as_str())))
             .or_default()
             .insert(*sid);
     }
     // Removed channels: were recorded, no longer subscribed.
     for channel in session.subs.difference(&session.ctx.subscribed) {
-        let k = (app.clone(), channel.clone());
+        let k = (Arc::clone(&app), Arc::<str>::from(channel.as_str()));
         if let Some(set) = local_subs.get_mut(&k) {
             set.remove(sid);
             if set.is_empty() {
@@ -1877,7 +1877,7 @@ fn drain_broadcasts(
     poll: &Poll,
     conns: &mut slab::Slab<Entry>,
     rx: &std::sync::mpsc::Receiver<crate::transport::fanout::BroadcastMsg>,
-    local_subs: &mut HashMap<(String, String), HashSet<SocketId>>,
+    local_subs: &mut HashMap<(Arc<str>, Arc<str>), HashSet<SocketId>>,
     sid_to_token: &mut HashMap<SocketId, usize>,
     wheel: &mut TimerWheel,
     effective_budget: u64,
@@ -1892,7 +1892,7 @@ fn drain_broadcasts(
     let mut to_close: Vec<usize> = Vec::new();
 
     while let Ok(msg) = rx.try_recv() {
-        let key = (msg.app.to_string(), msg.channel.to_string());
+        let key = (Arc::clone(&msg.app), Arc::clone(&msg.channel));
         let Some(subs) = local_subs.get(&key) else {
             continue; // no local subscribers for this channel on this worker
         };
