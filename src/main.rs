@@ -17,8 +17,15 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+#[cfg(not(feature = "dhat-heap"))]
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
+// Heap-profiling build (`--features dhat-heap`): dhat replaces the allocator so it
+// can attribute every allocation to its call site. Writes dhat-heap.json on exit.
+#[cfg(feature = "dhat-heap")]
+#[global_allocator]
+static GLOBAL: dhat::Alloc = dhat::Alloc;
 
 /// Spawn the webhook dispatcher with the production HTTP transport + system clock.
 /// `vacated_grace_ms` + `occupancy` enable the cluster-aware `channel_vacated` grace
@@ -56,6 +63,11 @@ fn spawn_webhooks(
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // Heap profiler guard: lives for the whole process; its Drop (after the worker
+    // joins on shutdown) writes dhat-heap.json. The gmax snapshot inside captures the
+    // heap at peak — i.e. while the connections were held.
+    #[cfg(feature = "dhat-heap")]
+    let _dhat = dhat::Profiler::new_heap();
     pylon::init_tracing();
     let config = ServerConfig::from_env();
     let apps: Arc<dyn AppManager> = Arc::new(StaticFileAppManager::from_file(&config.apps_path)?);

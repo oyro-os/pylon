@@ -15,6 +15,9 @@ categories = ["network-programming", "web-programming::websocket"]
 # integration tests of the SP10 overload accounting. Off by default; the crate's
 # own `cargo test` enables it implicitly via `cfg(test)`.
 test-hooks = []
+# Heap profiling: swaps mimalloc for dhat's allocator + installs a heap profiler
+# that writes dhat-heap.json on clean exit. Dev/profiling only; off by default.
+dhat-heap = ["dep:dhat"]
 
 [dependencies]
 # Async runtime
@@ -68,6 +71,8 @@ fred = { version = "10", default-features = false, features = ["subscriber-clien
 uuid = { version = "1", features = ["v4"] }
 # Global allocator: faster + better cross-thread alloc/free for the cross-core fan-out pattern.
 mimalloc = { version = "0.1", default-features = false }
+# Heap profiler (optional, `dhat-heap` feature) — replaces the allocator for attribution.
+dhat = { version = "0.3", optional = true }
 # SO_REUSEPORT/SO_REUSEADDR listener sockets — one per per-core worker so the
 # kernel load-balances accepts across worker threads (SP9 multi-worker). The
 # `all` feature unlocks `set_reuse_port` (gated `cfg(all(feature="all", unix))`).
