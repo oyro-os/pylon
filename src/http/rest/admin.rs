@@ -13,6 +13,8 @@ use axum::{
 #[derive(serde::Deserialize)]
 pub struct InvalidateBody {
     pub key: String,
+    #[serde(default)]
+    pub action: crate::app::invalidation::InvalidateAction,
 }
 
 /// `POST /admin/apps/{app_id}/invalidate`  body: `{ "key": "<app key>" }`
@@ -49,7 +51,7 @@ pub async fn post_invalidate(
         .map_err(|e| RestError::bad_request(format!("invalid body: {e}")))?;
     match &state.invalidator {
         Some(inv) => {
-            inv.publish(&app_id, &parsed.key)
+            inv.publish(&app_id, &parsed.key, parsed.action)
                 .await
                 .map_err(|e| RestError::service_unavailable(format!("invalidate publish failed: {e}")))?;
             Ok(axum::http::StatusCode::ACCEPTED)
@@ -76,7 +78,7 @@ pub fn check_token(expected: &str, presented: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::check_token;
+    use super::*;
 
     #[test]
     fn correct_token_passes() {
@@ -104,5 +106,24 @@ mod tests {
         // would never be set to empty string (from_env uses .ok() which treats
         // an unset var as None, not "").
         assert!(check_token("", ""));
+    }
+
+    #[test]
+    fn invalidate_body_defaults_action_to_refresh() {
+        let b: InvalidateBody = serde_json::from_str(r#"{"key":"k"}"#).unwrap();
+        assert_eq!(b.key, "k");
+        assert_eq!(b.action, crate::app::invalidation::InvalidateAction::Refresh);
+    }
+
+    #[test]
+    fn invalidate_body_parses_remove_action() {
+        let b: InvalidateBody = serde_json::from_str(r#"{"key":"k","action":"remove"}"#).unwrap();
+        assert_eq!(b.action, crate::app::invalidation::InvalidateAction::Remove);
+    }
+
+    #[test]
+    fn invalidate_body_parses_refresh_action() {
+        let b: InvalidateBody = serde_json::from_str(r#"{"key":"k","action":"refresh"}"#).unwrap();
+        assert_eq!(b.action, crate::app::invalidation::InvalidateAction::Refresh);
     }
 }

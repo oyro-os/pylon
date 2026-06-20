@@ -243,6 +243,13 @@ impl Adapter for ClusterAdapter {
         self.local.terminate_user(app, user_id).await
     }
 
+    async fn purge_app(&self, app_id: &str) -> Vec<SocketId> {
+        // Node-local purge. Cross-node reclaim (Redis SREM + conn_counts + cache eviction)
+        // is the AppPurger's responsibility via the node's RedisAdapter; the worker path
+        // closes only its own local connections.
+        self.local.purge_app(app_id).await
+    }
+
     async fn watch(
         &self,
         app: &str,

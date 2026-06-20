@@ -78,7 +78,7 @@ async fn spawn_pylon(receiver: SocketAddr) -> SocketAddr {
         ]"#
     );
     let apps: Arc<dyn AppManager> = Arc::new(StaticFileAppManager::from_json(&apps_json).unwrap());
-    let local = Arc::new(LocalAdapter::new(Arc::new(Registry::new())));
+    let local = Arc::new(LocalAdapter::new(Arc::new(Registry::new()), Arc::new(pylon::adapter::app_registry::AppRegistry::new())));
     let webhooks = pylon::webhook::spawn(
         apps.clone(),
         |metrics| {

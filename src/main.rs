@@ -84,24 +84,23 @@ async fn main() -> anyhow::Result<()> {
             Arc::new(pylon::app::mongo::MongoAppManager::connect(&dsn).await?)
         }
     };
-    let (apps, invalidator): (Arc<dyn AppManager>, Option<Arc<pylon::app::invalidation::AppInvalidator>>) =
-        if config.app_cache && config.app_manager != AppManagerKind::StaticFile {
-            use pylon::app::cache::{CacheConfig, CachingAppManager};
-            let l2 = match &config.app_cache_redis_url {
-                Some(url) => Some(Arc::new(pylon::app::l2::RedisAppCache::connect(url, 4, config.app_cache_ttl).await?)),
-                None => None,
-            };
-            let cfg = CacheConfig {
-                max_capacity: config.app_cache_max, ttl_secs: config.app_cache_ttl,
-                neg_max: config.app_cache_neg_max, neg_ttl_secs: config.app_cache_neg_ttl,
-            };
-            let caching = Arc::new(CachingAppManager::new(apps, cfg, l2));
-            let inv = match &config.app_cache_redis_url {
-                Some(url) => Some(pylon::app::invalidation::AppInvalidator::spawn(url, caching.clone()).await?),
-                None => None,
-            };
-            (caching, inv)
-        } else { (apps, None) };
+    let (apps, caching_for_purge, uncached_driver) = if config.app_cache && config.app_manager != AppManagerKind::StaticFile {
+        use pylon::app::cache::{CacheConfig, CachingAppManager};
+        let l2 = match &config.app_cache_redis_url {
+            Some(url) => Some(Arc::new(pylon::app::l2::RedisAppCache::connect(url, 4, config.app_cache_ttl).await?)),
+            None => None,
+        };
+        let cfg = CacheConfig {
+            max_capacity: config.app_cache_max, ttl_secs: config.app_cache_ttl,
+            neg_max: config.app_cache_neg_max, neg_ttl_secs: config.app_cache_neg_ttl,
+        };
+        let uncached_driver: Arc<dyn AppManager> = apps.clone();
+        let caching = Arc::new(CachingAppManager::new(apps, cfg, l2));
+        let apps_erased: Arc<dyn AppManager> = caching.clone();
+        (apps_erased, Some(caching), Some(uncached_driver))
+    } else {
+        (apps, None, None)
+    };
 
     // The redis adapter is the CLUSTERED production path: the node's single
     // `RedisAdapter` is owned by a `ClusterBridge` (on its own runtime), the percore workers
@@ -111,12 +110,17 @@ async fn main() -> anyhow::Result<()> {
     // so webhooks are attached AFTER the bridge is up), so it runs in a dedicated function.
     // The local (single-node) path keeps the straight-line wiring below.
     if config.adapter == "redis" {
-        return run_redis_percore(config, apps, invalidator).await;
+        return run_redis_percore(config, apps, caching_for_purge, uncached_driver).await;
     }
+
+    // Per-app connection index shared with `LocalAdapter::purge_app` (Phase 6),
+    // created once and threaded into both the worker fleet and the adapter.
+    let app_registry: Arc<pylon::adapter::app_registry::AppRegistry> =
+        Arc::new(pylon::adapter::app_registry::AppRegistry::new());
 
     // The CONCRETE local adapter, so the percore transport can install its sharded
     // broadcast sink on it.
-    let local = Arc::new(LocalAdapter::new(Arc::new(Registry::new())));
+    let local = Arc::new(LocalAdapter::new(Arc::new(Registry::new()), app_registry.clone()));
     let adapter: Arc<dyn Adapter> = local.clone();
 
     // The single-node local path fires `channel_vacated` immediately (no grace
@@ -127,6 +131,38 @@ async fn main() -> anyhow::Result<()> {
     // Shared connection counters (the axum REST `AppState` and the percore
     // `DispatchEnv` mirror this type exactly).
     let conn_counts: Arc<DashMap<String, Arc<AtomicUsize>>> = Arc::new(Default::default());
+
+    // Build the AppPurger + invalidation subscriber once the adapter + conn_counts
+    // exist. Only for DB-backed cache paths with an L2/pub-sub Redis URL.
+    let invalidator = match (&caching_for_purge, &config.app_cache_redis_url) {
+        (Some(cache), Some(url)) => {
+            let purger = Arc::new(pylon::app::purger::AppPurger::new(
+                adapter.clone(),
+                conn_counts.clone(),
+                cache.clone(),
+            ));
+            Some(pylon::app::invalidation::AppInvalidator::spawn(url, purger).await?)
+        }
+        _ => None,
+    };
+
+    // App-purge sweep backstop: DB-backed cache path only, gated by the interval.
+    if let (Some(cache), Some(driver)) = (&caching_for_purge, &uncached_driver) {
+        if config.app_sweep_interval_secs > 0 {
+            let purger = Arc::new(pylon::app::purger::AppPurger::new(
+                adapter.clone(),
+                conn_counts.clone(),
+                cache.clone(),
+            ));
+            pylon::app::purger::spawn_sweep(
+                config.app_sweep_interval_secs,
+                app_registry.clone(),
+                driver.clone(),
+                cache.clone(),
+                purger,
+            );
+        }
+    }
 
     // The percore worker is a blocking `mio` loop; run it on a dedicated blocking
     // thread and flip the shared shutdown flag when the signal future resolves.
@@ -186,6 +222,7 @@ async fn main() -> anyhow::Result<()> {
             apps,
             adapter,
             conn_counts,
+            app_registry,
             webhooks,
             Some(rest_tx),
             worker_shutdown,
@@ -231,12 +268,22 @@ async fn main() -> anyhow::Result<()> {
 /// `AdapterOccupancy` over `bridge.adapter()`, and only THEN `bridge.attach_webhooks` wires
 /// the deferred handle into the drain loop and starts the Redis sweeper. The bridge is held
 /// alive until after the worker joins; its `Drop` tears down the dedicated Redis runtime.
-async fn run_redis_percore(config: ServerConfig, apps: Arc<dyn AppManager>, invalidator: Option<Arc<pylon::app::invalidation::AppInvalidator>>) -> anyhow::Result<()> {
+async fn run_redis_percore(
+    config: ServerConfig,
+    apps: Arc<dyn AppManager>,
+    caching_for_purge: Option<Arc<pylon::app::cache::CachingAppManager>>,
+    uncached_driver: Option<Arc<dyn AppManager>>,
+) -> anyhow::Result<()> {
+    // Per-app connection index shared with `LocalAdapter::purge_app` (Phase 6),
+    // created once and threaded into both the worker fleet and the adapter.
+    let app_registry: Arc<pylon::adapter::app_registry::AppRegistry> =
+        Arc::new(pylon::adapter::app_registry::AppRegistry::new());
+
     // The single shared LocalAdapter: the bridge's RedisAdapter shares it (so its recv
     // loop's `local.broadcast(Raw)` shards remote frames to this node's workers), the REST
     // plane reads the saturation flag off it, and the worker's ClusterAdapter + the sharded
     // sink install on it.
-    let local = Arc::new(LocalAdapter::new(Arc::new(Registry::new())));
+    let local = Arc::new(LocalAdapter::new(Arc::new(Registry::new()), app_registry.clone()));
 
     // Start the bridge: builds the node's single `RedisAdapter` (sharing `local`) on its own
     // runtime and returns once Redis is connected, or `Err` if the connect failed.
@@ -263,6 +310,38 @@ async fn run_redis_percore(config: ServerConfig, apps: Arc<dyn AppManager>, inva
     bridge.attach_webhooks(webhooks.clone());
 
     let conn_counts: Arc<DashMap<String, Arc<AtomicUsize>>> = Arc::new(Default::default());
+
+    // Build the AppPurger + invalidation subscriber once the adapter + conn_counts
+    // exist. Only for DB-backed cache paths with an L2/pub-sub Redis URL.
+    let invalidator = match (&caching_for_purge, &config.app_cache_redis_url) {
+        (Some(cache), Some(url)) => {
+            let purger = Arc::new(pylon::app::purger::AppPurger::new(
+                adapter.clone(),
+                conn_counts.clone(),
+                cache.clone(),
+            ));
+            Some(pylon::app::invalidation::AppInvalidator::spawn(url, purger).await?)
+        }
+        _ => None,
+    };
+
+    // App-purge sweep backstop: DB-backed cache path only, gated by the interval.
+    if let (Some(cache), Some(driver)) = (&caching_for_purge, &uncached_driver) {
+        if config.app_sweep_interval_secs > 0 {
+            let purger = Arc::new(pylon::app::purger::AppPurger::new(
+                adapter.clone(),
+                conn_counts.clone(),
+                cache.clone(),
+            ));
+            pylon::app::purger::spawn_sweep(
+                config.app_sweep_interval_secs,
+                app_registry.clone(),
+                driver.clone(),
+                cache.clone(),
+                purger,
+            );
+        }
+    }
 
     // REST handoff plane: the worker hands plain-HTTP connections to this axum router via
     // `rest_tx`; `rest::serve` drives them on the tokio runtime. The REST `AppState` drives
@@ -322,6 +401,7 @@ async fn run_redis_percore(config: ServerConfig, apps: Arc<dyn AppManager>, inva
             apps,
             worker_adapter,
             conn_counts,
+            app_registry,
             webhooks,
             Some(rest_tx),
             worker_shutdown,

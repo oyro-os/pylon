@@ -76,7 +76,7 @@ fn free_port() -> u16 {
 async fn spawn() -> Harness {
     let apps: Arc<dyn AppManager> = Arc::new(StaticFileAppManager::from_json(APPS).unwrap());
     let registry = Arc::new(Registry::new());
-    let adapter: Arc<dyn Adapter> = Arc::new(LocalAdapter::new(registry));
+    let adapter: Arc<dyn Adapter> = Arc::new(LocalAdapter::new(registry, Arc::new(pylon::adapter::app_registry::AppRegistry::new())));
     let config = ServerConfig::default();
     let env = Arc::new(DispatchEnv {
         apps,
@@ -91,6 +91,7 @@ async fn spawn() -> Harness {
         clustered: false,
         max_connections: 0,
         mailbox_capacity: 256,
+        app_registry: Arc::new(pylon::adapter::app_registry::AppRegistry::new()),
     });
 
     let port = free_port();

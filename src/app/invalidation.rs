@@ -1,4 +1,4 @@
-use super::cache::CachingAppManager;
+use super::purger::AppPurger;
 use fred::interfaces::PubsubInterface;
 use fred::prelude::*;
 use std::sync::Arc;
@@ -10,16 +10,31 @@ pub struct AppInvalidator {
 
 pub const INVALIDATE_CHANNEL: &str = "pylon:app:invalidate";
 
+/// The invalidation action. `Refresh` (config/secret change) evicts cache only;
+/// `Remove` (disabled/deleted) additionally force-closes connections + reclaims
+/// the per-app counter. `#[serde(default)]` on the field + `#[default] Refresh`
+/// means any legacy/blank message degrades to the SAFE (non-destructive) action.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum InvalidateAction {
+    #[default]
+    Refresh,
+    Remove,
+}
+
 #[derive(serde::Serialize, serde::Deserialize)]
 struct InvalidateMsg {
     id: String,
     key: String,
+    #[serde(default)]
+    action: InvalidateAction,
 }
 
 impl AppInvalidator {
-    /// Connect to `url`, subscribe to the invalidation channel (evicting `cache`
-    /// on each message), and return a handle that can publish invalidations.
-    pub async fn spawn(url: &str, cache: Arc<CachingAppManager>) -> anyhow::Result<Arc<Self>> {
+    /// Connect to `url`, subscribe to the invalidation channel (dispatching each
+    /// message through `purger`), and return a handle that can publish
+    /// invalidations.
+    pub async fn spawn(url: &str, purger: Arc<AppPurger>) -> anyhow::Result<Arc<Self>> {
         // `max_attempts = 0` means retry forever; min 100ms, max 30s, base 2.
         let policy = ReconnectPolicy::new_exponential(0, 100, 30_000, 2);
         let mut builder = Builder::from_config(Config::from_url(url)?);
@@ -43,7 +58,10 @@ impl AppInvalidator {
                     Ok(msg) => match msg.value.into_string() {
                         Some(s) => {
                             if let Ok(m) = serde_json::from_str::<InvalidateMsg>(&s) {
-                                cache.invalidate(&m.id, &m.key).await;
+                                match m.action {
+                                    InvalidateAction::Refresh => purger.refresh(&m.id, &m.key).await,
+                                    InvalidateAction::Remove => purger.purge(&m.id, &m.key).await,
+                                }
                             } else {
                                 tracing::warn!(payload = %s, "bad app-invalidate message");
                             }
@@ -62,9 +80,9 @@ impl AppInvalidator {
         Ok(Arc::new(Self { publish_pool }))
     }
 
-    pub async fn publish(&self, id: &str, key: &str) -> anyhow::Result<()> {
+    pub async fn publish(&self, id: &str, key: &str, action: InvalidateAction) -> anyhow::Result<()> {
         let payload =
-            serde_json::to_string(&InvalidateMsg { id: id.into(), key: key.into() })?;
+            serde_json::to_string(&InvalidateMsg { id: id.into(), key: key.into(), action })?;
         let _: () = self.publish_pool.next().publish(INVALIDATE_CHANNEL, payload).await?;
         Ok(())
     }
@@ -73,8 +91,12 @@ impl AppInvalidator {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::adapter::app_registry::AppRegistry;
+    use crate::adapter::local::LocalAdapter;
+    use crate::adapter::Adapter;
     use crate::app::cache::{CacheConfig, CachingAppManager};
     use crate::app::{App, AppLookupError, AppManager};
+    use crate::channel::registry::Registry;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     fn redis_url() -> String {
@@ -127,7 +149,17 @@ mod tests {
             cfg.clone(),
             None,
         ));
-        let _inv_b = AppInvalidator::spawn(&redis_url(), cache_b.clone()).await.unwrap();
+        let purger_b = std::sync::Arc::new(crate::app::purger::AppPurger::new(
+            {
+                let app_registry = std::sync::Arc::new(AppRegistry::new());
+                let local: std::sync::Arc<dyn Adapter> =
+                    std::sync::Arc::new(LocalAdapter::new(std::sync::Arc::new(Registry::new()), app_registry));
+                local
+            },
+            std::sync::Arc::new(dashmap::DashMap::new()),
+            cache_b.clone(),
+        ));
+        let _inv_b = AppInvalidator::spawn(&redis_url(), purger_b).await.unwrap();
         // node A: only publishes
         let cache_a = std::sync::Arc::new(CachingAppManager::new(
             std::sync::Arc::new(Mock {
@@ -137,12 +169,22 @@ mod tests {
             cfg,
             None,
         ));
-        let inv_a = AppInvalidator::spawn(&redis_url(), cache_a).await.unwrap();
+        let purger_a = std::sync::Arc::new(crate::app::purger::AppPurger::new(
+            {
+                let app_registry = std::sync::Arc::new(AppRegistry::new());
+                let local: std::sync::Arc<dyn Adapter> =
+                    std::sync::Arc::new(LocalAdapter::new(std::sync::Arc::new(Registry::new()), app_registry));
+                local
+            },
+            std::sync::Arc::new(dashmap::DashMap::new()),
+            cache_a,
+        ));
+        let inv_a = AppInvalidator::spawn(&redis_url(), purger_a).await.unwrap();
 
         // warm node B's cache (driver call 1), then invalidate from node A
         assert_eq!(cache_b.by_id("a").await.unwrap().unwrap().key, "k");
         assert_eq!(calls.load(Ordering::SeqCst), 1);
-        inv_a.publish("a", "k").await.unwrap();
+        inv_a.publish("a", "k", InvalidateAction::Refresh).await.unwrap();
         // wait for the pub/sub round-trip, then re-fetch to prove eviction
         for _ in 0..50 {
             if cache_b_evicted(&cache_b, &calls).await {
@@ -168,6 +210,88 @@ mod tests {
             );
         }
     }
+
+    #[tokio::test]
+    async fn remove_publish_force_closes_conn_clears_counter_and_evicts_cache_on_node_b() {
+        use crate::connection::handle::{ConnectionHandle, Mailbox};
+        use crate::protocol::event::ServerEvent;
+        use crate::protocol::socket_id::SocketId;
+        use tokio::sync::mpsc;
+
+        let cfg = CacheConfig { max_capacity: 100, ttl_secs: 300, neg_max: 100, neg_ttl_secs: 300 };
+        let calls = std::sync::Arc::new(AtomicUsize::new(0));
+        let cache_b = std::sync::Arc::new(CachingAppManager::new(
+            std::sync::Arc::new(Mock { app: Some(app("a", "k")), calls: calls.clone() }),
+            cfg.clone(),
+            None,
+        ));
+
+        // node B: a live connection registered for "a", and a conn_counts entry.
+        let app_registry_b = std::sync::Arc::new(AppRegistry::new());
+        let local_b = std::sync::Arc::new(LocalAdapter::new(
+            std::sync::Arc::new(Registry::new()),
+            app_registry_b.clone(),
+        ));
+        let (tx, mut rx) = mpsc::channel(1024);
+        let sid = SocketId::generate();
+        app_registry_b.insert("a", ConnectionHandle { socket_id: sid, mailbox: Mailbox::new(tx, None, None) });
+        let conn_counts_b: std::sync::Arc<dashmap::DashMap<String, std::sync::Arc<AtomicUsize>>> =
+            std::sync::Arc::new(dashmap::DashMap::new());
+        conn_counts_b.insert("a".to_string(), std::sync::Arc::new(AtomicUsize::new(1)));
+
+        let adapter_b: std::sync::Arc<dyn Adapter> = local_b.clone();
+        let purger_b = std::sync::Arc::new(crate::app::purger::AppPurger::new(
+            adapter_b,
+            conn_counts_b.clone(),
+            cache_b.clone(),
+        ));
+        let _inv_b = AppInvalidator::spawn(&redis_url(), purger_b).await.unwrap();
+
+        // Warm node B's cache.
+        assert_eq!(cache_b.by_id("a").await.unwrap().unwrap().key, "k");
+        let warmed = calls.load(Ordering::SeqCst);
+
+        // node A publishes a REMOVE.
+        let purger_a = std::sync::Arc::new(crate::app::purger::AppPurger::new(
+            {
+                let ar = std::sync::Arc::new(AppRegistry::new());
+                let l: std::sync::Arc<dyn Adapter> =
+                    std::sync::Arc::new(LocalAdapter::new(std::sync::Arc::new(Registry::new()), ar));
+                l
+            },
+            std::sync::Arc::new(dashmap::DashMap::new()),
+            std::sync::Arc::new(CachingAppManager::new(
+                std::sync::Arc::new(Mock { app: Some(app("a", "k")), calls: std::sync::Arc::new(AtomicUsize::new(0)) }),
+                cfg,
+                None,
+            )),
+        ));
+        let inv_a = AppInvalidator::spawn(&redis_url(), purger_a).await.unwrap();
+        inv_a.publish("a", "k", InvalidateAction::Remove).await.unwrap();
+
+        // Wait for the pub/sub round-trip: the connection gets 4009.
+        let got_close = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                match rx.recv().await {
+                    Some(b) => {
+                        if matches!(*b, ServerEvent::Close { code: 4009, .. }) {
+                            return true;
+                        }
+                    }
+                    None => return false,
+                }
+            }
+        })
+        .await
+        .unwrap_or(false);
+        assert!(got_close, "node B's connection must be force-closed 4009 by the remove");
+        // conn_counts entry reclaimed.
+        assert!(!conn_counts_b.contains_key("a"), "node B conn_counts entry must be cleared");
+        // Cache evicted: a re-fetch hits the driver again.
+        let _ = cache_b.by_id("a").await;
+        assert!(calls.load(Ordering::SeqCst) > warmed, "node B cache must be evicted");
+    }
+
     async fn cache_b_evicted(
         c: &std::sync::Arc<CachingAppManager>,
         calls: &std::sync::Arc<AtomicUsize>,
