@@ -1,6 +1,7 @@
 //! Cross-node channel-state seam. SP2a ships only the in-process `Local` impl;
 //! a Redis impl lands in SP7 behind this same trait — no handler changes.
 
+pub mod app_registry;
 pub mod local;
 pub mod redis;
 
