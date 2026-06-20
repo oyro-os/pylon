@@ -30,6 +30,12 @@ impl AppManager for StaticFileAppManager {
     async fn by_id(&self, id: &str) -> Result<Option<Arc<App>>, AppLookupError> {
         Ok(self.apps.iter().find(|a| a.id == id && a.enabled).cloned())
     }
+
+    fn by_key_cached(&self, key: &str) -> Option<Result<Option<Arc<App>>, AppLookupError>> {
+        // The whole app set is in memory; resolving never does I/O, so the static
+        // path always answers synchronously and never offloads.
+        Some(Ok(self.apps.iter().find(|a| a.key == key && a.enabled).cloned()))
+    }
 }
 
 #[cfg(test)]
@@ -103,5 +109,24 @@ mod tests {
             std::sync::Arc::ptr_eq(&a1, &k1),
             "by_key/by_id must share the same Arc<App>"
         );
+    }
+
+    #[tokio::test]
+    async fn by_key_cached_is_instant_and_matches_by_key() {
+        let m = StaticFileAppManager::from_json(SAMPLE).unwrap();
+        // Hit: returns Some(Ok(Some(app))) without any I/O.
+        let probed = m.by_key_cached("app-key").expect("static always resolves");
+        assert_eq!(probed.unwrap().unwrap().id, "app-id");
+        // Miss-on-unknown: static resolves it as Some(Ok(None)), never None.
+        let unknown = m.by_key_cached("nope").expect("static always resolves");
+        assert!(unknown.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn by_key_cached_honours_enabled_flag() {
+        let raw = r#"[{"name":"X","id":"a","key":"k","secret":"s","enabled":false}]"#;
+        let m = StaticFileAppManager::from_json(raw).unwrap();
+        let probed = m.by_key_cached("k").expect("static always resolves");
+        assert!(probed.unwrap().is_none(), "disabled app resolves to None");
     }
 }
