@@ -161,6 +161,9 @@ pub async fn spawn_percore(spec: SpawnSpec) -> SocketAddr {
     let worker_shutdown = shutdown.clone();
     let worker_config = config.clone();
     let local_for_sink = Some(local.clone());
+    // Phase 7: capture the runtime handle here (async context) before spawning the
+    // raw worker thread (where `Handle::try_current()` would return `Err`).
+    let worker_runtime = tokio::runtime::Handle::current();
     let handle = std::thread::spawn(move || {
         let _ = pylon::transport::run_percore(
             worker_config,
@@ -176,6 +179,7 @@ pub async fn spawn_percore(spec: SpawnSpec) -> SocketAddr {
             // `spawn_percore_cluster`, which passes `true`).
             false,
             None,
+            worker_runtime,
         );
     });
     // Keep the worker alive for the whole test process.
@@ -323,6 +327,8 @@ pub async fn spawn_percore_cluster_with(
     let worker_apps = apps.clone();
     let worker_webhooks = webhooks.clone();
     let worker_local = local.clone();
+    // Phase 7: capture the runtime handle here (async context) before spawning.
+    let worker_runtime = tokio::runtime::Handle::current();
     let worker = std::thread::spawn(move || {
         let _ = pylon::transport::run_percore(
             worker_config,
@@ -337,6 +343,7 @@ pub async fn spawn_percore_cluster_with(
             // This IS a clustered node: defer the single-emit cluster edges.
             true,
             None,
+            worker_runtime,
         );
     });
 

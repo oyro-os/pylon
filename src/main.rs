@@ -216,6 +216,9 @@ async fn main() -> anyhow::Result<()> {
     let shutdown = Arc::new(AtomicBool::new(false));
     let worker_shutdown = shutdown.clone();
     let worker_config = config.clone();
+    // Phase 7: capture the runtime handle in THIS async context (inside the tokio
+    // runtime) BEFORE `spawn_blocking` (where `Handle::try_current()` is `Err`).
+    let worker_runtime = tokio::runtime::Handle::current();
     let worker = tokio::task::spawn_blocking(move || {
         pylon::transport::run_percore(
             worker_config,
@@ -232,6 +235,7 @@ async fn main() -> anyhow::Result<()> {
             // path is not clustered.
             false,
             tls,
+            worker_runtime,
         )
     });
 
@@ -395,6 +399,8 @@ async fn run_redis_percore(
     let worker_shutdown = shutdown.clone();
     let worker_config = config.clone();
     let worker_local = local.clone();
+    // Phase 7: capture the runtime handle here (async context) before spawn_blocking.
+    let worker_runtime = tokio::runtime::Handle::current();
     let worker = tokio::task::spawn_blocking(move || {
         pylon::transport::run_percore(
             worker_config,
@@ -409,6 +415,7 @@ async fn run_redis_percore(
             // This IS a clustered node: defer the single-emit cluster edges.
             true,
             tls,
+            worker_runtime,
         )
     });
 

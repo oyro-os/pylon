@@ -127,6 +127,8 @@ async fn spawn_tls_server(cert_path: &std::path::Path, key_path: &std::path::Pat
     let shutdown = Arc::new(AtomicBool::new(false));
     let worker_shutdown = shutdown.clone();
     let local_for_sink = Some(local.clone());
+    // Phase 7: capture the runtime handle here (async context) before spawning.
+    let worker_runtime = tokio::runtime::Handle::current();
     let handle = std::thread::spawn(move || {
         let _ = pylon::transport::run_percore(
             config,
@@ -140,6 +142,7 @@ async fn spawn_tls_server(cert_path: &std::path::Path, key_path: &std::path::Pat
             local_for_sink,
             false,
             tls,
+            worker_runtime,
         );
     });
     std::mem::forget((shutdown, handle));
@@ -482,6 +485,8 @@ async fn spawn_tls_server_large(
     let shutdown = Arc::new(AtomicBool::new(false));
     let worker_shutdown = shutdown.clone();
     let local_for_sink = Some(local.clone());
+    // Phase 7: capture the runtime handle here (async context) before spawning.
+    let worker_runtime = tokio::runtime::Handle::current();
     let handle = std::thread::spawn(move || {
         let _ = pylon::transport::run_percore(
             config,
@@ -495,6 +500,7 @@ async fn spawn_tls_server_large(
             local_for_sink,
             false,
             tls,
+            worker_runtime,
         );
     });
     std::mem::forget((shutdown, handle));

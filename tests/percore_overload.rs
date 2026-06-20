@@ -137,6 +137,8 @@ async fn spawn_with(config: ServerConfig) -> Harness {
 
     let shutdown = Arc::new(AtomicBool::new(false));
     let worker_shutdown = shutdown.clone();
+    // Phase 7: capture the runtime handle here (async context) before spawning.
+    let worker_runtime = tokio::runtime::Handle::current();
     let handle = std::thread::spawn(move || {
         pylon::transport::run_percore(
             config,
@@ -150,6 +152,7 @@ async fn spawn_with(config: ServerConfig) -> Harness {
             Some(local),
             false, // not clustered
             None,
+            worker_runtime,
         )
         .expect("run_percore failed");
     });

@@ -144,6 +144,12 @@ pub struct DispatchEnv {
     /// maintained beside `conn_counts`: inserted at establish, removed at close.
     /// Mirrors how `conn_counts` is shared between `DispatchEnv` and `AppState`.
     pub app_registry: Arc<AppRegistry>,
+    /// Phase 7: the tokio runtime handle captured in [`run_percore`] BEFORE the
+    /// worker OS-threads spawn. The worker is a raw `std::thread` where
+    /// `Handle::try_current()` is `Err`, so it cannot reach tokio on its own; this
+    /// handle lets the L1-MISS establish path `spawn` an offloaded `by_key` lookup
+    /// (parking the one connection) instead of blocking the whole worker on I/O.
+    pub runtime: tokio::runtime::Handle,
 }
 
 /// Configuration for a single worker event loop.
@@ -263,6 +269,36 @@ struct Entry {
     token: Token,
     /// v7 protocol state; `None` for echo workers and pre-handshake connections.
     session: Option<Session>,
+    /// Phase 7: set while this connection is PARKED waiting on an offloaded app
+    /// lookup (L1 miss). `Open` + `session: None` + `pending_establish: Some(..)`
+    /// is the park state. Cleared (`take`) when its `ResolvedApp` arrives, or
+    /// dropped wholesale when the connection closes mid-park (leaking nothing —
+    /// no counter was taken). A park holds the slab slot but no app resources.
+    pending_establish: Option<PendingEstablish>,
+}
+
+/// Phase 7: the establish state captured at park time, replayed by
+/// [`drain_resolved`] when the offloaded `by_key` lookup completes. Holds the
+/// negotiated `codec` + the worker's mailbox notifier so resume can run
+/// [`finish_establish`] exactly as the synchronous path would have. `gen` is the
+/// monotonic park generation: it must match the `ResolvedApp.gen` or the
+/// resolution is for a since-recycled slab token and is discarded.
+struct PendingEstablish {
+    key: String,
+    codec: Box<dyn Codec>,
+    notify: MailboxNotify,
+    mailbox_dropped: Option<Arc<AtomicU64>>,
+    gen: u64,
+}
+
+/// Phase 7: the result of an offloaded `by_key` lookup, sent from the tokio task
+/// back to the worker over an unbounded channel. `token` is the parked
+/// connection's slab key; `gen` guards against slab-token recycling (a mismatch
+/// means the slot now holds a different connection → discard).
+struct ResolvedApp {
+    token: usize,
+    gen: u64,
+    result: Result<Option<Arc<App>>, crate::app::AppLookupError>,
 }
 
 /// Build a `mio` listener bound to `addr` with `SO_REUSEADDR` + `SO_REUSEPORT`
@@ -331,6 +367,16 @@ pub fn run(mut cfg: WorkerConfig, shutdown: Arc<AtomicBool>) -> std::io::Result<
     // Reused dirty-token set: drained from `dirty_rx` each iteration and deduped
     // (a connection may be marked dirty several times before we drain it).
     let mut dirty_set: HashSet<usize> = HashSet::new();
+
+    // Phase 7: the resume channel for parked (L1-miss) establishes. An offloaded
+    // tokio task pushes a `ResolvedApp` here and wakes `worker_waker` (the SAME
+    // WORKER_WAKER that backs the dirty drain), so the loop drains it next pass.
+    // Unbounded + lives for the worker's whole lifetime ⇒ `tx.send` never fails;
+    // a discarded (recycled-token) result is a harmless no-op.
+    let (resolved_tx, resolved_rx) = std::sync::mpsc::channel::<ResolvedApp>();
+    // Monotonic park generation, bumped once per park. Guards slab-token reuse so
+    // a late resolution for a freed/recycled token is detected and dropped.
+    let mut next_gen: u64 = 0;
 
     // SP10 per-worker byte budget + inflight accounting. `inflight_bytes` is this
     // worker's local (non-atomic) view of how many bytes are queued across all of
@@ -615,6 +661,8 @@ pub fn run(mut cfg: WorkerConfig, shutdown: Arc<AtomicBool>) -> std::io::Result<
                             now_ns,
                             &dirty_tx,
                             &mailbox_waker,
+                            &resolved_tx,
+                            &mut next_gen,
                         ) {
                             Action::Close => {
                                 remove(
@@ -757,6 +805,31 @@ pub fn run(mut cfg: WorkerConfig, shutdown: Arc<AtomicBool>) -> std::io::Result<
             )
         {
             work = true;
+        }
+
+        // Phase 7: drain completed offloaded app lookups and resume (or reject)
+        // each parked connection. Same WORKER_WAKER nudges this; no-op (O(1)
+        // `try_recv` → Empty) when nothing is parked. Only meaningful on dispatch
+        // workers (echo workers never park).
+        if dispatch {
+            if let Mode::Dispatch(env) = &cfg.mode {
+                if drain_resolved(
+                    &poll,
+                    &mut conns,
+                    &resolved_rx,
+                    env,
+                    &mut local_subs,
+                    &mut sid_to_token,
+                    &mut wheel,
+                    &mut inflight_bytes,
+                    &mut codel_dropped_total,
+                    now_ns,
+                    &conn_counts,
+                    &app_registry,
+                ) {
+                    work = true;
+                }
+            }
         }
 
         // SP11 §4: fire any liveness timers that have come due this iteration.
@@ -992,6 +1065,7 @@ fn accept_ready(
                     inbuf: BytesMut::new(),
                     token: Token(key),
                     session: None,
+                    pending_establish: None,
                 });
                 accepted += 1;
             }
@@ -1021,12 +1095,14 @@ fn handle_readable(
     now_ns: u64,
     dirty_tx: &std::sync::mpsc::Sender<usize>,
     mailbox_waker: &Arc<mio::Waker>,
+    resolved_tx: &std::sync::mpsc::Sender<ResolvedApp>,
+    next_gen: &mut u64,
 ) -> Action {
     let entry = &mut conns[key];
     match entry.conn.state {
-        ConnState::Handshaking => {
-            handle_handshake(poll, entry, key, cfg, now_ns, dirty_tx, mailbox_waker)
-        }
+        ConnState::Handshaking => handle_handshake(
+            poll, entry, key, cfg, now_ns, dirty_tx, mailbox_waker, resolved_tx, next_gen,
+        ),
         ConnState::Open | ConnState::Closing => handle_frames(poll, entry, cfg, now_ns),
     }
 }
@@ -1045,6 +1121,8 @@ fn handle_handshake(
     now_ns: u64,
     dirty_tx: &std::sync::mpsc::Sender<usize>,
     mailbox_waker: &Arc<mio::Waker>,
+    resolved_tx: &std::sync::mpsc::Sender<ResolvedApp>,
+    next_gen: &mut u64,
 ) -> Action {
     // Pull all available bytes into the head-accumulation buffer (`inbuf`).
     if drain_into(&mut entry.conn, &mut entry.inbuf) == ReadOutcome::Closed {
@@ -1078,8 +1156,6 @@ fn handle_handshake(
                 };
                 use crate::protocol::error::PusherError;
                 let (app_key, protocol) = parse_app_path(&path);
-                // Negotiate the codec up-front (no I/O) so a probe hit can finish
-                // immediately and a probe miss has the codec ready to offload with.
                 let codec = match negotiate(protocol.as_deref(), env.strict_protocol) {
                     Ok(c) => c,
                     Err(error) => {
@@ -1088,7 +1164,6 @@ fn handle_handshake(
                         return Action::Close;
                     }
                 };
-                // SYNC L1 probe — instant on a static/cache hit, never offloads.
                 let resolved = match env.apps.by_key_cached(&app_key) {
                     Some(Ok(Some(app))) => finish_establish(
                         env,
@@ -1108,28 +1183,37 @@ fn handle_handshake(
                             codec: Some(codec),
                         })
                     }
-                    // L1 MISS: Task 2 keeps this synchronous (Task 3 parks+offloads).
+                    // L1 MISS / raw driver: PARK this one connection and offload the
+                    // `by_key` lookup to tokio. NO counter is taken here (counters
+                    // are only incremented in `finish_establish` at resume), so a
+                    // drop while parked leaks nothing. The connection stays in the
+                    // slab as `Open` + `session: None` + `pending_establish: Some`.
                     None => {
-                        match futures_executor::block_on(env.apps.by_key(&app_key)) {
-                            Ok(Some(app)) => finish_establish(
-                                env,
-                                app,
-                                codec,
-                                notify,
-                                cfg.mailbox_dropped_slot.clone(),
-                            ),
-                            Ok(None) => Err(Reject {
-                                error: PusherError::app_not_found(),
-                                codec: Some(codec),
-                            }),
-                            Err(e) => {
-                                tracing::warn!(key = %app_key, error = %e, "app lookup failed (transient)");
-                                Err(Reject {
-                                    error: PusherError::backend_unavailable(),
-                                    codec: Some(codec),
-                                })
-                            }
-                        }
+                        let gen = *next_gen;
+                        *next_gen = next_gen.wrapping_add(1);
+                        entry.pending_establish = Some(PendingEstablish {
+                            key: app_key.clone(),
+                            codec,
+                            notify,
+                            mailbox_dropped: cfg.mailbox_dropped_slot.clone(),
+                            gen,
+                        });
+                        // Offload the lookup. The spawned task echoes `token` + `gen`
+                        // back in the `ResolvedApp` and wakes the worker; an
+                        // unbounded send to a worker-lifetime channel never fails.
+                        let apps = env.apps.clone();
+                        let tx = resolved_tx.clone();
+                        let waker = mailbox_waker.clone();
+                        let token = key;
+                        let lookup_key = app_key;
+                        env.runtime.spawn(async move {
+                            let result = apps.by_key(&lookup_key).await;
+                            let _ = tx.send(ResolvedApp { token, gen, result });
+                            let _ = waker.wake();
+                        });
+                        // No establish frame yet — flush whatever is queued (the 101)
+                        // and keep the connection. It resumes in `drain_resolved`.
+                        return flush_and_arm(poll, entry, now_ns);
                     }
                 };
                 match resolved {
@@ -1180,38 +1264,6 @@ fn handle_handshake(
 struct Reject {
     error: crate::protocol::error::PusherError,
     codec: Option<Box<dyn Codec>>,
-}
-
-/// Resolve the app + protocol from a `/app/{key}?protocol=N` path and build the
-/// v7 [`Session`]: negotiate codec, look up the app by key (synchronously via
-/// `block_on` — this task's pre-park behavior), then run [`finish_establish`].
-/// Returns `Err(Reject)` on any rejection (unsupported protocol → 4007, unknown
-/// app → 4001, backend down → 4103, over capacity → 4004).
-fn establish_session(
-    env: &Arc<DispatchEnv>,
-    path: &str,
-    notify: MailboxNotify,
-    mailbox_dropped: Option<Arc<AtomicU64>>,
-) -> Result<Session, Reject> {
-    use crate::protocol::error::PusherError;
-    let (key, protocol) = parse_app_path(path);
-
-    // Negotiation failure (e.g. `protocol=3`) has no codec yet → raw fallback.
-    let codec = match negotiate(protocol.as_deref(), env.strict_protocol) {
-        Ok(c) => c,
-        Err(error) => return Err(Reject { error, codec: None }),
-    };
-
-    let app = match futures_executor::block_on(env.apps.by_key(&key)) {
-        Ok(Some(a)) => a,
-        Ok(None) => return Err(Reject { error: PusherError::app_not_found(), codec: Some(codec) }),
-        Err(e) => {
-            tracing::warn!(key = %key, error = %e, "app lookup failed (transient)");
-            return Err(Reject { error: PusherError::backend_unavailable(), codec: Some(codec) });
-        }
-    };
-
-    finish_establish(env, app, codec, notify, mailbox_dropped)
 }
 
 /// The deferred establish TAIL, reusable by both the synchronous L1-hit path and
@@ -1676,6 +1728,122 @@ fn drain_dirty_sessions(
         }
     }
     dirty_set.clear();
+    wrote_any
+}
+
+/// Phase 7: drain completed offloaded app lookups and resume each parked
+/// connection. For each `ResolvedApp { token, gen, result }`:
+///
+/// * absent slab entry → the parked connection closed; discard.
+/// * `pending_establish.gen != gen` (or `pending_establish` is `None`) → the slab
+///   token was recycled to a different connection; discard (no use-after-park).
+/// * else take the `PendingEstablish` and apply:
+///   * `Ok(Some(app))` → `finish_establish`; on `Ok(session)` queue
+///     `connection_established` + store the session + flush; on `Err(reject)`
+///     queue the reject + flush + `remove`.
+///   * `Ok(None)`  → reject `app_not_found` (4001) + flush + `remove`.
+///   * `Err(_)`    → reject `backend_unavailable` (4103) + flush + `remove`.
+///
+/// Returns whether it wrote anything (so the adaptive poll stays tight). O(1) when
+/// the channel is empty.
+#[allow(clippy::too_many_arguments)]
+fn drain_resolved(
+    poll: &Poll,
+    conns: &mut slab::Slab<Entry>,
+    resolved_rx: &std::sync::mpsc::Receiver<ResolvedApp>,
+    env: &Arc<DispatchEnv>,
+    local_subs: &mut HashMap<(Arc<str>, Arc<str>), HashSet<SocketId>>,
+    sid_to_token: &mut HashMap<SocketId, usize>,
+    wheel: &mut TimerWheel,
+    inflight_bytes: &mut u64,
+    codel_total: &mut u64,
+    now_ns: u64,
+    conn_counts: &Arc<DashMap<String, Arc<AtomicUsize>>>,
+    app_registry: &Arc<AppRegistry>,
+) -> bool {
+    use crate::protocol::error::PusherError;
+    let mut wrote_any = false;
+    while let Ok(ResolvedApp { token, gen, result }) = resolved_rx.try_recv() {
+        // The parked connection may have closed; its slab slot is gone or recycled.
+        // Slab-token recycling guard: only resume if THIS park is still pending and
+        // its generation matches. A mismatch means a new connection took the slot.
+        // `take` the PendingEstablish in this tight borrow scope so the borrow of
+        // `conns` is released before the `fold_delta`/`remove` calls below re-borrow
+        // it (mirrors `drain_dirty_sessions`, which reborrows `&mut conns[key]`
+        // inline rather than holding an `entry` across the helper calls).
+        let pe = {
+            let Some(entry) = conns.get_mut(token) else {
+                continue;
+            };
+            match &entry.pending_establish {
+                Some(p) if p.gen == gen => {}
+                _ => continue,
+            }
+            entry.pending_establish.take().expect("pending_establish present")
+        };
+
+        let outcome = match result {
+            Ok(Some(app)) => finish_establish(env, app, pe.codec, pe.notify, pe.mailbox_dropped),
+            Ok(None) => Err(Reject {
+                error: PusherError::app_not_found(),
+                codec: Some(pe.codec),
+            }),
+            Err(e) => {
+                tracing::warn!(key = %pe.key, error = %e, "offloaded app lookup failed (transient)");
+                Err(Reject {
+                    error: PusherError::backend_unavailable(),
+                    codec: Some(pe.codec),
+                })
+            }
+        };
+
+        match outcome {
+            Ok(session) => {
+                // Reborrow inline so the `entry` borrow drops before `fold_delta`.
+                let action = {
+                    let entry = &mut conns[token];
+                    let established = ServerEvent::ConnectionEstablished {
+                        socket_id: session.ctx.socket_id,
+                        activity_timeout: env.activity_timeout,
+                    };
+                    let text = session.codec.encode(&established);
+                    let mut out = BytesMut::new();
+                    frame::encode_text(&mut out, text.as_bytes());
+                    let _ = entry
+                        .conn
+                        .queue(Arc::from(out.to_vec().into_boxed_slice()), now_ns);
+                    entry.session = Some(session);
+                    flush_and_arm(poll, entry, now_ns)
+                };
+                // INCREMENTAL INFLIGHT: the established frame was queued + flushed.
+                fold_delta(conns, token, inflight_bytes);
+                fold_codel(conns, token, codel_total);
+                wrote_any = true;
+                if action == Action::Close {
+                    remove(
+                        poll, conns, token, local_subs, sid_to_token, wheel,
+                        inflight_bytes, conn_counts, app_registry,
+                    );
+                }
+            }
+            Err(reject) => {
+                {
+                    let entry = &mut conns[token];
+                    queue_reject(entry, &reject, now_ns);
+                    let _ = flush_and_arm(poll, entry, now_ns);
+                }
+                // INCREMENTAL INFLIGHT: fold the reject frames before `remove`
+                // subtracts the connection's still-queued bytes.
+                fold_delta(conns, token, inflight_bytes);
+                fold_codel(conns, token, codel_total);
+                wrote_any = true;
+                remove(
+                    poll, conns, token, local_subs, sid_to_token, wheel,
+                    inflight_bytes, conn_counts, app_registry,
+                );
+            }
+        }
+    }
     wrote_any
 }
 

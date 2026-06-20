@@ -86,6 +86,7 @@ async fn spawn(config: ServerConfig) -> Harness {
         max_connections: 0,
         mailbox_capacity: 256,
         app_registry: app_registry.clone(),
+        runtime: tokio::runtime::Handle::current(),
     });
 
     let port = free_port();
@@ -302,6 +303,7 @@ async fn spawn_with_node_ceiling(max_connections: usize) -> Harness {
         max_connections,
         mailbox_capacity: 256,
         app_registry: app_registry.clone(),
+        runtime: tokio::runtime::Handle::current(),
     });
 
     let port = free_port();
@@ -503,6 +505,7 @@ async fn spawn_with_saturation_flag() -> (Harness, Arc<AtomicBool>) {
         max_connections: 0,
         mailbox_capacity: 256,
         app_registry: app_registry.clone(),
+        runtime: tokio::runtime::Handle::current(),
     });
 
     let port = free_port();
