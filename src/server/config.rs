@@ -149,10 +149,10 @@ pub struct ServerConfig {
     /// is full a `try_send` silently drops the frame and bumps the per-worker
     /// `pylon_mailbox_dropped_total` counter. `PYLON_MAILBOX_CAPACITY` (default 256).
     pub mailbox_capacity: usize,
-    /// Which app-manager backend to use. `PYLON_APP_MANAGER` (`static` | `sqlite` | `mysql` | `postgres`;
-    /// default `static`). Set to `sqlite`, `mysql`, or `postgres` and provide `PYLON_APP_DSN`.
+    /// Which app-manager backend to use. `PYLON_APP_MANAGER` (`static` | `sqlite` | `mysql` | `postgres` | `mongo`;
+    /// default `static`). Set to `sqlite`, `mysql`, `postgres`, or `mongo` and provide `PYLON_APP_DSN`.
     pub app_manager: AppManagerKind,
-    /// DSN for the DB-backed app manager. Required when `app_manager` is Sqlite, Mysql, or Postgres.
+    /// DSN for the DB-backed app manager. Required when `app_manager` is Sqlite, Mysql, Postgres, or Mongo.
     /// `PYLON_APP_DSN` (e.g. `sqlite:///var/lib/pylon/apps.db`).
     pub app_dsn: Option<String>,
     /// Enable the L1 (moka) + optional L2 (Redis) app-manager cache layer.
