@@ -40,15 +40,18 @@ impl AppInvalidator {
             let _sub_mgr = _mgr;
             loop {
                 match rx.recv().await {
-                    Ok(msg) => {
-                        if let Some(s) = msg.value.into_string() {
+                    Ok(msg) => match msg.value.into_string() {
+                        Some(s) => {
                             if let Ok(m) = serde_json::from_str::<InvalidateMsg>(&s) {
                                 cache.invalidate(&m.id, &m.key).await;
                             } else {
                                 tracing::warn!(payload = %s, "bad app-invalidate message");
                             }
                         }
-                    }
+                        None => {
+                            tracing::warn!("dropped non-UTF8 app-invalidate payload");
+                        }
+                    },
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
                         tracing::warn!(skipped = n, "app-invalidate sub stream lagged; dropped messages");
                     }
