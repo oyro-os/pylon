@@ -84,19 +84,24 @@ async fn main() -> anyhow::Result<()> {
             Arc::new(pylon::app::mongo::MongoAppManager::connect(&dsn).await?)
         }
     };
-    let apps: Arc<dyn AppManager> = if config.app_cache && config.app_manager != AppManagerKind::StaticFile {
-        use pylon::app::cache::{CacheConfig, CachingAppManager};
-        let l2 = match &config.app_cache_redis_url {
-            Some(url) => Some(std::sync::Arc::new(
-                pylon::app::l2::RedisAppCache::connect(url, 4, config.app_cache_ttl).await?)),
-            None => None,
-        };
-        let cfg = CacheConfig {
-            max_capacity: config.app_cache_max, ttl_secs: config.app_cache_ttl,
-            neg_max: config.app_cache_neg_max, neg_ttl_secs: config.app_cache_neg_ttl,
-        };
-        std::sync::Arc::new(CachingAppManager::new(apps, cfg, l2))
-    } else { apps };
+    let (apps, invalidator): (Arc<dyn AppManager>, Option<Arc<pylon::app::invalidation::AppInvalidator>>) =
+        if config.app_cache && config.app_manager != AppManagerKind::StaticFile {
+            use pylon::app::cache::{CacheConfig, CachingAppManager};
+            let l2 = match &config.app_cache_redis_url {
+                Some(url) => Some(Arc::new(pylon::app::l2::RedisAppCache::connect(url, 4, config.app_cache_ttl).await?)),
+                None => None,
+            };
+            let cfg = CacheConfig {
+                max_capacity: config.app_cache_max, ttl_secs: config.app_cache_ttl,
+                neg_max: config.app_cache_neg_max, neg_ttl_secs: config.app_cache_neg_ttl,
+            };
+            let caching = Arc::new(CachingAppManager::new(apps, cfg, l2));
+            let inv = match &config.app_cache_redis_url {
+                Some(url) => Some(pylon::app::invalidation::AppInvalidator::spawn(url, caching.clone()).await?),
+                None => None,
+            };
+            (caching, inv)
+        } else { (apps, None) };
 
     // The redis adapter is the CLUSTERED production path: the node's single
     // `RedisAdapter` is owned by a `ClusterBridge` (on its own runtime), the percore workers
@@ -106,7 +111,7 @@ async fn main() -> anyhow::Result<()> {
     // so webhooks are attached AFTER the bridge is up), so it runs in a dedicated function.
     // The local (single-node) path keeps the straight-line wiring below.
     if config.adapter == "redis" {
-        return run_redis_percore(config, apps).await;
+        return run_redis_percore(config, apps, invalidator).await;
     }
 
     // The CONCRETE local adapter, so the percore transport can install its sharded
@@ -152,6 +157,7 @@ async fn main() -> anyhow::Result<()> {
         saturated: Some(local.saturation_flag()),
         draining,
         cluster_metrics: None,
+        invalidator: invalidator.clone(),
     };
     let rest_router = build_router(rest_state);
     tokio::spawn(pylon::transport::rest::serve(rest_rx, rest_router));
@@ -225,7 +231,7 @@ async fn main() -> anyhow::Result<()> {
 /// `AdapterOccupancy` over `bridge.adapter()`, and only THEN `bridge.attach_webhooks` wires
 /// the deferred handle into the drain loop and starts the Redis sweeper. The bridge is held
 /// alive until after the worker joins; its `Drop` tears down the dedicated Redis runtime.
-async fn run_redis_percore(config: ServerConfig, apps: Arc<dyn AppManager>) -> anyhow::Result<()> {
+async fn run_redis_percore(config: ServerConfig, apps: Arc<dyn AppManager>, invalidator: Option<Arc<pylon::app::invalidation::AppInvalidator>>) -> anyhow::Result<()> {
     // The single shared LocalAdapter: the bridge's RedisAdapter shares it (so its recv
     // loop's `local.broadcast(Raw)` shards remote frames to this node's workers), the REST
     // plane reads the saturation flag off it, and the worker's ClusterAdapter + the sharded
@@ -278,6 +284,7 @@ async fn run_redis_percore(config: ServerConfig, apps: Arc<dyn AppManager>) -> a
         saturated: Some(local.saturation_flag()),
         draining,
         cluster_metrics: Some(bridge.metrics()),
+        invalidator,
     };
     tokio::spawn(pylon::transport::rest::serve(
         rest_rx,

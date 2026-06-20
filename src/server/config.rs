@@ -169,6 +169,9 @@ pub struct ServerConfig {
     /// Redis URL for the L2 app cache. When set, resolved apps are written through
     /// to Redis and read back on L1 misses. `PYLON_APP_CACHE_REDIS_URL`.
     pub app_cache_redis_url: Option<String>,
+    /// Bearer token required for the admin endpoints (`POST /admin/apps/{id}/invalidate`).
+    /// When `None` (default, `PYLON_ADMIN_TOKEN` not set), the admin API is disabled (404).
+    pub app_admin_token: Option<String>,
 }
 
 impl Default for ServerConfig {
@@ -235,6 +238,7 @@ impl Default for ServerConfig {
             app_cache_neg_max: 10_000,
             app_cache_neg_ttl: 30,
             app_cache_redis_url: None,
+            app_admin_token: None,
         }
     }
 }
@@ -274,6 +278,7 @@ impl ServerConfig {
         if let Ok(v) = std::env::var("PYLON_APP_CACHE_NEG_MAX") { if let Ok(n) = v.parse() { c.app_cache_neg_max = n; } }
         if let Ok(v) = std::env::var("PYLON_APP_CACHE_NEG_TTL") { if let Ok(n) = v.parse() { c.app_cache_neg_ttl = n; } }
         c.app_cache_redis_url = std::env::var("PYLON_APP_CACHE_REDIS_URL").ok();
+        c.app_admin_token = std::env::var("PYLON_ADMIN_TOKEN").ok();
         if let Ok(v) = std::env::var("PYLON_MAX_PRESENCE_MEMBERS") {
             if let Ok(p) = v.parse() {
                 c.max_presence_members = p;
@@ -819,6 +824,11 @@ mod tests {
         assert_eq!(c.app_cache_max, 100_000);
         assert_eq!(c.app_cache_ttl, 300);
         assert_eq!(c.app_cache_neg_ttl, 30);
+    }
+
+    #[test]
+    fn admin_token_defaults_none() {
+        assert!(ServerConfig::default().app_admin_token.is_none());
     }
 
     #[test]

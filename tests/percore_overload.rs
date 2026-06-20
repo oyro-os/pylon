@@ -130,6 +130,7 @@ async fn spawn_with(config: ServerConfig) -> Harness {
         saturated: Some(local.saturation_flag()),
         draining: Arc::new(AtomicBool::new(false)),
         cluster_metrics: None,
+        invalidator: None,
     };
     let rest_router = build_router(rest_state);
     tokio::spawn(pylon::transport::rest::serve(rest_rx, rest_router));

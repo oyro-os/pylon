@@ -34,6 +34,10 @@ pub struct AppState {
     /// (`None`) on the local single-node path. The `/metrics` handler emits
     /// `pylon_cluster_cmd_dropped_total` and `pylon_redis_connected` only when `Some`.
     pub cluster_metrics: Option<Arc<ClusterMetrics>>,
+    /// Phase-5 app-cache invalidation handle: present when `PYLON_APP_CACHE_REDIS_URL`
+    /// is set and caching is enabled, `None` otherwise. Required by the admin
+    /// `POST /admin/apps/{id}/invalidate` endpoint to publish cross-node evictions.
+    pub invalidator: Option<Arc<crate::app::invalidation::AppInvalidator>>,
 }
 
 impl AppState {

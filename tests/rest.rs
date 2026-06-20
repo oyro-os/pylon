@@ -68,6 +68,7 @@ async fn spawn() -> SocketAddr {
         saturated: Some(local.saturation_flag()),
         draining: Arc::new(AtomicBool::new(false)),
         cluster_metrics: None,
+        invalidator: None,
     };
     tokio::spawn(pylon::transport::rest::serve(
         rest_rx,

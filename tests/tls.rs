@@ -117,6 +117,7 @@ async fn spawn_tls_server(cert_path: &std::path::Path, key_path: &std::path::Pat
         saturated: Some(local.saturation_flag()),
         draining: Arc::new(AtomicBool::new(false)),
         cluster_metrics: None,
+        invalidator: None,
     };
     tokio::spawn(pylon::transport::rest::serve(
         rest_rx,
@@ -471,6 +472,7 @@ async fn spawn_tls_server_large(
         saturated: Some(local.saturation_flag()),
         draining: Arc::new(AtomicBool::new(false)),
         cluster_metrics: None,
+        invalidator: None,
     };
     tokio::spawn(pylon::transport::rest::serve(
         rest_rx,

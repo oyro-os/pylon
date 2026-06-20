@@ -1,5 +1,6 @@
 //! Pusher REST HTTP API: signed-request auth + the five endpoints.
 
+pub mod admin;
 pub mod auth;
 pub mod channels;
 pub mod events;
@@ -41,5 +42,15 @@ pub fn merge(router: Router<AppState>, body_limit: usize) -> Router<AppState> {
         .route("/healthz", get(health::get_health))
         .route("/ready", get(health::get_ready))
         .route("/readyz", get(health::get_ready));
-    router.merge(rest).merge(probes)
+    // The admin body is a tiny `{"key":"<app key>"}`; cap it explicitly (rather
+    // than relying on axum's global default) so the route stays bounded even if
+    // an operator disables the global limit. Defense-in-depth: the buffer is
+    // capped before `post_invalidate`'s auth check runs.
+    let admin = Router::new()
+        .route(
+            "/admin/apps/{app_id}/invalidate",
+            post(admin::post_invalidate),
+        )
+        .layer(DefaultBodyLimit::max(4 * 1024));
+    router.merge(rest).merge(probes).merge(admin)
 }
