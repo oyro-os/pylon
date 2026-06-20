@@ -73,9 +73,9 @@ async fn main() -> anyhow::Result<()> {
     let config = ServerConfig::from_env();
     let apps: Arc<dyn AppManager> = match config.app_manager {
         AppManagerKind::StaticFile => Arc::new(StaticFileAppManager::from_file(&config.apps_path)?),
-        AppManagerKind::Sqlite => {
+        AppManagerKind::Sqlite | AppManagerKind::Mysql => {
             let dsn = config.app_dsn.clone()
-                .ok_or_else(|| anyhow::anyhow!("PYLON_APP_MANAGER=sqlite requires PYLON_APP_DSN"))?;
+                .ok_or_else(|| anyhow::anyhow!("PYLON_APP_MANAGER=sqlite|mysql requires PYLON_APP_DSN"))?;
             Arc::new(pylon::app::sql::SqlAppManager::connect(&dsn).await?)
         }
     };
