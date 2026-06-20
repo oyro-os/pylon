@@ -84,10 +84,7 @@ async fn main() -> anyhow::Result<()> {
             Arc::new(pylon::app::mongo::MongoAppManager::connect(&dsn).await?)
         }
     };
-    // Bound as `_invalidator` here — the spawned subscriber runs regardless; Task 3 renames
-    // this to `invalidator` and threads it into AppState (which gains the field there), so
-    // there is no unused-variable warning at this task's boundary.
-    let (apps, _invalidator): (Arc<dyn AppManager>, Option<Arc<pylon::app::invalidation::AppInvalidator>>) =
+    let (apps, invalidator): (Arc<dyn AppManager>, Option<Arc<pylon::app::invalidation::AppInvalidator>>) =
         if config.app_cache && config.app_manager != AppManagerKind::StaticFile {
             use pylon::app::cache::{CacheConfig, CachingAppManager};
             let l2 = match &config.app_cache_redis_url {
@@ -160,6 +157,7 @@ async fn main() -> anyhow::Result<()> {
         saturated: Some(local.saturation_flag()),
         draining,
         cluster_metrics: None,
+        invalidator: invalidator.clone(),
     };
     let rest_router = build_router(rest_state);
     tokio::spawn(pylon::transport::rest::serve(rest_rx, rest_router));
@@ -286,6 +284,7 @@ async fn run_redis_percore(config: ServerConfig, apps: Arc<dyn AppManager>) -> a
         saturated: Some(local.saturation_flag()),
         draining,
         cluster_metrics: Some(bridge.metrics()),
+        invalidator: None,
     };
     tokio::spawn(pylon::transport::rest::serve(
         rest_rx,
