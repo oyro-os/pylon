@@ -14,6 +14,21 @@ const SELECT: &str =
     "SELECT id, key, secret, name, capacity, client_messages_enabled, \
      subscription_count_enabled, enabled, webhooks FROM apps";
 
+/// Typed column for app lookup to prevent SQL injection via caller-controlled column names.
+enum LookupCol {
+    Id,
+    Key,
+}
+
+impl LookupCol {
+    fn column(&self) -> &'static str {
+        match self {
+            LookupCol::Id => "id",
+            LookupCol::Key => "key",
+        }
+    }
+}
+
 impl SqlAppManager {
     pub async fn connect(dsn: &str) -> anyhow::Result<Self> {
         sqlx::any::install_default_drivers();
@@ -21,8 +36,8 @@ impl SqlAppManager {
         Ok(Self { pool })
     }
 
-    async fn fetch(&self, col: &str, val: &str) -> Result<Option<Arc<App>>, AppLookupError> {
-        let sql = format!("{SELECT} WHERE {col} = ? AND enabled <> 0 LIMIT 1");
+    async fn fetch(&self, col: LookupCol, val: &str) -> Result<Option<Arc<App>>, AppLookupError> {
+        let sql = format!("{SELECT} WHERE {} = ? AND enabled <> 0 LIMIT 1", col.column());
         let row = sqlx::query(&sql).bind(val).fetch_optional(&self.pool).await
             .map_err(|e| AppLookupError::Backend(e.to_string()))?;
         match row {
@@ -32,7 +47,11 @@ impl SqlAppManager {
     }
 }
 
-fn get_bool(r: &AnyRow, col: &str) -> bool { r.try_get::<i64, _>(col).unwrap_or(0) != 0 }
+fn get_bool(r: &AnyRow, col: &str) -> Result<bool, AppLookupError> {
+    r.try_get::<i64, _>(col)
+        .map(|v| v != 0)
+        .map_err(|e| AppLookupError::Decode(format!("{col}: {e}")))
+}
 
 fn row_to_app(r: &AnyRow) -> Result<App, AppLookupError> {
     let webhooks_json: String = r.try_get("webhooks")
@@ -45,10 +64,10 @@ fn row_to_app(r: &AnyRow) -> Result<App, AppLookupError> {
         id: r.try_get("id").map_err(dec)?,
         key: r.try_get("key").map_err(dec)?,
         secret: r.try_get("secret").map_err(dec)?,
-        client_messages_enabled: get_bool(r, "client_messages_enabled"),
+        client_messages_enabled: get_bool(r, "client_messages_enabled")?,
         capacity: r.try_get::<i64, _>("capacity").map_err(dec)? as u32,
-        subscription_count_enabled: get_bool(r, "subscription_count_enabled"),
-        enabled: get_bool(r, "enabled"),
+        subscription_count_enabled: get_bool(r, "subscription_count_enabled")?,
+        enabled: get_bool(r, "enabled")?,
         webhooks,
         has_channel_occupied_webhooks: false,
         has_channel_vacated_webhooks: false,
@@ -65,10 +84,10 @@ fn row_to_app(r: &AnyRow) -> Result<App, AppLookupError> {
 #[async_trait::async_trait]
 impl AppManager for SqlAppManager {
     async fn by_key(&self, key: &str) -> Result<Option<Arc<App>>, AppLookupError> {
-        self.fetch("key", key).await
+        self.fetch(LookupCol::Key, key).await
     }
     async fn by_id(&self, id: &str) -> Result<Option<Arc<App>>, AppLookupError> {
-        self.fetch("id", id).await
+        self.fetch(LookupCol::Id, id).await
     }
 }
 
