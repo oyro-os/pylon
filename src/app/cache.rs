@@ -18,10 +18,10 @@ enum LoadErr { NotFound, Lookup(AppLookupError) }
 
 enum LookupBy { Id(String), Key(String) }
 impl LookupBy {
-    async fn from_l2(&self, l2: &RedisAppCache) -> Result<Option<Arc<App>>, AppLookupError> {
+    async fn load_from_l2(&self, l2: &RedisAppCache) -> Result<Option<Arc<App>>, AppLookupError> {
         match self { LookupBy::Id(id) => l2.get_id(id).await, LookupBy::Key(k) => l2.get_key(k).await }
     }
-    async fn from_driver(&self, d: &dyn AppManager) -> Result<Option<Arc<App>>, AppLookupError> {
+    async fn load_from_driver(&self, d: &dyn AppManager) -> Result<Option<Arc<App>>, AppLookupError> {
         match self { LookupBy::Id(id) => d.by_id(id).await, LookupBy::Key(k) => d.by_key(k).await }
     }
 }
@@ -55,13 +55,13 @@ impl CachingAppManager {
         let res = self.pos.try_get_with(pkey.clone(), async move {
             // L2 first — best-effort: errors degrade to the driver, never fail the lookup.
             if let Some(l2) = &l2 {
-                match by.from_l2(l2).await {
+                match by.load_from_l2(l2).await {
                     Ok(Some(app)) => return Ok(app),
                     Ok(None) => {}
                     Err(e) => tracing::warn!(error = %e, "app L2 get failed; using driver"),
                 }
             }
-            match by.from_driver(&*inner).await {
+            match by.load_from_driver(&*inner).await {
                 Ok(Some(app)) => {
                     if let Some(l2) = &l2 {
                         if let Err(e) = l2.put(&app).await {
@@ -122,10 +122,7 @@ impl AppManager for CachingAppManager {
         if futures_executor::block_on(self.neg.get(&pkey)).is_some() {
             return Some(Ok(None));
         }
-        match futures_executor::block_on(self.pos.get(&pkey)) {
-            Some(app) => Some(Ok(Some(app))),
-            None => None,
-        }
+        futures_executor::block_on(self.pos.get(&pkey)).map(|app| Ok(Some(app)))
     }
 }
 
