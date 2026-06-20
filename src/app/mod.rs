@@ -2,6 +2,7 @@
 
 pub mod cache;
 pub mod l2;
+pub mod mongo;
 pub mod sql;
 pub mod static_file;
 
