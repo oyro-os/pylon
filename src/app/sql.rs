@@ -17,6 +17,10 @@ impl Dialect {
     fn key_ident(&self) -> &'static str {
         match self { Dialect::MySql => "`key`", _ => "key" }
     }
+    /// Bind-parameter placeholder for the single lookup value. Postgres uses $N.
+    fn placeholder(&self) -> &'static str {
+        match self { Dialect::Postgres => "$1", _ => "?" }
+    }
 }
 
 /// App store backed by a SQL database via sqlx `Any` (SQLite now; MySQL/Postgres
@@ -48,7 +52,8 @@ impl SqlAppManager {
 
     async fn fetch(&self, col: LookupCol, val: &str) -> Result<Option<Arc<App>>, AppLookupError> {
         let where_col = match col { LookupCol::Id => "id", LookupCol::Key => self.dialect.key_ident() };
-        let sql = format!("{} WHERE {} = ? AND enabled <> 0 LIMIT 1", self.select_sql(), where_col);
+        let sql = format!("{} WHERE {} = {} AND enabled <> 0 LIMIT 1",
+                          self.select_sql(), where_col, self.dialect.placeholder());
         let row = sqlx::query(&sql).bind(val).fetch_optional(&self.pool).await
             .map_err(|e| AppLookupError::Backend(e.to_string()))?;
         match row { None => Ok(None), Some(r) => Ok(Some(Arc::new(row_to_app(&r)?))) }
