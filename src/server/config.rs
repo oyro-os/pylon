@@ -172,6 +172,11 @@ pub struct ServerConfig {
     /// Bearer token required for the admin endpoints (`POST /admin/apps/{id}/invalidate`).
     /// When `None` (default, `PYLON_ADMIN_TOKEN` not set), the admin API is disabled (404).
     pub app_admin_token: Option<String>,
+    /// Interval (seconds) for the app-purge sweep backstop. `0` disables it
+    /// (default). `PYLON_APP_SWEEP_INTERVAL`. The sweep enumerates distinct
+    /// connected apps and purges any the authoritative (uncached) driver reports
+    /// as absent/disabled — closing the gap if a `remove` signal is ever missed.
+    pub app_sweep_interval_secs: u64,
 }
 
 impl Default for ServerConfig {
@@ -239,6 +244,7 @@ impl Default for ServerConfig {
             app_cache_neg_ttl: 30,
             app_cache_redis_url: None,
             app_admin_token: None,
+            app_sweep_interval_secs: 0,
         }
     }
 }
@@ -279,6 +285,11 @@ impl ServerConfig {
         if let Ok(v) = std::env::var("PYLON_APP_CACHE_NEG_TTL") { if let Ok(n) = v.parse() { c.app_cache_neg_ttl = n; } }
         c.app_cache_redis_url = std::env::var("PYLON_APP_CACHE_REDIS_URL").ok();
         c.app_admin_token = std::env::var("PYLON_ADMIN_TOKEN").ok();
+        if let Ok(v) = std::env::var("PYLON_APP_SWEEP_INTERVAL") {
+            if let Ok(n) = v.parse() {
+                c.app_sweep_interval_secs = n;
+            }
+        }
         if let Ok(v) = std::env::var("PYLON_MAX_PRESENCE_MEMBERS") {
             if let Ok(p) = v.parse() {
                 c.max_presence_members = p;
@@ -882,5 +893,18 @@ mod tests {
         std::env::remove_var("PYLON_WEBHOOK_MAX_RETRIES");
         std::env::remove_var("PYLON_WEBHOOK_RETRY_BASE_MS");
         std::env::remove_var("PYLON_WEBHOOK_MAX_CONCURRENCY");
+    }
+
+    #[test]
+    fn app_sweep_interval_parses_from_env() {
+        std::env::set_var("PYLON_APP_SWEEP_INTERVAL", "30");
+        let c = ServerConfig::from_env();
+        assert_eq!(c.app_sweep_interval_secs, 30);
+        std::env::remove_var("PYLON_APP_SWEEP_INTERVAL");
+    }
+
+    #[test]
+    fn app_sweep_interval_defaults_to_zero() {
+        assert_eq!(ServerConfig::default().app_sweep_interval_secs, 0);
     }
 }

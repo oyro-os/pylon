@@ -3,11 +3,14 @@
 //! is the config/secret-change action (cache eviction only); `purge` is the
 //! remove/disable action (close conns + reclaim counter + evict cache).
 
+use crate::adapter::app_registry::AppRegistry;
 use crate::adapter::Adapter;
 use crate::app::cache::CachingAppManager;
+use crate::app::AppManager;
 use dashmap::DashMap;
 use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
+use std::time::Duration;
 
 /// Owns the three structures a remove must reclaim node-locally. Built once in
 /// `main.rs` (DB-backed cache paths only) and shared by the invalidation
@@ -41,6 +44,67 @@ impl AppPurger {
         self.conn_counts.remove(id);
         self.cache.invalidate(id, key).await;
     }
+}
+
+/// One sweep pass: for each distinct connected app, query the AUTHORITATIVE
+/// (uncached) driver by id. `Ok(None)` ⇒ the app is gone/disabled ⇒ purge it.
+/// `Ok(Some)` ⇒ live, skip. `Err` ⇒ backend trouble, LOG + skip (an outage must
+/// never evict a live app). Returns the number of apps purged this pass.
+///
+/// The app key needed for cache eviction is resolved from the still-warm cache
+/// (`cache.by_id`) BEFORE purging; if the cache no longer holds it the id-keyed
+/// L1/L2 eviction still runs and the key alias falls back to TTL. The `cache`
+/// lookup here is the only place the key is recoverable for an already-removed app.
+pub(crate) async fn sweep_once(
+    app_registry: &Arc<AppRegistry>,
+    driver: &Arc<dyn AppManager>,
+    cache: &Arc<CachingAppManager>,
+    purger: &AppPurger,
+) -> usize {
+    let mut purged = 0usize;
+    for id in app_registry.connected_app_ids() {
+        // Resolve the key from the warm cache BEFORE the driver verdict (a removed
+        // app returns no App, so we couldn't learn its key afterwards). Empty key
+        // ⇒ id-keyed eviction only (key alias falls back to TTL); never blocks.
+        let key = cache
+            .by_id(&id)
+            .await
+            .ok()
+            .flatten()
+            .map(|a| a.key.clone())
+            .unwrap_or_default();
+        match driver.by_id(&id).await {
+            Ok(None) => {
+                purger.purge(&id, &key).await;
+                purged += 1;
+            }
+            Ok(Some(_)) => {} // live — skip
+            Err(e) => {
+                tracing::warn!(error = %e, app = %id, "app-purge sweep: driver lookup failed; skipping (no purge on error)");
+            }
+        }
+    }
+    purged
+}
+
+/// Spawn the low-frequency sweep loop. Off when `interval_secs == 0`.
+pub fn spawn_sweep(
+    interval_secs: u64,
+    app_registry: Arc<AppRegistry>,
+    driver: Arc<dyn AppManager>,
+    cache: Arc<CachingAppManager>,
+    purger: Arc<AppPurger>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(Duration::from_secs(interval_secs.max(1)));
+        loop {
+            ticker.tick().await;
+            let n = sweep_once(&app_registry, &driver, &cache, &purger).await;
+            if n > 0 {
+                tracing::info!(purged = n, "app-purge sweep reclaimed removed apps");
+            }
+        }
+    })
 }
 
 #[cfg(test)]
@@ -127,5 +191,73 @@ mod tests {
             driver_calls.load(Ordering::SeqCst) > 1,
             "post-purge lookup must miss L1 and re-hit the driver (cache was evicted)"
         );
+    }
+
+    enum Outcome {
+        Some,
+        None,
+        Err,
+    }
+    struct VarMock {
+        app: Arc<App>,
+        outcome: Outcome,
+    }
+    #[async_trait::async_trait]
+    impl AppManager for VarMock {
+        async fn by_id(&self, _: &str) -> Result<Option<Arc<App>>, AppLookupError> {
+            match self.outcome {
+                Outcome::Some => Ok(std::option::Option::Some(self.app.clone())),
+                Outcome::None => Ok(std::option::Option::None),
+                Outcome::Err => Err(AppLookupError::Backend("down".into())),
+            }
+        }
+        async fn by_key(&self, k: &str) -> Result<Option<Arc<App>>, AppLookupError> {
+            self.by_id(k).await
+        }
+    }
+
+    type SetupResult = (Arc<AppRegistry>, Arc<dyn AppManager>, Arc<CachingAppManager>, AppPurger, mpsc::Receiver<Box<ServerEvent>>);
+
+    fn setup(outcome: Outcome) -> SetupResult {
+        let app_registry = Arc::new(AppRegistry::new());
+        let local = Arc::new(LocalAdapter::new(Arc::new(Registry::new()), app_registry.clone()));
+        let adapter: Arc<dyn Adapter> = local.clone();
+        let (tx, rx) = mpsc::channel(1024);
+        app_registry.insert("a", ConnectionHandle { socket_id: SocketId::generate(), mailbox: Mailbox::new(tx, None, None) });
+        let conn_counts: Arc<DashMap<String, Arc<AtomicUsize>>> = Arc::new(DashMap::new());
+        conn_counts.insert("a".to_string(), Arc::new(AtomicUsize::new(1)));
+        let driver: Arc<dyn AppManager> = Arc::new(VarMock { app: app("a", "k"), outcome });
+        let cfg = CacheConfig { max_capacity: 100, ttl_secs: 300, neg_max: 100, neg_ttl_secs: 300 };
+        let cache = Arc::new(CachingAppManager::new(driver.clone(), cfg, None));
+        let purger = AppPurger::new(adapter, conn_counts, cache.clone());
+        (app_registry, driver, cache, purger, rx)
+    }
+
+    #[tokio::test]
+    async fn sweep_purges_app_whose_driver_returns_none() {
+        let (app_registry, driver, cache, purger, mut rx) = setup(Outcome::None);
+        // Warm the cache so the sweep can resolve "a"'s key before purging.
+        let _ = cache.by_id("a").await;
+        let purged = sweep_once(&app_registry, &driver, &cache, &purger).await;
+        assert_eq!(purged, 1, "an Ok(None) app must be purged");
+        assert!(matches!(rx.try_recv().map(|b| *b), Ok(ServerEvent::Error(e)) if e.code == 4009));
+    }
+
+    #[tokio::test]
+    async fn sweep_does_not_purge_on_ok_some() {
+        let (app_registry, driver, cache, purger, mut rx) = setup(Outcome::Some);
+        let _ = cache.by_id("a").await;
+        let purged = sweep_once(&app_registry, &driver, &cache, &purger).await;
+        assert_eq!(purged, 0, "a live (Ok(Some)) app must NOT be purged");
+        assert!(rx.try_recv().is_err(), "no 4009 frame for a live app");
+    }
+
+    #[tokio::test]
+    async fn sweep_does_not_purge_on_err() {
+        let (app_registry, driver, cache, purger, mut rx) = setup(Outcome::Err);
+        let _ = cache.by_id("a").await;
+        let purged = sweep_once(&app_registry, &driver, &cache, &purger).await;
+        assert_eq!(purged, 0, "a backend Err must NEVER purge a live app");
+        assert!(rx.try_recv().is_err(), "no 4009 frame on a backend error");
     }
 }

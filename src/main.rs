@@ -84,20 +84,23 @@ async fn main() -> anyhow::Result<()> {
             Arc::new(pylon::app::mongo::MongoAppManager::connect(&dsn).await?)
         }
     };
-    let (apps, caching_for_purge): (Arc<dyn AppManager>, Option<Arc<pylon::app::cache::CachingAppManager>>) =
-        if config.app_cache && config.app_manager != AppManagerKind::StaticFile {
-            use pylon::app::cache::{CacheConfig, CachingAppManager};
-            let l2 = match &config.app_cache_redis_url {
-                Some(url) => Some(Arc::new(pylon::app::l2::RedisAppCache::connect(url, 4, config.app_cache_ttl).await?)),
-                None => None,
-            };
-            let cfg = CacheConfig {
-                max_capacity: config.app_cache_max, ttl_secs: config.app_cache_ttl,
-                neg_max: config.app_cache_neg_max, neg_ttl_secs: config.app_cache_neg_ttl,
-            };
-            let caching = Arc::new(CachingAppManager::new(apps, cfg, l2));
-            (caching.clone(), Some(caching))
-        } else { (apps, None) };
+    let (apps, caching_for_purge, uncached_driver) = if config.app_cache && config.app_manager != AppManagerKind::StaticFile {
+        use pylon::app::cache::{CacheConfig, CachingAppManager};
+        let l2 = match &config.app_cache_redis_url {
+            Some(url) => Some(Arc::new(pylon::app::l2::RedisAppCache::connect(url, 4, config.app_cache_ttl).await?)),
+            None => None,
+        };
+        let cfg = CacheConfig {
+            max_capacity: config.app_cache_max, ttl_secs: config.app_cache_ttl,
+            neg_max: config.app_cache_neg_max, neg_ttl_secs: config.app_cache_neg_ttl,
+        };
+        let uncached_driver: Arc<dyn AppManager> = apps.clone();
+        let caching = Arc::new(CachingAppManager::new(apps, cfg, l2));
+        let apps_erased: Arc<dyn AppManager> = caching.clone();
+        (apps_erased, Some(caching), Some(uncached_driver))
+    } else {
+        (apps, None, None)
+    };
 
     // The redis adapter is the CLUSTERED production path: the node's single
     // `RedisAdapter` is owned by a `ClusterBridge` (on its own runtime), the percore workers
@@ -107,7 +110,7 @@ async fn main() -> anyhow::Result<()> {
     // so webhooks are attached AFTER the bridge is up), so it runs in a dedicated function.
     // The local (single-node) path keeps the straight-line wiring below.
     if config.adapter == "redis" {
-        return run_redis_percore(config, apps, caching_for_purge).await;
+        return run_redis_percore(config, apps, caching_for_purge, uncached_driver).await;
     }
 
     // Per-app connection index shared with `LocalAdapter::purge_app` (Phase 6),
@@ -142,6 +145,24 @@ async fn main() -> anyhow::Result<()> {
         }
         _ => None,
     };
+
+    // App-purge sweep backstop: DB-backed cache path only, gated by the interval.
+    if let (Some(cache), Some(driver)) = (&caching_for_purge, &uncached_driver) {
+        if config.app_sweep_interval_secs > 0 {
+            let purger = Arc::new(pylon::app::purger::AppPurger::new(
+                adapter.clone(),
+                conn_counts.clone(),
+                cache.clone(),
+            ));
+            pylon::app::purger::spawn_sweep(
+                config.app_sweep_interval_secs,
+                app_registry.clone(),
+                driver.clone(),
+                cache.clone(),
+                purger,
+            );
+        }
+    }
 
     // The percore worker is a blocking `mio` loop; run it on a dedicated blocking
     // thread and flip the shared shutdown flag when the signal future resolves.
@@ -251,6 +272,7 @@ async fn run_redis_percore(
     config: ServerConfig,
     apps: Arc<dyn AppManager>,
     caching_for_purge: Option<Arc<pylon::app::cache::CachingAppManager>>,
+    uncached_driver: Option<Arc<dyn AppManager>>,
 ) -> anyhow::Result<()> {
     // Per-app connection index shared with `LocalAdapter::purge_app` (Phase 6),
     // created once and threaded into both the worker fleet and the adapter.
@@ -302,6 +324,24 @@ async fn run_redis_percore(
         }
         _ => None,
     };
+
+    // App-purge sweep backstop: DB-backed cache path only, gated by the interval.
+    if let (Some(cache), Some(driver)) = (&caching_for_purge, &uncached_driver) {
+        if config.app_sweep_interval_secs > 0 {
+            let purger = Arc::new(pylon::app::purger::AppPurger::new(
+                adapter.clone(),
+                conn_counts.clone(),
+                cache.clone(),
+            ));
+            pylon::app::purger::spawn_sweep(
+                config.app_sweep_interval_secs,
+                app_registry.clone(),
+                driver.clone(),
+                cache.clone(),
+                purger,
+            );
+        }
+    }
 
     // REST handoff plane: the worker hands plain-HTTP connections to this axum router via
     // `rest_tx`; `rest::serve` drives them on the tokio runtime. The REST `AppState` drives
