@@ -4,6 +4,7 @@ pub mod cache;
 pub mod invalidation;
 pub mod l2;
 pub mod mongo;
+pub mod purger;
 pub mod sql;
 pub mod static_file;
 

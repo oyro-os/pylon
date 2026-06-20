@@ -49,7 +49,9 @@ pub async fn post_invalidate(
         .map_err(|e| RestError::bad_request(format!("invalid body: {e}")))?;
     match &state.invalidator {
         Some(inv) => {
-            inv.publish(&app_id, &parsed.key)
+            // Task 5 will replace this with the body's action; for now bridge with Refresh
+            // (the safe, non-destructive default) so the compile succeeds.
+            inv.publish(&app_id, &parsed.key, crate::app::invalidation::InvalidateAction::Refresh)
                 .await
                 .map_err(|e| RestError::service_unavailable(format!("invalidate publish failed: {e}")))?;
             Ok(axum::http::StatusCode::ACCEPTED)
