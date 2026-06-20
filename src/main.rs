@@ -111,7 +111,7 @@ async fn main() -> anyhow::Result<()> {
     // so webhooks are attached AFTER the bridge is up), so it runs in a dedicated function.
     // The local (single-node) path keeps the straight-line wiring below.
     if config.adapter == "redis" {
-        return run_redis_percore(config, apps).await;
+        return run_redis_percore(config, apps, invalidator).await;
     }
 
     // The CONCRETE local adapter, so the percore transport can install its sharded
@@ -231,7 +231,7 @@ async fn main() -> anyhow::Result<()> {
 /// `AdapterOccupancy` over `bridge.adapter()`, and only THEN `bridge.attach_webhooks` wires
 /// the deferred handle into the drain loop and starts the Redis sweeper. The bridge is held
 /// alive until after the worker joins; its `Drop` tears down the dedicated Redis runtime.
-async fn run_redis_percore(config: ServerConfig, apps: Arc<dyn AppManager>) -> anyhow::Result<()> {
+async fn run_redis_percore(config: ServerConfig, apps: Arc<dyn AppManager>, invalidator: Option<Arc<pylon::app::invalidation::AppInvalidator>>) -> anyhow::Result<()> {
     // The single shared LocalAdapter: the bridge's RedisAdapter shares it (so its recv
     // loop's `local.broadcast(Raw)` shards remote frames to this node's workers), the REST
     // plane reads the saturation flag off it, and the worker's ClusterAdapter + the sharded
@@ -284,7 +284,7 @@ async fn run_redis_percore(config: ServerConfig, apps: Arc<dyn AppManager>) -> a
         saturated: Some(local.saturation_flag()),
         draining,
         cluster_metrics: Some(bridge.metrics()),
-        invalidator: None,
+        invalidator,
     };
     tokio::spawn(pylon::transport::rest::serve(
         rest_rx,
