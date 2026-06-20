@@ -33,6 +33,10 @@ impl PusherError {
     pub fn server_over_capacity() -> Self {
         Self::new(4100, "Server is over capacity")
     }
+    /// Transient: app store unreachable. Client reconnects after backoff (41xx range).
+    pub fn backend_unavailable() -> Self {
+        Self::new(4103, "application store temporarily unavailable")
+    }
 }
 
 #[cfg(test)]
