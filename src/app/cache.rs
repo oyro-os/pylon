@@ -83,6 +83,23 @@ impl CachingAppManager {
             },
         }
     }
+
+    /// Evict an app from L1 (positive + negative, both id and key aliases) and L2.
+    /// L2 errors are best-effort (logged). Carries `key` so the key alias evicts
+    /// reliably without waiting for TTL.
+    pub async fn invalidate(&self, id: &str, key: &str) {
+        let id_pkey = format!("id:{id}");
+        let key_pkey = format!("key:{key}");
+        self.pos.invalidate(&id_pkey).await;
+        self.pos.invalidate(&key_pkey).await;
+        self.neg.invalidate(&id_pkey).await;
+        self.neg.invalidate(&key_pkey).await;
+        if let Some(l2) = &self.l2 {
+            if let Err(e) = l2.del(id, key).await {
+                tracing::warn!(error = %e, "L2 del during invalidate failed (ignored)");
+            }
+        }
+    }
 }
 
 #[async_trait::async_trait]
@@ -160,6 +177,26 @@ mod tests {
         for _ in 0..50 { let c = c.clone(); hs.push(tokio::spawn(async move { c.by_id("a").await })); }
         for h in hs { h.await.unwrap().unwrap().unwrap(); }
         assert_eq!(calls.load(Ordering::SeqCst), 1, "single-flight: 50 concurrent misses => 1 driver call");
+    }
+
+    #[tokio::test]
+    async fn invalidate_evicts_l1_positive() {
+        let (m, calls) = mock(Some(app("a", "k")), false);
+        let c = CachingAppManager::new(m, cfg(), None);
+        assert_eq!(c.by_id("a").await.unwrap().unwrap().key, "k");   // caches it (driver call 1)
+        c.invalidate("a", "k").await;
+        assert_eq!(c.by_id("a").await.unwrap().unwrap().key, "k");   // re-fetch (driver call 2)
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2, "invalidate must evict L1");
+    }
+
+    #[tokio::test]
+    async fn invalidate_evicts_negative_and_key_alias() {
+        let (m, calls) = mock(Some(app("a", "k")), false);
+        let c = CachingAppManager::new(m, cfg(), None);
+        assert!(c.by_key("k").await.unwrap().is_some());             // caches key alias (call 1)
+        c.invalidate("a", "k").await;
+        assert!(c.by_key("k").await.unwrap().is_some());             // re-fetch by key (call 2)
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2, "invalidate must evict the key alias too");
     }
 
     #[tokio::test]

@@ -52,6 +52,13 @@ impl RedisAppCache {
         }
     }
 
+    /// Delete both the id- and key-keyed entries for an app.
+    pub async fn del(&self, id: &str, key: &str) -> Result<(), AppLookupError> {
+        let _: () = self.pool.del((Self::id_key(id), Self::key_key(key))).await
+            .map_err(|e| AppLookupError::Backend(e.to_string()))?;
+        Ok(())
+    }
+
     /// Store the app under both its id- and key-keyed entries with the configured TTL.
     pub async fn put(&self, app: &App) -> Result<(), AppLookupError> {
         let s =
@@ -108,5 +115,16 @@ mod tests {
         let c = RedisAppCache::connect(&redis_url(), 2, 60).await.unwrap();
         let n = uuid::Uuid::new_v4();
         assert!(c.get_id(&format!("absent-{n}")).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn del_removes_both_keys() {
+        let c = RedisAppCache::connect(&redis_url(), 2, 60).await.unwrap();
+        let app = uniq_app();
+        c.put(&app).await.unwrap();
+        assert!(c.get_id(&app.id).await.unwrap().is_some());
+        c.del(&app.id, &app.key).await.unwrap();
+        assert!(c.get_id(&app.id).await.unwrap().is_none());
+        assert!(c.get_key(&app.key).await.unwrap().is_none());
     }
 }
