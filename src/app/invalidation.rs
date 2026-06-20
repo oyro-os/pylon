@@ -20,17 +20,24 @@ impl AppInvalidator {
     /// Connect to `url`, subscribe to the invalidation channel (evicting `cache`
     /// on each message), and return a handle that can publish invalidations.
     pub async fn spawn(url: &str, cache: Arc<CachingAppManager>) -> anyhow::Result<Arc<Self>> {
-        let config = Config::from_url(url)?;
-        let publish_pool = Builder::from_config(config.clone()).build_pool(2)?;
+        // `max_attempts = 0` means retry forever; min 100ms, max 30s, base 2.
+        let policy = ReconnectPolicy::new_exponential(0, 100, 30_000, 2);
+        let mut builder = Builder::from_config(Config::from_url(url)?);
+        builder.set_policy(policy);
+
+        let publish_pool = builder.build_pool(2)?;
         publish_pool.init().await?;
 
-        let sub = Builder::from_config(config).build_subscriber_client()?;
+        let sub = builder.build_subscriber_client()?;
         sub.init().await?;
+        // Keep the resubscribe task handle so it isn't dropped (which would stop it).
+        let _mgr = sub.manage_subscriptions();
         sub.subscribe(INVALIDATE_CHANNEL).await?;
         let mut rx = sub.message_rx();
         tokio::spawn(async move {
-            // hold `sub` for the task's lifetime so the subscription stays open
+            // hold `sub` and `_mgr` for the task's lifetime so the subscription stays open
             let _sub = sub;
+            let _sub_mgr = _mgr;
             loop {
                 match rx.recv().await {
                     Ok(msg) => {
