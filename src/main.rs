@@ -78,6 +78,11 @@ async fn main() -> anyhow::Result<()> {
                 .ok_or_else(|| anyhow::anyhow!("PYLON_APP_MANAGER=sqlite|mysql|postgres requires PYLON_APP_DSN"))?;
             Arc::new(pylon::app::sql::SqlAppManager::connect(&dsn).await?)
         }
+        AppManagerKind::Mongo => {
+            let dsn = config.app_dsn.clone()
+                .ok_or_else(|| anyhow::anyhow!("PYLON_APP_MANAGER=mongo requires PYLON_APP_DSN (mongodb://host/db)"))?;
+            Arc::new(pylon::app::mongo::MongoAppManager::connect(&dsn).await?)
+        }
     };
     let apps: Arc<dyn AppManager> = if config.app_cache && config.app_manager != AppManagerKind::StaticFile {
         use pylon::app::cache::{CacheConfig, CachingAppManager};

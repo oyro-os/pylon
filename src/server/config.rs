@@ -7,6 +7,7 @@ pub enum AppManagerKind {
     Sqlite,
     Mysql,
     Postgres,
+    Mongo,
 }
 
 /// Parse `PYLON_APP_MANAGER` into an [`AppManagerKind`].
@@ -16,6 +17,7 @@ pub fn parse_app_manager(kind: Option<&str>) -> AppManagerKind {
         "sqlite" => AppManagerKind::Sqlite,
         "mysql" => AppManagerKind::Mysql,
         "postgres" => AppManagerKind::Postgres,
+        "mongo" => AppManagerKind::Mongo,
         _ => AppManagerKind::StaticFile,
     }
 }
@@ -806,6 +808,7 @@ mod tests {
         assert_eq!(parse_app_manager(Some("sqlite")), AppManagerKind::Sqlite);
         assert_eq!(parse_app_manager(Some("mysql")), AppManagerKind::Mysql);
         assert_eq!(parse_app_manager(Some("postgres")), AppManagerKind::Postgres);
+        assert_eq!(parse_app_manager(Some("mongo")), AppManagerKind::Mongo);
         assert_eq!(parse_app_manager(Some("weird")), AppManagerKind::StaticFile);
     }
 
