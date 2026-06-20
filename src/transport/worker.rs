@@ -41,7 +41,7 @@
 
 use crate::adapter::app_registry::AppRegistry;
 use crate::adapter::Adapter;
-use crate::app::AppManager;
+use crate::app::{App, AppManager};
 use crate::connection::handle::MailboxNotify;
 use crate::protocol::command::ClientCommand;
 use crate::protocol::event::ServerEvent;
@@ -1076,7 +1076,63 @@ fn handle_handshake(
                     dirty: dirty_tx.clone(),
                     waker: mailbox_waker.clone(),
                 };
-                match establish_session(env, &path, notify, cfg.mailbox_dropped_slot.clone()) {
+                use crate::protocol::error::PusherError;
+                let (app_key, protocol) = parse_app_path(&path);
+                // Negotiate the codec up-front (no I/O) so a probe hit can finish
+                // immediately and a probe miss has the codec ready to offload with.
+                let codec = match negotiate(protocol.as_deref(), env.strict_protocol) {
+                    Ok(c) => c,
+                    Err(error) => {
+                        queue_reject(entry, &Reject { error, codec: None }, now_ns);
+                        let _ = flush_and_arm(poll, entry, now_ns);
+                        return Action::Close;
+                    }
+                };
+                // SYNC L1 probe — instant on a static/cache hit, never offloads.
+                let resolved = match env.apps.by_key_cached(&app_key) {
+                    Some(Ok(Some(app))) => finish_establish(
+                        env,
+                        app,
+                        codec,
+                        notify,
+                        cfg.mailbox_dropped_slot.clone(),
+                    ),
+                    Some(Ok(None)) => Err(Reject {
+                        error: PusherError::app_not_found(),
+                        codec: Some(codec),
+                    }),
+                    Some(Err(e)) => {
+                        tracing::warn!(key = %app_key, error = %e, "app probe failed");
+                        Err(Reject {
+                            error: PusherError::backend_unavailable(),
+                            codec: Some(codec),
+                        })
+                    }
+                    // L1 MISS: Task 2 keeps this synchronous (Task 3 parks+offloads).
+                    None => {
+                        match futures_executor::block_on(env.apps.by_key(&app_key)) {
+                            Ok(Some(app)) => finish_establish(
+                                env,
+                                app,
+                                codec,
+                                notify,
+                                cfg.mailbox_dropped_slot.clone(),
+                            ),
+                            Ok(None) => Err(Reject {
+                                error: PusherError::app_not_found(),
+                                codec: Some(codec),
+                            }),
+                            Err(e) => {
+                                tracing::warn!(key = %app_key, error = %e, "app lookup failed (transient)");
+                                Err(Reject {
+                                    error: PusherError::backend_unavailable(),
+                                    codec: Some(codec),
+                                })
+                            }
+                        }
+                    }
+                };
+                match resolved {
                     Ok(session) => {
                         let established = ServerEvent::ConnectionEstablished {
                             socket_id: session.ctx.socket_id,
@@ -1127,11 +1183,10 @@ struct Reject {
 }
 
 /// Resolve the app + protocol from a `/app/{key}?protocol=N` path and build the
-/// v7 [`Session`]: negotiate codec, look up the app by key, enforce per-app
-/// capacity, and assemble the [`ConnectionContext`]. Returns `Err(Reject)` on any
-/// rejection (unsupported protocol → 4007, unknown app → 4001, over capacity →
-/// 4004), carrying the `pusher:error` + the codec to encode it — so the caller
-/// emits the error frame then a WS Close.
+/// v7 [`Session`]: negotiate codec, look up the app by key (synchronously via
+/// `block_on` — this task's pre-park behavior), then run [`finish_establish`].
+/// Returns `Err(Reject)` on any rejection (unsupported protocol → 4007, unknown
+/// app → 4001, backend down → 4103, over capacity → 4004).
 fn establish_session(
     env: &Arc<DispatchEnv>,
     path: &str,
@@ -1155,6 +1210,25 @@ fn establish_session(
             return Err(Reject { error: PusherError::backend_unavailable(), codec: Some(codec) });
         }
     };
+
+    finish_establish(env, app, codec, notify, mailbox_dropped)
+}
+
+/// The deferred establish TAIL, reusable by both the synchronous L1-hit path and
+/// the park-resume path (Task 3). Given a resolved `app` + a negotiated `codec`,
+/// enforce the node ceiling, the saturation gate, and the per-app capacity, then
+/// build the [`ConnectionContext`] and register the connection. Counters
+/// (`NODE_CONNS`, `conn_counts`) are incremented HERE and rolled back on every
+/// reject — never before the app is resolved — so a connection that drops before
+/// this runs (e.g. while parked) leaks nothing.
+fn finish_establish(
+    env: &Arc<DispatchEnv>,
+    app: Arc<App>,
+    codec: Box<dyn Codec>,
+    notify: MailboxNotify,
+    mailbox_dropped: Option<Arc<AtomicU64>>,
+) -> Result<Session, Reject> {
+    use crate::protocol::error::PusherError;
 
     // Node-level ceiling check: enforced before the per-app capacity check.
     // `max_connections == 0` means unlimited (no ceiling).
