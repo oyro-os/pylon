@@ -84,19 +84,27 @@ async fn main() -> anyhow::Result<()> {
             Arc::new(pylon::app::mongo::MongoAppManager::connect(&dsn).await?)
         }
     };
-    let apps: Arc<dyn AppManager> = if config.app_cache && config.app_manager != AppManagerKind::StaticFile {
-        use pylon::app::cache::{CacheConfig, CachingAppManager};
-        let l2 = match &config.app_cache_redis_url {
-            Some(url) => Some(std::sync::Arc::new(
-                pylon::app::l2::RedisAppCache::connect(url, 4, config.app_cache_ttl).await?)),
-            None => None,
-        };
-        let cfg = CacheConfig {
-            max_capacity: config.app_cache_max, ttl_secs: config.app_cache_ttl,
-            neg_max: config.app_cache_neg_max, neg_ttl_secs: config.app_cache_neg_ttl,
-        };
-        std::sync::Arc::new(CachingAppManager::new(apps, cfg, l2))
-    } else { apps };
+    // Bound as `_invalidator` here — the spawned subscriber runs regardless; Task 3 renames
+    // this to `invalidator` and threads it into AppState (which gains the field there), so
+    // there is no unused-variable warning at this task's boundary.
+    let (apps, _invalidator): (Arc<dyn AppManager>, Option<Arc<pylon::app::invalidation::AppInvalidator>>) =
+        if config.app_cache && config.app_manager != AppManagerKind::StaticFile {
+            use pylon::app::cache::{CacheConfig, CachingAppManager};
+            let l2 = match &config.app_cache_redis_url {
+                Some(url) => Some(Arc::new(pylon::app::l2::RedisAppCache::connect(url, 4, config.app_cache_ttl).await?)),
+                None => None,
+            };
+            let cfg = CacheConfig {
+                max_capacity: config.app_cache_max, ttl_secs: config.app_cache_ttl,
+                neg_max: config.app_cache_neg_max, neg_ttl_secs: config.app_cache_neg_ttl,
+            };
+            let caching = Arc::new(CachingAppManager::new(apps, cfg, l2));
+            let inv = match &config.app_cache_redis_url {
+                Some(url) => Some(pylon::app::invalidation::AppInvalidator::spawn(url, caching.clone()).await?),
+                None => None,
+            };
+            (caching, inv)
+        } else { (apps, None) };
 
     // The redis adapter is the CLUSTERED production path: the node's single
     // `RedisAdapter` is owned by a `ClusterBridge` (on its own runtime), the percore workers
