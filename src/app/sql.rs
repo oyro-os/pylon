@@ -3,16 +3,29 @@ use sqlx::any::{AnyPoolOptions, AnyRow};
 use sqlx::{AnyPool, Row};
 use std::sync::Arc;
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Dialect { Sqlite, MySql, Postgres }
+
+impl Dialect {
+    fn from_dsn(dsn: &str) -> Self {
+        let scheme = dsn.split(':').next().unwrap_or("").to_ascii_lowercase();
+        if scheme.starts_with("mysql") || scheme.starts_with("mariadb") { Dialect::MySql }
+        else if scheme.starts_with("postgres") { Dialect::Postgres }
+        else { Dialect::Sqlite }
+    }
+    /// `key` is reserved in MySQL (needs backticks); non-reserved in SQLite/Postgres.
+    fn key_ident(&self) -> &'static str {
+        match self { Dialect::MySql => "`key`", _ => "key" }
+    }
+}
+
 /// App store backed by a SQL database via sqlx `Any` (SQLite now; MySQL/Postgres
 /// added later by enabling their sqlx features — same code, DSN-selected).
 #[derive(Debug)]
 pub struct SqlAppManager {
     pub(crate) pool: AnyPool,
+    dialect: Dialect,
 }
-
-const SELECT: &str =
-    "SELECT id, key, secret, name, capacity, client_messages_enabled, \
-     subscription_count_enabled, enabled, webhooks FROM apps";
 
 /// Typed column for app lookup to prevent SQL injection via caller-controlled column names.
 enum LookupCol {
@@ -20,30 +33,25 @@ enum LookupCol {
     Key,
 }
 
-impl LookupCol {
-    fn column(&self) -> &'static str {
-        match self {
-            LookupCol::Id => "id",
-            LookupCol::Key => "key",
-        }
-    }
-}
-
 impl SqlAppManager {
     pub async fn connect(dsn: &str) -> anyhow::Result<Self> {
         sqlx::any::install_default_drivers();
+        let dialect = Dialect::from_dsn(dsn);
         let pool = AnyPoolOptions::new().max_connections(8).connect(dsn).await?;
-        Ok(Self { pool })
+        Ok(Self { pool, dialect })
+    }
+
+    fn select_sql(&self) -> String {
+        format!("SELECT id, {}, secret, name, capacity, client_messages_enabled, \
+                 subscription_count_enabled, enabled, webhooks FROM apps", self.dialect.key_ident())
     }
 
     async fn fetch(&self, col: LookupCol, val: &str) -> Result<Option<Arc<App>>, AppLookupError> {
-        let sql = format!("{SELECT} WHERE {} = ? AND enabled <> 0 LIMIT 1", col.column());
+        let where_col = match col { LookupCol::Id => "id", LookupCol::Key => self.dialect.key_ident() };
+        let sql = format!("{} WHERE {} = ? AND enabled <> 0 LIMIT 1", self.select_sql(), where_col);
         let row = sqlx::query(&sql).bind(val).fetch_optional(&self.pool).await
             .map_err(|e| AppLookupError::Backend(e.to_string()))?;
-        match row {
-            None => Ok(None),
-            Some(r) => Ok(Some(Arc::new(row_to_app(&r)?))),
-        }
+        match row { None => Ok(None), Some(r) => Ok(Some(Arc::new(row_to_app(&r)?))) }
     }
 }
 
@@ -53,9 +61,20 @@ fn get_bool(r: &AnyRow, col: &str) -> Result<bool, AppLookupError> {
         .map_err(|e| AppLookupError::Decode(format!("{col}: {e}")))
 }
 
+/// Read a column that may come back as `String` (SQLite/Postgres VARCHAR) or
+/// `Vec<u8>` (MySQL TEXT mapped to BLOB by sqlx Any) — both cases valid UTF-8.
+fn get_text(r: &AnyRow, col: &str) -> Result<String, AppLookupError> {
+    if let Ok(s) = r.try_get::<String, _>(col) {
+        return Ok(s);
+    }
+    let bytes: Vec<u8> = r.try_get(col)
+        .map_err(|e| AppLookupError::Decode(format!("{col} column: {e}")))?;
+    String::from_utf8(bytes)
+        .map_err(|e| AppLookupError::Decode(format!("{col} utf8: {e}")))
+}
+
 fn row_to_app(r: &AnyRow) -> Result<App, AppLookupError> {
-    let webhooks_json: String = r.try_get("webhooks")
-        .map_err(|e| AppLookupError::Decode(format!("webhooks column: {e}")))?;
+    let webhooks_json = get_text(r, "webhooks")?;
     let webhooks: Vec<WebhookConfig> = serde_json::from_str(&webhooks_json)
         .map_err(|e| AppLookupError::Decode(format!("webhooks json: {e}")))?;
     let dec = |e: sqlx::Error| AppLookupError::Decode(e.to_string());
