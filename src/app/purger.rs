@@ -54,6 +54,7 @@ mod tests {
     use crate::connection::handle::{ConnectionHandle, Mailbox};
     use crate::protocol::event::ServerEvent;
     use crate::protocol::socket_id::SocketId;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::sync::mpsc;
 
     fn app(id: &str, key: &str) -> Arc<App> {
@@ -65,11 +66,16 @@ mod tests {
         Arc::new(a)
     }
 
-    struct Mock(Arc<App>);
+    /// Call-counting mock: every `by_id` hit increments `calls`.
+    struct Mock {
+        app: Option<Arc<App>>,
+        calls: Arc<AtomicUsize>,
+    }
     #[async_trait::async_trait]
     impl AppManager for Mock {
         async fn by_id(&self, _: &str) -> Result<Option<Arc<App>>, AppLookupError> {
-            Ok(Some(self.0.clone()))
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(self.app.clone())
         }
         async fn by_key(&self, k: &str) -> Result<Option<Arc<App>>, AppLookupError> {
             self.by_id(k).await
@@ -91,10 +97,19 @@ mod tests {
         let conn_counts: Arc<DashMap<String, Arc<AtomicUsize>>> = Arc::new(DashMap::new());
         conn_counts.insert("a".to_string(), Arc::new(AtomicUsize::new(1)));
 
+        let driver_calls = Arc::new(AtomicUsize::new(0));
+        let mock_driver = Arc::new(Mock { app: Some(app("a", "k")), calls: driver_calls.clone() });
         let cfg = CacheConfig { max_capacity: 100, ttl_secs: 300, neg_max: 100, neg_ttl_secs: 300 };
-        let cache = Arc::new(CachingAppManager::new(Arc::new(Mock(app("a", "k"))), cfg, None));
-        // Warm the cache so we can prove eviction.
+        let cache = Arc::new(CachingAppManager::new(mock_driver, cfg, None));
+
+        // Warm the cache: driver must be hit exactly once.
         assert_eq!(cache.by_id("a").await.unwrap().unwrap().key, "k");
+        let calls_after_warm = driver_calls.load(Ordering::SeqCst);
+        assert_eq!(calls_after_warm, 1, "warm-up must hit the driver once");
+
+        // Second lookup before purge must be an L1 cache hit (driver NOT called again).
+        let _ = cache.by_id("a").await.unwrap();
+        assert_eq!(driver_calls.load(Ordering::SeqCst), 1, "pre-purge second lookup must be L1 hit");
 
         let purger = AppPurger::new(adapter, conn_counts.clone(), cache.clone());
         purger.purge("a", "k").await;
@@ -106,5 +121,11 @@ mod tests {
         assert!(!conn_counts.contains_key("a"), "purge must remove the conn_counts entry");
         // (3) AppRegistry entry drained.
         assert!(app_registry.connected_app_ids().is_empty());
+        // (4) Cache was evicted: a lookup after purge must reach the driver again.
+        let _ = cache.by_id("a").await.unwrap();
+        assert!(
+            driver_calls.load(Ordering::SeqCst) > 1,
+            "post-purge lookup must miss L1 and re-hit the driver (cache was evicted)"
+        );
     }
 }
