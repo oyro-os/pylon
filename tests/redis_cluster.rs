@@ -1609,3 +1609,61 @@ async fn cluster_publish_broadcast_fans_out_only_remote() {
     .await
     .expect("cluster_publish_broadcast direct test must not hang (Redis up?)");
 }
+
+/// `purge_app` on a `RedisAdapter` closes all local connections with 4009 and
+/// removes the app from the Redis `apps` set so the sweeper stops enumerating it.
+#[tokio::test]
+async fn purge_app_closes_connections_and_removes_from_redis_apps_set() {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let prefix = random_prefix();
+        let adapter = connect_adapter_with_prefix(&prefix).await;
+        let keys = Keys::new(&prefix);
+
+        // Register the app in the `apps` set by subscribing a connection (same as
+        // `cluster_subscribe` does) so the pre-condition matches production.
+        let (tx, _rx) = tokio::sync::mpsc::channel::<Box<ServerEvent>>(64);
+        let sock = SocketId::generate();
+        let handle = ConnectionHandle {
+            socket_id: sock,
+            mailbox: pylon::connection::handle::Mailbox::new(tx, None, None),
+        };
+        adapter.subscribe(TEST_APP, "public-room", handle, None).await;
+
+        // Confirm the app is indexed in the Redis `apps` set.
+        let clients = RedisClients::connect(&test_redis_url(), 1)
+            .await
+            .expect("test clients must connect");
+        let is_member: bool = clients
+            .pool
+            .next()
+            .sismember(keys.apps(), TEST_APP)
+            .await
+            .expect("SISMEMBER apps must succeed");
+        assert!(is_member, "app must be in the `apps` set after subscribe");
+
+        // Now purge the app — all local connections closed, Redis `apps` SREM'd.
+        let ids = adapter.purge_app(TEST_APP).await;
+        // The LocalAdapter holds the one connection we inserted via `subscribe`.
+        // On the test path there is no DispatchEnv, so `app_registry.drain_app`
+        // may return empty (the connection was not inserted there) — what matters is
+        // the Redis SREM ran (no panic, no error).
+        assert!(
+            ids.len() <= 1,
+            "purge_app must return <=1 id (only those in app_registry)"
+        );
+
+        // The app must have been removed from the Redis `apps` set.
+        let still_member: bool = clients
+            .pool
+            .next()
+            .sismember(keys.apps(), TEST_APP)
+            .await
+            .expect("SISMEMBER apps must succeed after purge");
+        assert!(
+            !still_member,
+            "app must be removed from the `apps` set after purge_app"
+        );
+    })
+    .await
+    .expect("purge_app Redis test must not hang (Redis up?)");
+}

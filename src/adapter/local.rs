@@ -1,4 +1,5 @@
 use super::Adapter;
+use crate::adapter::app_registry::AppRegistry;
 use crate::channel::cache::{CacheStore, CachedEvent};
 use crate::channel::outcome::{ChannelSummary, SubscribeOutcome, UnsubscribeOutcome};
 use crate::channel::registry::Registry;
@@ -13,10 +14,33 @@ use async_trait::async_trait;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+/// Send error (4009) + close (4009) frames to every handle in `handles` and
+/// return their socket ids. Shared by `terminate_user` and `purge_app` so the
+/// 4009 eviction logic lives in exactly one place.
+fn close_handles_4009(handles: Vec<ConnectionHandle>) -> Vec<SocketId> {
+    let ids = handles.iter().map(|h| h.socket_id).collect();
+    for h in handles {
+        let _ = h.mailbox.send(ServerEvent::Error(PusherError::new(
+            4009,
+            "You got disconnected by the app.",
+        )));
+        let _ = h.mailbox.send(ServerEvent::Close {
+            code: 4009,
+            reason: "You got disconnected by the app.".to_string(),
+        });
+    }
+    ids
+}
+
 pub struct LocalAdapter {
     registry: Arc<Registry>,
     cache: CacheStore,
     users: UserRegistry,
+    /// Per-app connection index for `purge_app`. Shared with the percore worker
+    /// fleet (inserted on establish, removed on close) so `purge_app` can drain
+    /// ALL connections of a removed app — including idle (unsubscribed) ones that
+    /// would be invisible to the channel registry.
+    app_registry: Arc<AppRegistry>,
     /// Per-core SHARDED broadcast sink. Set by `run_percore` BEFORE any worker
     /// spawns when the per-core transport is active; `None` for the legacy
     /// (axum) transport and standalone tests. When present, channel broadcasts
@@ -33,11 +57,12 @@ pub struct LocalAdapter {
 }
 
 impl LocalAdapter {
-    pub fn new(registry: Arc<Registry>) -> Self {
+    pub fn new(registry: Arc<Registry>, app_registry: Arc<AppRegistry>) -> Self {
         Self {
             registry,
             cache: CacheStore::new(),
             users: UserRegistry::new(),
+            app_registry,
             bcast_sink: std::sync::OnceLock::new(),
             saturated: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
@@ -237,20 +262,15 @@ impl Adapter for LocalAdapter {
     }
 
     async fn terminate_user(&self, app: &str, user_id: &str) -> Vec<SocketId> {
-        let handles = self.users.handles(app, user_id);
-        let ids = handles.iter().map(|h| h.socket_id).collect();
-        for h in handles {
-            // Mirror soketi namespace.ts:179-188 — error frame then close, both 4009.
-            let _ = h.mailbox.send(ServerEvent::Error(PusherError::new(
-                4009,
-                "You got disconnected by the app.",
-            )));
-            let _ = h.mailbox.send(ServerEvent::Close {
-                code: 4009,
-                reason: "You got disconnected by the app.".to_string(),
-            });
-        }
-        ids
+        // Mirror soketi namespace.ts:179-188 — error frame then close, both 4009.
+        close_handles_4009(self.users.handles(app, user_id))
+    }
+
+    async fn purge_app(&self, app_id: &str) -> Vec<SocketId> {
+        // Drain all connections for this app from the per-app index, then 4009-close
+        // each one. Each connection's on_close will self-clean its channel/user/presence
+        // registries, so no explicit registry teardown is needed here.
+        close_handles_4009(self.app_registry.drain_app(app_id))
     }
 }
 
@@ -262,7 +282,7 @@ mod tests {
     #[tokio::test]
     async fn subscribe_then_broadcast_delegates_to_registry() {
         let reg = Arc::new(Registry::new());
-        let adapter = LocalAdapter::new(reg.clone());
+        let adapter = LocalAdapter::new(reg.clone(), Arc::new(crate::adapter::app_registry::AppRegistry::new()));
         let (tx, mut rx) = mpsc::channel(1024);
         let out = adapter
             .subscribe(
@@ -290,7 +310,7 @@ mod tests {
     #[tokio::test]
     async fn presence_members_round_trip() {
         let reg = Arc::new(Registry::new());
-        let adapter = LocalAdapter::new(reg.clone());
+        let adapter = LocalAdapter::new(reg.clone(), Arc::new(crate::adapter::app_registry::AppRegistry::new()));
         let (tx, _rx) = mpsc::channel(1024);
         adapter
             .subscribe(
@@ -317,7 +337,7 @@ mod tests {
 
     #[tokio::test]
     async fn cache_set_then_get_round_trips() {
-        let adapter = LocalAdapter::new(Arc::new(Registry::new()));
+        let adapter = LocalAdapter::new(Arc::new(Registry::new()), Arc::new(crate::adapter::app_registry::AppRegistry::new()));
         adapter
             .cache_set(
                 "app",
@@ -341,7 +361,7 @@ mod tests {
 
     #[tokio::test]
     async fn cache_set_overwrites_last_event() {
-        let adapter = LocalAdapter::new(Arc::new(Registry::new()));
+        let adapter = LocalAdapter::new(Arc::new(Registry::new()), Arc::new(crate::adapter::app_registry::AppRegistry::new()));
         for data in ["one", "two"] {
             adapter
                 .cache_set(
@@ -363,13 +383,13 @@ mod tests {
 
     #[tokio::test]
     async fn cache_get_is_none_when_absent() {
-        let adapter = LocalAdapter::new(Arc::new(Registry::new()));
+        let adapter = LocalAdapter::new(Arc::new(Registry::new()), Arc::new(crate::adapter::app_registry::AppRegistry::new()));
         assert_eq!(adapter.cache_get("app", "cache-missing").await, None);
     }
 
     #[tokio::test]
     async fn cache_entry_expires_after_ttl() {
-        let adapter = LocalAdapter::new(Arc::new(Registry::new()));
+        let adapter = LocalAdapter::new(Arc::new(Registry::new()), Arc::new(crate::adapter::app_registry::AppRegistry::new()));
         adapter
             .cache_set(
                 "app",
@@ -386,7 +406,7 @@ mod tests {
 
     #[tokio::test]
     async fn send_to_user_fans_out_to_all_connections() {
-        let adapter = LocalAdapter::new(Arc::new(Registry::new()));
+        let adapter = LocalAdapter::new(Arc::new(Registry::new()), Arc::new(crate::adapter::app_registry::AppRegistry::new()));
         let (tx1, mut rx1) = mpsc::channel(1024);
         let (tx2, mut rx2) = mpsc::channel(1024);
         let s1 = SocketId::generate();
@@ -418,7 +438,7 @@ mod tests {
 
     #[tokio::test]
     async fn terminate_user_pushes_error_then_close_and_returns_ids() {
-        let adapter = LocalAdapter::new(Arc::new(Registry::new()));
+        let adapter = LocalAdapter::new(Arc::new(Registry::new()), Arc::new(crate::adapter::app_registry::AppRegistry::new()));
         let (tx, mut rx) = mpsc::channel(1024);
         let s = SocketId::generate();
         adapter
@@ -438,5 +458,51 @@ mod tests {
             rx.try_recv().map(|b| *b),
             Ok(ServerEvent::Close { code: 4009, .. })
         ));
+    }
+
+    #[tokio::test]
+    async fn purge_app_closes_all_connections_with_4009() {
+        let app_registry = Arc::new(crate::adapter::app_registry::AppRegistry::new());
+        let adapter = LocalAdapter::new(
+            Arc::new(Registry::new()),
+            app_registry.clone(),
+        );
+        let (tx1, mut rx1) = mpsc::channel(1024);
+        let (tx2, mut rx2) = mpsc::channel(1024);
+        let s1 = SocketId::generate();
+        let s2 = SocketId::generate();
+        // Register both connections in the app registry (simulating the on-establish
+        // path that the worker does in production).
+        app_registry.insert(
+            "myapp",
+            ConnectionHandle {
+                socket_id: s1,
+                mailbox: crate::connection::handle::Mailbox::new(tx1, None, None),
+            },
+        );
+        app_registry.insert(
+            "myapp",
+            ConnectionHandle {
+                socket_id: s2,
+                mailbox: crate::connection::handle::Mailbox::new(tx2, None, None),
+            },
+        );
+        let mut ids = adapter.purge_app("myapp").await;
+        ids.sort();
+        let mut expected = vec![s1, s2];
+        expected.sort();
+        assert_eq!(ids, expected);
+        // Both connections must have received error(4009) + close(4009).
+        for rx in [&mut rx1, &mut rx2] {
+            assert!(
+                matches!(rx.try_recv().map(|b| *b), Ok(ServerEvent::Error(e)) if e.code == 4009)
+            );
+            assert!(matches!(
+                rx.try_recv().map(|b| *b),
+                Ok(ServerEvent::Close { code: 4009, .. })
+            ));
+        }
+        // The app entry is gone — a second purge returns empty.
+        assert!(adapter.purge_app("myapp").await.is_empty());
     }
 }

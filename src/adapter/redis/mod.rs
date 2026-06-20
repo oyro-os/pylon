@@ -241,7 +241,10 @@ impl RedisAdapter {
     pub async fn new(cfg: &ServerConfig) -> anyhow::Result<Self> {
         Self::with_local(
             cfg,
-            Arc::new(LocalAdapter::new(Arc::new(Registry::new()))),
+            Arc::new(LocalAdapter::new(
+                Arc::new(Registry::new()),
+                Arc::new(crate::adapter::app_registry::AppRegistry::new()),
+            )),
             None,
         )
         .await
@@ -1222,6 +1225,23 @@ impl Adapter for RedisAdapter {
             serde_json::Value::Null,
         )
         .await;
+        ids
+    }
+
+    async fn purge_app(&self, app_id: &str) -> Vec<SocketId> {
+        let ids = self.local.purge_app(app_id).await;
+        // Best-effort: remove this app from the cluster `apps` set so the sweeper
+        // will no longer enumerate it. Failure is logged and ignored — the entry is
+        // bounded and the sweeper degrades gracefully if it lingers.
+        if let Err(e) = self
+            .clients
+            .pool
+            .next()
+            .srem::<i64, _, _>(self.keys.apps(), app_id.to_string())
+            .await
+        {
+            tracing::warn!(error = %e, app = app_id, "redis SREM apps during purge failed (ignored)");
+        }
         ids
     }
 

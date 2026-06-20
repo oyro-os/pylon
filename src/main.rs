@@ -114,9 +114,14 @@ async fn main() -> anyhow::Result<()> {
         return run_redis_percore(config, apps, invalidator).await;
     }
 
+    // Per-app connection index shared with `LocalAdapter::purge_app` (Phase 6),
+    // created once and threaded into both the worker fleet and the adapter.
+    let app_registry: Arc<pylon::adapter::app_registry::AppRegistry> =
+        Arc::new(pylon::adapter::app_registry::AppRegistry::new());
+
     // The CONCRETE local adapter, so the percore transport can install its sharded
     // broadcast sink on it.
-    let local = Arc::new(LocalAdapter::new(Arc::new(Registry::new())));
+    let local = Arc::new(LocalAdapter::new(Arc::new(Registry::new()), app_registry.clone()));
     let adapter: Arc<dyn Adapter> = local.clone();
 
     // The single-node local path fires `channel_vacated` immediately (no grace
@@ -127,10 +132,6 @@ async fn main() -> anyhow::Result<()> {
     // Shared connection counters (the axum REST `AppState` and the percore
     // `DispatchEnv` mirror this type exactly).
     let conn_counts: Arc<DashMap<String, Arc<AtomicUsize>>> = Arc::new(Default::default());
-    // Per-app connection index shared with `LocalAdapter::purge_app` (Phase 6),
-    // created once and threaded into both the worker fleet and the adapter.
-    let app_registry: Arc<pylon::adapter::app_registry::AppRegistry> =
-        Arc::new(pylon::adapter::app_registry::AppRegistry::new());
 
     // The percore worker is a blocking `mio` loop; run it on a dedicated blocking
     // thread and flip the shared shutdown flag when the signal future resolves.
@@ -237,11 +238,16 @@ async fn main() -> anyhow::Result<()> {
 /// the deferred handle into the drain loop and starts the Redis sweeper. The bridge is held
 /// alive until after the worker joins; its `Drop` tears down the dedicated Redis runtime.
 async fn run_redis_percore(config: ServerConfig, apps: Arc<dyn AppManager>, invalidator: Option<Arc<pylon::app::invalidation::AppInvalidator>>) -> anyhow::Result<()> {
+    // Per-app connection index shared with `LocalAdapter::purge_app` (Phase 6),
+    // created once and threaded into both the worker fleet and the adapter.
+    let app_registry: Arc<pylon::adapter::app_registry::AppRegistry> =
+        Arc::new(pylon::adapter::app_registry::AppRegistry::new());
+
     // The single shared LocalAdapter: the bridge's RedisAdapter shares it (so its recv
     // loop's `local.broadcast(Raw)` shards remote frames to this node's workers), the REST
     // plane reads the saturation flag off it, and the worker's ClusterAdapter + the sharded
     // sink install on it.
-    let local = Arc::new(LocalAdapter::new(Arc::new(Registry::new())));
+    let local = Arc::new(LocalAdapter::new(Arc::new(Registry::new()), app_registry.clone()));
 
     // Start the bridge: builds the node's single `RedisAdapter` (sharing `local`) on its own
     // runtime and returns once Redis is connected, or `Err` if the connect failed.
@@ -268,10 +274,6 @@ async fn run_redis_percore(config: ServerConfig, apps: Arc<dyn AppManager>, inva
     bridge.attach_webhooks(webhooks.clone());
 
     let conn_counts: Arc<DashMap<String, Arc<AtomicUsize>>> = Arc::new(Default::default());
-    // Per-app connection index shared with `LocalAdapter::purge_app` (Phase 6),
-    // created once and threaded into both the worker fleet and the adapter.
-    let app_registry: Arc<pylon::adapter::app_registry::AppRegistry> =
-        Arc::new(pylon::adapter::app_registry::AppRegistry::new());
 
     // REST handoff plane: the worker hands plain-HTTP connections to this axum router via
     // `rest_tx`; `rest::serve` drives them on the tokio runtime. The REST `AppState` drives

@@ -70,7 +70,7 @@ impl SpawnSpec {
     pub fn with_apps(config: ServerConfig, apps_json: &str) -> Self {
         let apps: Arc<dyn AppManager> =
             Arc::new(StaticFileAppManager::from_json(apps_json).unwrap());
-        let local = Arc::new(LocalAdapter::new(Arc::new(Registry::new())));
+        let local = Arc::new(LocalAdapter::new(Arc::new(Registry::new()), Arc::new(pylon::adapter::app_registry::AppRegistry::new())));
         Self {
             config,
             apps,
@@ -259,7 +259,7 @@ pub async fn spawn_percore_cluster_with(
     // pub/sub recv loop's `local.broadcast(Raw)` shards remote frames to this
     // node's workers), the REST plane reads the saturation flag off it, and the
     // worker's ClusterAdapter + the sharded sink install on it.
-    let local = Arc::new(LocalAdapter::new(Arc::new(Registry::new())));
+    let local = Arc::new(LocalAdapter::new(Arc::new(Registry::new()), Arc::new(pylon::adapter::app_registry::AppRegistry::new())));
 
     // A free ephemeral port, reserved then released (mirrors `spawn_percore`).
     let port = {

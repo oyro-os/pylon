@@ -85,7 +85,7 @@ async fn spawn_tls_server(cert_path: &std::path::Path, key_path: &std::path::Pat
     };
 
     let apps: Arc<dyn AppManager> = Arc::new(StaticFileAppManager::from_json(APPS).unwrap());
-    let local = Arc::new(LocalAdapter::new(Arc::new(Registry::new())));
+    let local = Arc::new(LocalAdapter::new(Arc::new(Registry::new()), Arc::new(pylon::adapter::app_registry::AppRegistry::new())));
     let adapter: Arc<dyn Adapter> = local.clone();
     let conn_counts: Arc<DashMap<String, Arc<AtomicUsize>>> = Arc::new(Default::default());
     let webhooks = WebhookHandle::null();
@@ -441,7 +441,7 @@ async fn spawn_tls_server_large(
     };
     let apps: Arc<dyn AppManager> =
         Arc::new(StaticFileAppManager::from_json(LARGE_RESP_APPS).unwrap());
-    let local = Arc::new(LocalAdapter::new(Arc::new(Registry::new())));
+    let local = Arc::new(LocalAdapter::new(Arc::new(Registry::new()), Arc::new(pylon::adapter::app_registry::AppRegistry::new())));
     let adapter: Arc<dyn Adapter> = local.clone();
     let conn_counts: Arc<DashMap<String, Arc<AtomicUsize>>> = Arc::new(Default::default());
     let webhooks = WebhookHandle::null();

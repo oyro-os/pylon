@@ -69,7 +69,7 @@ async fn spawn(activity_timeout: u32, pong_timeout: u32) -> Harness {
     };
     let apps: Arc<dyn AppManager> = Arc::new(StaticFileAppManager::from_json(APPS).unwrap());
     let registry = Arc::new(Registry::new());
-    let adapter: Arc<dyn Adapter> = Arc::new(LocalAdapter::new(registry));
+    let adapter: Arc<dyn Adapter> = Arc::new(LocalAdapter::new(registry, Arc::new(pylon::adapter::app_registry::AppRegistry::new())));
     let env = Arc::new(DispatchEnv {
         apps,
         adapter,

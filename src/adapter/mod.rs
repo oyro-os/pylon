@@ -82,6 +82,13 @@ pub trait Adapter: Send + Sync {
     /// socket ids. Connections clean themselves up via their task's on_close.
     async fn terminate_user(&self, app: &str, user_id: &str) -> Vec<SocketId>;
 
+    /// Force-close EVERY connection of `app_id` (a removed/disabled app), 4009.
+    /// Returns the closed socket ids. Drains the per-app connection registry; each
+    /// per-connection close then triggers the self-cleaning channel/user/presence
+    /// structures. Cluster-wide reclaim (Redis `{prefix}:apps` SREM, `conn_counts`,
+    /// cache eviction) is layered by the composing adapters / the `AppPurger`.
+    async fn purge_app(&self, app_id: &str) -> Vec<SocketId>;
+
     /// Register `handle` as watching `watched`; returns the currently-online subset.
     async fn watch(&self, app: &str, handle: ConnectionHandle, watched: Vec<String>)
         -> Vec<String>;

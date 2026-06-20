@@ -20,7 +20,7 @@ const APPS: &str = r#"[
 /// Returns the bound `SocketAddr`.
 async fn spawn() -> SocketAddr {
     let apps: Arc<dyn AppManager> = Arc::new(StaticFileAppManager::from_json(APPS).unwrap());
-    let local = Arc::new(LocalAdapter::new(Arc::new(Registry::new())));
+    let local = Arc::new(LocalAdapter::new(Arc::new(Registry::new()), Arc::new(pylon::adapter::app_registry::AppRegistry::new())));
     let adapter: Arc<dyn Adapter> = local.clone();
     let conn_counts: Arc<dashmap::DashMap<String, Arc<AtomicUsize>>> = Arc::new(Default::default());
     let webhooks = pylon::webhook::WebhookHandle::null();

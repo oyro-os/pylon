@@ -69,9 +69,9 @@ fn free_port() -> u16 {
 async fn spawn(config: ServerConfig) -> Harness {
     let apps: Arc<dyn AppManager> = Arc::new(StaticFileAppManager::from_json(APPS).unwrap());
     let registry = Arc::new(Registry::new());
-    let adapter: Arc<dyn Adapter> = Arc::new(LocalAdapter::new(registry));
-    let conn_counts: Arc<DashMap<String, Arc<AtomicUsize>>> = Arc::new(Default::default());
     let app_registry = Arc::new(AppRegistry::new());
+    let adapter: Arc<dyn Adapter> = Arc::new(LocalAdapter::new(registry, app_registry.clone()));
+    let conn_counts: Arc<DashMap<String, Arc<AtomicUsize>>> = Arc::new(Default::default());
     let env = Arc::new(DispatchEnv {
         apps,
         adapter: adapter.clone(),
@@ -285,9 +285,9 @@ async fn spawn_with_node_ceiling(max_connections: usize) -> Harness {
     let apps: Arc<dyn AppManager> =
         Arc::new(StaticFileAppManager::from_json(APPS_UNLIMITED).unwrap());
     let registry = Arc::new(Registry::new());
-    let adapter: Arc<dyn Adapter> = Arc::new(LocalAdapter::new(registry));
-    let conn_counts: Arc<DashMap<String, Arc<AtomicUsize>>> = Arc::new(Default::default());
     let app_registry = Arc::new(AppRegistry::new());
+    let adapter: Arc<dyn Adapter> = Arc::new(LocalAdapter::new(registry, app_registry.clone()));
+    let conn_counts: Arc<DashMap<String, Arc<AtomicUsize>>> = Arc::new(Default::default());
     let env = Arc::new(DispatchEnv {
         apps,
         adapter: adapter.clone(),
@@ -485,10 +485,10 @@ async fn spawn_with_saturation_flag() -> (Harness, Arc<AtomicBool>) {
     let apps: Arc<dyn AppManager> =
         Arc::new(StaticFileAppManager::from_json(APPS_UNLIMITED).unwrap());
     let registry = Arc::new(pylon::channel::registry::Registry::new());
-    let adapter: Arc<dyn Adapter> = Arc::new(pylon::adapter::local::LocalAdapter::new(registry));
+    let app_registry = Arc::new(AppRegistry::new());
+    let adapter: Arc<dyn Adapter> = Arc::new(pylon::adapter::local::LocalAdapter::new(registry, app_registry.clone()));
     let sat_flag = Arc::new(AtomicBool::new(false));
     let conn_counts: Arc<DashMap<String, Arc<AtomicUsize>>> = Arc::new(Default::default());
-    let app_registry = Arc::new(AppRegistry::new());
     let env = Arc::new(DispatchEnv {
         apps,
         adapter: adapter.clone(),
