@@ -149,6 +149,20 @@ pub struct ServerConfig {
     /// DSN for the SQLite app-manager. Required when `app_manager == Sqlite`.
     /// `PYLON_APP_DSN` (e.g. `sqlite:///var/lib/pylon/apps.db`).
     pub app_dsn: Option<String>,
+    /// Enable the L1 (moka) + optional L2 (Redis) app-manager cache layer.
+    /// `PYLON_APP_CACHE` (`0`/`off`/`false` to disable; default `true` / enabled).
+    pub app_cache: bool,
+    /// L1 moka cache max-capacity (apps). `PYLON_APP_CACHE_MAX` (default 100_000).
+    pub app_cache_max: u64,
+    /// L1 positive-entry TTL in seconds. `PYLON_APP_CACHE_TTL` (default 300).
+    pub app_cache_ttl: u64,
+    /// L1 negative-entry max-capacity. `PYLON_APP_CACHE_NEG_MAX` (default 10_000).
+    pub app_cache_neg_max: u64,
+    /// L1 negative-entry TTL in seconds. `PYLON_APP_CACHE_NEG_TTL` (default 30).
+    pub app_cache_neg_ttl: u64,
+    /// Redis URL for the L2 app cache. When set, resolved apps are written through
+    /// to Redis and read back on L1 misses. `PYLON_APP_CACHE_REDIS_URL`.
+    pub app_cache_redis_url: Option<String>,
 }
 
 impl Default for ServerConfig {
@@ -209,6 +223,12 @@ impl Default for ServerConfig {
             mailbox_capacity: 256,
             app_manager: AppManagerKind::StaticFile,
             app_dsn: None,
+            app_cache: true,
+            app_cache_max: 100_000,
+            app_cache_ttl: 300,
+            app_cache_neg_max: 10_000,
+            app_cache_neg_ttl: 30,
+            app_cache_redis_url: None,
         }
     }
 }
@@ -242,6 +262,11 @@ impl ServerConfig {
         }
         c.app_manager = parse_app_manager(std::env::var("PYLON_APP_MANAGER").ok().as_deref());
         c.app_dsn = std::env::var("PYLON_APP_DSN").ok();
+        if let Ok(v) = std::env::var("PYLON_APP_CACHE") { c.app_cache = v != "0" && v.to_lowercase() != "off" && v.to_lowercase() != "false"; }
+        if let Ok(v) = std::env::var("PYLON_APP_CACHE_MAX") { if let Ok(n) = v.parse() { c.app_cache_max = n; } }
+        if let Ok(v) = std::env::var("PYLON_APP_CACHE_TTL") { if let Ok(n) = v.parse() { c.app_cache_ttl = n; } }
+        if let Ok(v) = std::env::var("PYLON_APP_CACHE_NEG_TTL") { if let Ok(n) = v.parse() { c.app_cache_neg_ttl = n; } }
+        c.app_cache_redis_url = std::env::var("PYLON_APP_CACHE_REDIS_URL").ok();
         if let Ok(v) = std::env::var("PYLON_MAX_PRESENCE_MEMBERS") {
             if let Ok(p) = v.parse() {
                 c.max_presence_members = p;
@@ -775,6 +800,15 @@ mod tests {
         assert_eq!(parse_app_manager(Some("static")), AppManagerKind::StaticFile);
         assert_eq!(parse_app_manager(Some("sqlite")), AppManagerKind::Sqlite);
         assert_eq!(parse_app_manager(Some("weird")), AppManagerKind::StaticFile);
+    }
+
+    #[test]
+    fn cache_defaults_are_sane() {
+        let c = ServerConfig::default();
+        assert!(c.app_cache);                 // on by default
+        assert_eq!(c.app_cache_max, 100_000);
+        assert_eq!(c.app_cache_ttl, 300);
+        assert_eq!(c.app_cache_neg_ttl, 30);
     }
 
     #[test]
