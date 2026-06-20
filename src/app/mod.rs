@@ -3,7 +3,7 @@
 pub mod sql;
 pub mod static_file;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
@@ -18,7 +18,7 @@ pub const WEBHOOK_EVENT_TYPES: [&str; 6] = [
 ];
 
 /// A per-app webhook endpoint (apps.json `webhooks[]`).
-#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct WebhookConfig {
     pub url: String,
     pub event_types: Vec<String>,
@@ -26,7 +26,7 @@ pub struct WebhookConfig {
     pub headers: BTreeMap<String, String>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct App {
     pub name: String,
     pub id: String,
@@ -105,7 +105,7 @@ impl App {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum AppLookupError {
     /// Transient backend failure (DB/Redis down, timeout). Reject retryably; do not cache.
     Backend(String),
@@ -195,5 +195,29 @@ mod tests {
             "webhooks": [{ "url": "", "event_types": ["cache_miss"] }]
         }));
         assert!(a.validate().unwrap_err().contains("url is empty"));
+    }
+
+    #[test]
+    fn app_json_round_trips_and_recomputes_flags() {
+        let mut a = parse(serde_json::json!({
+            "name":"t","id":"app","key":"k","secret":"s","capacity":5,
+            "client_messages_enabled": true, "enabled": true,
+            "webhooks":[{"url":"https://e.test","event_types":["channel_occupied"]}]
+        }));
+        a.recompute_has_flags();
+        let json = serde_json::to_string(&a).expect("serialize");
+        let mut back: App = serde_json::from_str(&json).expect("deserialize");
+        back.recompute_has_flags();
+        assert_eq!(back.id, "app");
+        assert_eq!(back.capacity, 5);
+        assert!(back.client_messages_enabled);
+        assert_eq!(back.webhooks.len(), 1);
+        assert!(back.has_channel_occupied_webhooks);
+    }
+
+    #[test]
+    fn app_lookup_error_is_clone() {
+        let e = AppLookupError::Backend("x".into());
+        let _c = e.clone();
     }
 }
