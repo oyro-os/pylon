@@ -36,13 +36,21 @@ impl AppPurger {
         self.cache.invalidate(id, key).await;
     }
 
-    /// App removed/disabled: force-close every connection (4009), reclaim the
-    /// per-app counter, and evict the cache. In cluster mode the composing
-    /// `RedisAdapter::purge_app` already SREM'd `{prefix}:apps`.
+    /// App removed/disabled: evict the cache FIRST, then force-close every
+    /// connection (4009) and reclaim the per-app counter. In cluster mode the
+    /// composing `RedisAdapter::purge_app` already SREM'd `{prefix}:apps`.
+    ///
+    /// Cache-first ordering is deliberate: once the L1/L2 entry is gone, any new
+    /// connect for this app re-fetches the (uncached) driver — which returns
+    /// `Ok(None)` for a removed/disabled app — and is rejected at `by_key` rather
+    /// than establishing against a stale-positive cache entry and surviving the
+    /// drain. The only residual window is a connect that already passed `by_key`
+    /// (cache hit) but registers in `AppRegistry` after the drain; that bounded
+    /// straggler is the sweep backstop's + TTL's job, by design.
     pub async fn purge(&self, id: &str, key: &str) {
+        self.cache.invalidate(id, key).await;
         self.adapter.purge_app(id).await;
         self.conn_counts.remove(id);
-        self.cache.invalidate(id, key).await;
     }
 }
 
