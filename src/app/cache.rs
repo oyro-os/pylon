@@ -18,10 +18,10 @@ enum LoadErr { NotFound, Lookup(AppLookupError) }
 
 enum LookupBy { Id(String), Key(String) }
 impl LookupBy {
-    async fn from_l2(&self, l2: &RedisAppCache) -> Result<Option<Arc<App>>, AppLookupError> {
+    async fn load_from_l2(&self, l2: &RedisAppCache) -> Result<Option<Arc<App>>, AppLookupError> {
         match self { LookupBy::Id(id) => l2.get_id(id).await, LookupBy::Key(k) => l2.get_key(k).await }
     }
-    async fn from_driver(&self, d: &dyn AppManager) -> Result<Option<Arc<App>>, AppLookupError> {
+    async fn load_from_driver(&self, d: &dyn AppManager) -> Result<Option<Arc<App>>, AppLookupError> {
         match self { LookupBy::Id(id) => d.by_id(id).await, LookupBy::Key(k) => d.by_key(k).await }
     }
 }
@@ -55,13 +55,13 @@ impl CachingAppManager {
         let res = self.pos.try_get_with(pkey.clone(), async move {
             // L2 first — best-effort: errors degrade to the driver, never fail the lookup.
             if let Some(l2) = &l2 {
-                match by.from_l2(l2).await {
+                match by.load_from_l2(l2).await {
                     Ok(Some(app)) => return Ok(app),
                     Ok(None) => {}
                     Err(e) => tracing::warn!(error = %e, "app L2 get failed; using driver"),
                 }
             }
-            match by.from_driver(&*inner).await {
+            match by.load_from_driver(&*inner).await {
                 Ok(Some(app)) => {
                     if let Some(l2) = &l2 {
                         if let Err(e) = l2.put(&app).await {
@@ -109,6 +109,20 @@ impl AppManager for CachingAppManager {
     }
     async fn by_key(&self, key: &str) -> Result<Option<Arc<App>>, AppLookupError> {
         self.cached(format!("key:{key}"), LookupBy::Key(key.to_string())).await
+    }
+
+    fn by_key_cached(&self, key: &str) -> Option<Result<Option<Arc<App>>, AppLookupError>> {
+        // SYNC L1-ONLY probe. Use the SAME pkey format as `by_key`. Touch ONLY the
+        // in-memory `neg`/`pos` moka caches — never `inner` (the driver) or `l2`
+        // (Redis): those are the I/O we offload. `block_on` of an in-memory moka
+        // `get` is instant (no reactor/IO is driven — it is exactly what today's
+        // establish `block_on` already drives on a hit). The cache never stores
+        // errors, so this never yields `Some(Err(_))`.
+        let pkey = format!("key:{key}");
+        if futures_executor::block_on(self.neg.get(&pkey)).is_some() {
+            return Some(Ok(None));
+        }
+        futures_executor::block_on(self.pos.get(&pkey)).map(|app| Ok(Some(app)))
     }
 }
 
@@ -211,5 +225,34 @@ mod tests {
         let got = c.by_id(&a.id).await.unwrap().expect("served from L2");
         assert_eq!(got.key, a.key);
         assert_eq!(calls.load(Ordering::SeqCst), 0, "L2 hit must not reach the driver");
+    }
+
+    #[tokio::test]
+    async fn by_key_cached_returns_none_on_cold_l1_without_touching_driver() {
+        let (m, calls) = mock(Some(app("a", "k")), false);
+        let c = CachingAppManager::new(m, cfg(), None);
+        // Cold: nothing in L1 yet → must offload (None) and NOT call the driver.
+        assert!(c.by_key_cached("k").is_none(), "cold probe must return None");
+        assert_eq!(calls.load(Ordering::SeqCst), 0, "cold probe must not call the driver");
+    }
+
+    #[tokio::test]
+    async fn by_key_cached_returns_some_some_when_l1_warm() {
+        let (m, _calls) = mock(Some(app("a", "k")), false);
+        let c = CachingAppManager::new(m, cfg(), None);
+        // Warm the positive L1 via the normal async path.
+        assert_eq!(c.by_key("k").await.unwrap().unwrap().key, "k");
+        let probed = c.by_key_cached("k").expect("warm L1 resolves");
+        assert_eq!(probed.unwrap().unwrap().key, "k");
+    }
+
+    #[tokio::test]
+    async fn by_key_cached_returns_some_none_when_neg_cached() {
+        let (m, _calls) = mock(None, false);
+        let c = CachingAppManager::new(m, cfg(), None);
+        // Warm the negative L1: a miss caches "not found".
+        assert!(c.by_key("k").await.unwrap().is_none());
+        let probed = c.by_key_cached("k").expect("neg-cached resolves");
+        assert!(probed.unwrap().is_none(), "neg-cached probe is Some(Ok(None))");
     }
 }

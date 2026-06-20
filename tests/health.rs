@@ -57,6 +57,8 @@ async fn spawn() -> SocketAddr {
     let worker_shutdown = shutdown.clone();
     let worker_config = config.clone();
     let local_for_sink = Some(local.clone());
+    // Phase 7: capture the runtime handle here (async context) before spawning.
+    let worker_runtime = tokio::runtime::Handle::current();
     let handle = std::thread::spawn(move || {
         let _ = pylon::transport::run_percore(
             worker_config,
@@ -70,6 +72,7 @@ async fn spawn() -> SocketAddr {
             local_for_sink,
             false,
             None,
+            worker_runtime,
         );
     });
     // Leak the worker thread + shutdown flag; the test process is short-lived.

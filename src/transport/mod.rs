@@ -184,6 +184,12 @@ pub fn run_percore(
     // is wrapped with a TLS server-side handshake before the WS upgrade;
     // `None` ⇒ plain TCP (no TLS).
     tls: Option<Arc<rustls::ServerConfig>>,
+    // Phase 7: tokio runtime handle for offloading L1-miss `by_key` lookups.
+    // The caller MUST capture `tokio::runtime::Handle::current()` BEFORE spawning
+    // the worker thread (or `spawn_blocking` body), where the runtime context is
+    // present. `run_percore` itself may run on a plain `std::thread` where
+    // `Handle::try_current()` returns `Err`.
+    runtime: tokio::runtime::Handle,
 ) -> std::io::Result<()> {
     let addr: std::net::SocketAddr = format!("{}:{}", config.bind, config.port)
         .parse()
@@ -223,6 +229,7 @@ pub fn run_percore(
         max_connections: config.resolved_max_connections(budget),
         // Task 4: bounded mailbox capacity from config (default 256).
         mailbox_capacity: config.mailbox_capacity,
+        runtime,
     });
     // WS frame cap: bound a single inbound frame's payload. The configured
     // event-payload limit is small (KiB), so use a 1 MiB frame ceiling that

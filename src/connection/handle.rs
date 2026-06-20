@@ -5,7 +5,7 @@ use std::sync::Arc;
 use tokio::sync::mpsc::Sender;
 
 /// The per-worker notifier a [`Mailbox`] uses to wake its owning worker on a
-/// cross-connection send. Built in [`establish_session`](crate::transport::worker)
+/// cross-connection send. Built in `handle_handshake` (in `crate::transport::worker`)
 /// from the worker's dirty-token channel + the `MAILBOX_WAKER`.
 ///
 /// `token` is this connection's slab key (== its `mio::Token` value); `dirty` is
@@ -79,7 +79,10 @@ impl Mailbox {
     pub fn send(
         &self,
         event: ServerEvent,
-    ) -> Result<(), tokio::sync::mpsc::error::SendError<ServerEvent>> {
+    ) -> Result<(), Box<tokio::sync::mpsc::error::SendError<ServerEvent>>> {
+        // The `Err` carries the (large) undelivered `ServerEvent`, so it is boxed to
+        // keep the `Result` pointer-sized on this off-broadcast direct-send path
+        // (clippy `result_large_err`); every caller is fire-and-forget (`let _ =`).
         use tokio::sync::mpsc::error::TrySendError;
         match self.inner.try_send(Box::new(event)) {
             Ok(()) => {}
@@ -92,7 +95,7 @@ impl Mailbox {
                 return Ok(());
             }
             Err(TrySendError::Closed(ev)) => {
-                return Err(tokio::sync::mpsc::error::SendError(*ev));
+                return Err(Box::new(tokio::sync::mpsc::error::SendError(*ev)));
             }
         }
         if let Some(n) = &self.notify {

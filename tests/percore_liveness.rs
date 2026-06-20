@@ -84,6 +84,7 @@ async fn spawn(activity_timeout: u32, pong_timeout: u32) -> Harness {
         max_connections: 0,
         mailbox_capacity: 256,
         app_registry: Arc::new(pylon::adapter::app_registry::AppRegistry::new()),
+        runtime: tokio::runtime::Handle::current(),
     });
 
     let port = free_port();
