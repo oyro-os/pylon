@@ -302,17 +302,38 @@ struct ResolvedApp {
 /// `bind:port` independently; the kernel then load-balances incoming connections
 /// across the workers' listener sockets (one accept queue per worker).
 fn reuseport_listener(addr: std::net::SocketAddr) -> std::io::Result<TcpListener> {
-    let sock = socket2::Socket::new(
-        socket2::Domain::for_address(addr),
-        socket2::Type::STREAM,
-        Some(socket2::Protocol::TCP),
-    )?;
-    sock.set_reuse_address(true)?;
-    sock.set_reuse_port(true)?; // SO_REUSEPORT — kernel load-balances accepts across workers
-    sock.set_nonblocking(true)?;
-    sock.bind(&addr.into())?;
-    sock.listen(1024)?;
-    Ok(TcpListener::from_std(std::net::TcpListener::from(sock)))
+    // Bind with a bounded retry on `AddrInUse`. `SO_REUSEADDR` already covers a port
+    // in `TIME_WAIT`, but a port can still be briefly held by another holder: a fast
+    // restart racing the previous instance's teardown, or a test harness whose
+    // ephemeral-port probe just released the port a moment before this bind (a TOCTOU
+    // window). Retry a few times over ~250ms before failing loud, so a transient
+    // conflict doesn't abort startup while a genuine conflict still surfaces clearly.
+    // A fresh socket is required per attempt — a socket whose bind failed can't rebind.
+    let mut last_err: Option<std::io::Error> = None;
+    for _ in 0..10 {
+        let sock = socket2::Socket::new(
+            socket2::Domain::for_address(addr),
+            socket2::Type::STREAM,
+            Some(socket2::Protocol::TCP),
+        )?;
+        sock.set_reuse_address(true)?;
+        sock.set_reuse_port(true)?; // SO_REUSEPORT — kernel load-balances accepts across workers
+        sock.set_nonblocking(true)?;
+        match sock.bind(&addr.into()) {
+            Ok(()) => {
+                sock.listen(1024)?;
+                return Ok(TcpListener::from_std(std::net::TcpListener::from(sock)));
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
+                last_err = Some(e);
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Err(last_err.unwrap_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::AddrInUse, "address in use after retries")
+    }))
 }
 
 /// Run the worker event loop until `shutdown` is set. Blocks the calling thread.
@@ -1817,14 +1838,6 @@ fn drain_resolved(
 
         match outcome {
             Ok(session) => {
-                // Liveness: the wheel was already touched when this connection's
-                // WS-upgrade read event arrived (the `wheel.touch` in the run loop's
-                // readable arm, BEFORE `handle_handshake` parked it), so a resumed
-                // connection carries the same idle deadline as a synchronously-
-                // established one — no re-touch is needed here. The park itself is
-                // bounded by the driver's own lookup timeout (sqlx acquire / mongo
-                // serverSelection / fred command), which is ≪ `activity_timeout`, so
-                // the wheel never evicts a still-parked connection in any sane config.
                 // Reborrow inline so the `entry` borrow drops before `fold_delta`.
                 let action = {
                     let entry = &mut conns[token];
@@ -1850,6 +1863,17 @@ fn drain_resolved(
                         poll, conns, token, local_subs, sid_to_token, wheel,
                         inflight_bytes, conn_counts, app_registry, node_conns,
                     );
+                } else {
+                    // Re-arm this resumed connection's idle deadline from NOW. The
+                    // upgrade-time `wheel.touch` was set BEFORE the park; the park is
+                    // bounded by the driver lookup timeout (≪ `activity_timeout`), so
+                    // in any sane config the wheel still holds this entry — but if a
+                    // park ever outlived `activity_timeout`, the idle timer would have
+                    // fired on the `session: None` entry and dropped it from the wheel
+                    // (see the `Due::Ping` arm). Touching here re-arms it unconditionally
+                    // so a resumed connection is ALWAYS liveness-monitored, and starts
+                    // its idle clock at establish (`touch` reschedules — never duplicates).
+                    wheel.touch(token, now_ns / 1_000_000);
                 }
             }
             Err(reject) => {
