@@ -150,7 +150,7 @@ impl ChannelState {
     ///
     /// For large channels the serial per-subscriber `mailbox.send` loop becomes
     /// the publish-side bottleneck (at N=10k it caps fan-out below the worker
-    /// ceiling). Above [`PARALLEL_THRESHOLD`] we fan the enqueue out across the
+    /// ceiling). Above `PARALLEL_THRESHOLD` we fan the enqueue out across the
     /// rayon work-stealing pool. This is correctness-safe: subscribers are keyed
     /// by `SocketId`, so each distinct mailbox appears in `targets` at most once
     /// and is sent to exactly once per broadcast — no two threads ever push to the

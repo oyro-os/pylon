@@ -2,8 +2,8 @@
 //! drives via `block_on(ctx.dispatch(..))` when clustering is active.
 //!
 //! It does the LOCAL half synchronously on an injected [`LocalAdapter`] (which never
-//! awaits real I/O) and fires the matching FIRE-AND-FORGET [`ClusterCmd`] at the
-//! [`ClusterBridge`] over a [`ClusterHandle`]. It NEVER awaits Redis — that is the whole
+//! awaits real I/O) and fires the matching FIRE-AND-FORGET [`crate::cluster::bridge::ClusterCmd`] at the
+//! [`crate::cluster::bridge::ClusterBridge`] over a [`ClusterHandle`]. It NEVER awaits Redis — that is the whole
 //! point of the bridge: the sync mio loop must not block on the network.
 //!
 //! Division of labour for the membership/broadcast edges:

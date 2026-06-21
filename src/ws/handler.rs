@@ -38,7 +38,7 @@ pub struct ConnectionContext {
     /// node-local emits.
     pub clustered: bool,
     /// The worker's mailbox notifier inputs (dirty-token queue + `MAILBOX_WAKER`)
-    /// plus this connection's slab token, used by [`handle`](Self::handle) to build
+    /// plus this connection's slab token, used by `handle` to build
     /// a WAKING [`Mailbox`] so a cross-connection send marks this connection dirty
     /// and nudges the worker to drain it — instead of relying on the O(N) idle scan.
     /// `None` when no worker is wired (unit tests that build a `ConnectionContext`
@@ -46,7 +46,7 @@ pub struct ConnectionContext {
     /// is correct because those tests `try_recv` the matching receiver directly.
     pub mailbox_notify: Option<MailboxNotify>,
     /// Per-worker cumulative counter for mailbox-full drops, shared with the
-    /// `Mailbox`es that this connection hands out via [`handle`](Self::handle).
+    /// `Mailbox`es that this connection hands out via `handle`.
     /// `None` in tests that build a `ConnectionContext` without a worker.
     pub mailbox_dropped: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>,
 }

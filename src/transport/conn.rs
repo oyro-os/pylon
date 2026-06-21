@@ -4,14 +4,14 @@
 //! the two halves of a Pusher WebSocket session:
 //!
 //! * **Outbound.** A queue of pre-encoded frames ([`Arc<[u8]>`], so a broadcast
-//!   payload is encoded once and fanned out as cheap `Arc` clones). [`flush`]
+//!   payload is encoded once and fanned out as cheap `Arc` clones). [`Connection::flush`]
 //!   drains the queue with *corked* writes — it coalesces as many queued frames
 //!   as the socket will accept in a single call, advancing a cursor across
 //!   partial writes, and reports backpressure via [`WriteStatus::WouldBlock`].
-//!   [`queue`] enforces a high-water mark so a slow consumer cannot make us
+//!   [`Connection::queue`] enforces a high-water mark so a slow consumer cannot make us
 //!   buffer unbounded memory.
 //!
-//! * **Inbound.** [`read_frames`] reads whatever the socket has available into a
+//! * **Inbound.** [`Connection::read_frames`] reads whatever the socket has available into a
 //!   caller-supplied scratch [`BytesMut`] and parses every complete frame out of
 //!   it, leaving any partial-frame remainder in the buffer for next time.
 //!
@@ -427,7 +427,7 @@ impl Connection {
     ///
     /// `now_ns` is the monotonic dequeue time (ns since the worker's epoch). With
     /// CoDel enabled (`target_ns != 0`), each frame's sojourn (`now_ns -
-    /// enqueue_ns`) is checked before it is written: see [`codel_dequeue`].
+    /// enqueue_ns`) is checked before it is written: see `codel_dequeue`.
     pub fn flush(&mut self, now_ns: u64) -> WriteStatus {
         match &self.io {
             Io::Plain(_) => self.flush_plain(now_ns),

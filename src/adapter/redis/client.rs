@@ -85,8 +85,8 @@ return count
 /// PRESENCE_JOIN. Records this connection's member, bumps the user's cluster-wide
 /// connection refcount, and on the 0→1 user edge stores the user_info for the roster.
 /// Returns the new refcount (== 1 means first_for_user → emit member_added).
-/// KEYS[1]=presusers KEYS[2]=presinfo KEYS[3]=presmembers
-/// ARGV[1]=user_id ARGV[2]=user_info ARGV[3]=member_token
+/// KEYS\[1\]=presusers KEYS\[2\]=presinfo KEYS\[3\]=presmembers
+/// ARGV\[1\]=user_id ARGV\[2\]=user_info ARGV\[3\]=member_token
 const PRESENCE_JOIN_LUA: &str = r#"
 redis.call('HSET', KEYS[3], ARGV[3], ARGV[1])
 local conn = redis.call('HINCRBY', KEYS[1], ARGV[1], 1)
@@ -97,8 +97,8 @@ return conn
 /// PRESENCE_LEAVE. Drops this connection's member and decrements the user's refcount;
 /// on the →0 user edge removes the user from presusers + presinfo. Returns the
 /// remaining refcount (== 0 means last_for_user → emit member_removed).
-/// KEYS[1]=presusers KEYS[2]=presinfo KEYS[3]=presmembers
-/// ARGV[1]=user_id ARGV[2]=member_token
+/// KEYS\[1\]=presusers KEYS\[2\]=presinfo KEYS\[3\]=presmembers
+/// ARGV\[1\]=user_id ARGV\[2\]=member_token
 const PRESENCE_LEAVE_LUA: &str = r#"
 redis.call('HDEL', KEYS[3], ARGV[2])
 local conn = redis.call('HINCRBY', KEYS[1], ARGV[1], -1)

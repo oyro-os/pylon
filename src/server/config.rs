@@ -563,7 +563,7 @@ impl ServerConfig {
     /// * If `max_connections != 0`, return it as-is (explicit override).
     /// * Else derive from budget: `memory_budget_bytes / expected_per_conn_bytes`.
     ///   The caller supplies `budget` (already resolved via
-    ///   [`resolved_memory_budget`]) so this method is pure.
+    ///   [`Self::resolved_memory_budget`]) so this method is pure.
     ///   If `budget == 0` (budget unknown), returns `0` = unlimited.
     pub fn resolved_max_connections(&self, budget: u64) -> usize {
         if self.max_connections != 0 {

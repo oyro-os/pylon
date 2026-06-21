@@ -4,11 +4,11 @@
 //! frame loop entirely on the calling thread with one [`mio::Poll`]. A
 //! [`slab::Slab`] is the connection table: the slab key *is* the connection's
 //! [`mio::Token`] value, so a readiness event maps to its [`Connection`] in
-//! O(1). The listener uses a reserved token ([`LISTENER`]) that no slab key can
+//! O(1). The listener uses a reserved token (`LISTENER`) that no slab key can
 //! collide with.
 //!
 //! Readiness is managed edge-friendly: a connection is registered
-//! `READABLE`-only and only gains `WRITABLE` interest when a [`flush`] returns
+//! `READABLE`-only and only gains `WRITABLE` interest when a [`Connection::flush`] returns
 //! [`WriteStatus::WouldBlock`]; the interest is dropped back to `READABLE` once
 //! the queue drains. This keeps the loop from spinning on a writable socket with
 //! nothing to send.
@@ -140,7 +140,7 @@ pub struct DispatchEnv {
     /// maintained beside `conn_counts`: inserted at establish, removed at close.
     /// Mirrors how `conn_counts` is shared between `DispatchEnv` and `AppState`.
     pub app_registry: Arc<AppRegistry>,
-    /// Phase 7: the tokio runtime handle captured in [`run_percore`] BEFORE the
+    /// Phase 7: the tokio runtime handle captured in [`crate::transport::run_percore`] BEFORE the
     /// worker OS-threads spawn. The worker is a raw `std::thread` where
     /// `Handle::try_current()` is `Err`, so it cannot reach tokio on its own; this
     /// handle lets the L1-MISS establish path `spawn` an offloaded `by_key` lookup
@@ -183,7 +183,7 @@ pub struct WorkerConfig {
     /// each flush by folding `conn.take_codel_dropped()`; `None` for test workers.
     pub codel_dropped_slot: Option<Arc<AtomicU64>>,
     /// Task 4: cumulative mailbox-full-drop counter for this worker. Incremented
-    /// inside each connection's [`Mailbox::send`] on a `try_send` full-error.
+    /// inside each connection's [`crate::connection::handle::Mailbox::send`] on a `try_send` full-error.
     /// Shared (via `Arc` clone) with every `Mailbox` created by this worker's
     /// connections. `None` for echo/test workers without mailbox drop tracking.
     pub mailbox_dropped_slot: Option<Arc<AtomicU64>>,
@@ -216,7 +216,7 @@ pub struct WorkerConfig {
 /// The per-worker half of the sharded broadcast plumbing handed to [`run`].
 pub struct BroadcastWiring {
     /// Inbound broadcast hand-offs from the sink (the matching `SyncSender` lives
-    /// in `slot.tx`). Drained on the [`BCAST_WAKER`] event and once per loop.
+    /// in `slot.tx`). Drained on the `WORKER_WAKER` event and once per loop.
     pub rx: std::sync::mpsc::Receiver<crate::transport::fanout::BroadcastMsg>,
     /// This worker's sink slot; its `waker` `OnceLock` is filled at startup with
     /// a `Waker` built from this worker's own `Poll` registry.
@@ -1961,7 +1961,7 @@ fn drain_into(conn: &mut Connection, buf: &mut BytesMut) -> ReadOutcome {
 ///
 /// Order matters: deregister the stream from this `Poll` and remove the slab
 /// entry BEFORE moving the fd out of mio, so mio's registry/slab no longer
-/// reference it. Then [`rest::mio_to_std`] transfers fd ownership into a
+/// reference it. Then [`crate::transport::rest::mio_to_std`] transfers fd ownership into a
 /// `std::net::TcpStream` (the single audited `unsafe` site), and the connection
 /// plus its already-read `prefix` bytes are sent to the handoff channel. The
 /// stream stays non-blocking (inherited from mio), which is what tokio wants.
@@ -2205,7 +2205,7 @@ fn should_skip(band: ShedBand, out_bytes: usize, high_water: usize) -> bool {
     }
 }
 
-/// Deliver every queued [`BroadcastMsg`] to this worker's local subscribers,
+/// Deliver every queued [`crate::transport::fanout::BroadcastMsg`] to this worker's local subscribers,
 /// applying the SP10 graduated shed (§6) against this worker's byte budget.
 ///
 /// For each message: classify the current [`ShedBand`] from `inflight_bytes /
