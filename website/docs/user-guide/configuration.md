@@ -2,10 +2,12 @@
 
 Pylon uses two layers of configuration:
 
-- **`apps.json`** — defines the applications (with their keys, secrets, and per-app settings).
-  See the [Applications & Authentication](applications.md) page for details.
+- **The application store** — defines the applications (with their keys, secrets, and per-app
+  settings). By default this is a local **`apps.json`** file; for SaaS-scale deployments it can
+  instead be a **database** (SQLite, MySQL, Postgres, or MongoDB) fronted by an in-process +
+  Redis cache. See the [Applications & Authentication](applications.md) page for details.
 - **`PYLON_*` environment variables** — control server-wide behaviour: networking, worker count,
-  protocol limits, adapter selection, overload policy, and more.
+  the application store, protocol limits, adapter selection, overload policy, and more.
 
 All variables are optional. Unset variables fall back to the defaults shown below.
 
@@ -22,8 +24,33 @@ All variables are optional. Unset variables fall back to the defaults shown belo
 |---|---|---|
 | `PYLON_BIND` | `0.0.0.0` | IP address the WebSocket listener binds to. |
 | `PYLON_PORT` | `7000` | TCP port for the WebSocket listener and HTTP REST API. |
-| `PYLON_APPS_PATH` | `apps.json` | Path to the JSON file that defines the application registry. |
+| `PYLON_APPS_PATH` | `apps.json` | Path to the JSON file that defines the application registry (used when `PYLON_APP_MANAGER=static`). |
 | `PYLON_WORKERS` | `0` | Number of per-core worker threads. `0` = auto (one per available CPU). |
+
+---
+
+## Application store
+
+By default Pylon reads applications from the local `apps.json` file (`PYLON_APP_MANAGER=static`).
+For SaaS-scale deployments — more apps than fit comfortably in a file, or apps provisioned by a
+control plane — set `PYLON_APP_MANAGER` to a database driver and provide `PYLON_APP_DSN`. A
+DB-backed store is fronted by a two-tier cache (in-process L1 + optional Redis L2) so the
+per-connection and per-publish lookups stay fast. See
+[Applications & Authentication](applications.md#database-backed-app-stores) for the full guide
+(schema, caching, invalidation, and the admin API).
+
+| Variable | Default | Description |
+|---|---|---|
+| `PYLON_APP_MANAGER` | `static` | Application store backend: `static` (the `apps.json` file), `sqlite`, `mysql`, `postgres`, or `mongo`. |
+| `PYLON_APP_DSN` | _(none)_ | Database connection string for a non-`static` manager, e.g. `sqlite:///var/lib/pylon/apps.db`, `mysql://user:pass@host/db`, `postgres://user:pass@host/db`, `mongodb://host/db`. |
+| `PYLON_APP_CACHE` | `true` | Enable the cache in front of a DB-backed store. Set `0`, `off`, or `false` to disable (every lookup hits the database). No effect for `static`. |
+| `PYLON_APP_CACHE_MAX` | `100000` | L1 (in-process) cache max capacity, in number of apps. Bounded — "unlimited apps" never grows memory without bound. |
+| `PYLON_APP_CACHE_TTL` | `300` | L1 positive-entry TTL (seconds). The worst-case staleness floor even if no invalidation signal ever arrives. |
+| `PYLON_APP_CACHE_NEG_MAX` | `10000` | L1 negative-cache (unknown-key) max capacity. A separate, smaller cache so a flood of bad keys never evicts real apps. |
+| `PYLON_APP_CACHE_NEG_TTL` | `30` | L1 negative-entry TTL (seconds). Kept short. |
+| `PYLON_APP_CACHE_REDIS_URL` | _(none)_ | Optional Redis URL for the shared L2 cache + the cross-node invalidation channel. When set, a cold node reads warm apps from Redis instead of the database, and the admin invalidate API is enabled. |
+| `PYLON_ADMIN_TOKEN` | _(none)_ | Bearer token for the admin API (`POST /admin/apps/{id}/invalidate`). When unset, the admin API is **disabled** (returns 404). |
+| `PYLON_APP_SWEEP_INTERVAL` | `0` | Interval (seconds) for the app-purge sweep backstop. `0` disables it. When set, the sweep periodically reconciles connected apps against the database and force-closes any that have been removed/disabled. |
 
 ---
 
