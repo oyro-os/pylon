@@ -62,12 +62,23 @@ impl AppManager for MockDriver {
 
 fn cache_cfg() -> CacheConfig {
     // Capacity comfortably above the working set so the warm bench never evicts.
-    CacheConfig { max_capacity: 10_000, ttl_secs: 3600, neg_max: 10_000, neg_ttl_secs: 3600 }
+    CacheConfig {
+        max_capacity: 10_000,
+        ttl_secs: 3600,
+        neg_max: 10_000,
+        neg_ttl_secs: 3600,
+    }
 }
 
 fn driver(app: Option<Arc<App>>) -> (Arc<dyn AppManager>, Arc<AtomicUsize>) {
     let calls = Arc::new(AtomicUsize::new(0));
-    (Arc::new(MockDriver { app, calls: calls.clone() }), calls)
+    (
+        Arc::new(MockDriver {
+            app,
+            calls: calls.clone(),
+        }),
+        calls,
+    )
 }
 
 /// Single-threaded runtime: a warm lookup never suspends on real I/O, so a
@@ -98,7 +109,11 @@ fn bench_l1_hit(c: &mut Criterion) {
     let cache = CachingAppManager::new(drv, cache_cfg(), None);
     // Warm L1 once.
     rt.block_on(async { cache.by_id("app-0").await.unwrap().unwrap() });
-    assert_eq!(calls.load(Ordering::Relaxed), 1, "warm-up must be the only driver call");
+    assert_eq!(
+        calls.load(Ordering::Relaxed),
+        1,
+        "warm-up must be the only driver call"
+    );
 
     let mut group = c.benchmark_group("app_lookup");
     group.throughput(Throughput::Elements(BATCH));
@@ -113,7 +128,11 @@ fn bench_l1_hit(c: &mut Criterion) {
     });
     group.finish();
     // The whole point: a hit never re-touches the driver.
-    assert_eq!(calls.load(Ordering::Relaxed), 1, "L1 hits must not call the driver");
+    assert_eq!(
+        calls.load(Ordering::Relaxed),
+        1,
+        "L1 hits must not call the driver"
+    );
 }
 
 /// `StaticFileAppManager` O(n) `Vec` scan at increasing app counts. The id looked
@@ -162,7 +181,9 @@ fn bench_cold_miss(c: &mut Criterion) {
     let rt = rt();
     let (drv, _calls) = driver(Some(app("tmpl", "tmpl")));
     let cache = CachingAppManager::new(drv, cache_cfg(), None);
-    rt.block_on(async { let _ = cache.by_id("warmup").await; }); // pay moka first-touch once
+    rt.block_on(async {
+        let _ = cache.by_id("warmup").await;
+    }); // pay moka first-touch once
     let next = AtomicUsize::new(0);
 
     let mut group = c.benchmark_group("app_lookup");
@@ -196,7 +217,9 @@ fn bench_single_flight(c: &mut Criterion) {
     let rt = rt_multi();
     let (drv, _calls) = driver(Some(app("tmpl", "tmpl")));
     let cache = Arc::new(CachingAppManager::new(drv, cache_cfg(), None));
-    rt.block_on(async { let _ = cache.by_id("warmup").await; });
+    rt.block_on(async {
+        let _ = cache.by_id("warmup").await;
+    });
     let next = AtomicUsize::new(0);
 
     let mut group = c.benchmark_group("app_lookup");

@@ -85,7 +85,10 @@ async fn cluster_bridge_starts_clones_publishes_and_drops_cleanly() {
     tokio::time::timeout(Duration::from_secs(8), async {
         let cfg = redis_test_config(&random_prefix());
         // The SAME `LocalAdapter` the percore workers would broadcast through.
-        let local = Arc::new(LocalAdapter::new(Arc::new(Registry::new()), Arc::new(pylon::adapter::app_registry::AppRegistry::new())));
+        let local = Arc::new(LocalAdapter::new(
+            Arc::new(Registry::new()),
+            Arc::new(pylon::adapter::app_registry::AppRegistry::new()),
+        ));
         let webhooks = WebhookHandle::null();
         // The bridge resolves per-app flags itself; a single app is enough for the smoke.
         let apps: Arc<dyn AppManager> = Arc::new(

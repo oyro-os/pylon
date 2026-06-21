@@ -75,7 +75,10 @@ async fn spawn_with_grace(grace_ms: u64) -> Harness {
     let registry = Arc::new(Registry::new());
     // Keep a clone of the adapter before it is moved into DispatchEnv so tests
     // can call adapter.broadcast() to push events to subscribed connections.
-    let adapter_arc: Arc<dyn Adapter> = Arc::new(LocalAdapter::new(registry, Arc::new(pylon::adapter::app_registry::AppRegistry::new())));
+    let adapter_arc: Arc<dyn Adapter> = Arc::new(LocalAdapter::new(
+        registry,
+        Arc::new(pylon::adapter::app_registry::AppRegistry::new()),
+    ));
     let adapter_for_harness = adapter_arc.clone();
     let conn_counts: Arc<dashmap::DashMap<String, Arc<AtomicUsize>>> = Arc::new(Default::default());
     let env = Arc::new(DispatchEnv {

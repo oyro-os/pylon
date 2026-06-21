@@ -251,8 +251,7 @@ async fn slow_connection_eventually_establishes() {
     let elapsed = start.elapsed();
 
     assert_eq!(frame["event"], "pusher:connection_established");
-    let data: Value =
-        serde_json::from_str(frame["data"].as_str().unwrap()).unwrap();
+    let data: Value = serde_json::from_str(frame["data"].as_str().unwrap()).unwrap();
     assert!(
         data["socket_id"].as_str().unwrap().contains('.'),
         "socket_id should look like `<n>.<n>`"

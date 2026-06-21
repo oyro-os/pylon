@@ -332,7 +332,10 @@ fn reuseport_listener(addr: std::net::SocketAddr) -> std::io::Result<TcpListener
         }
     }
     Err(last_err.unwrap_or_else(|| {
-        std::io::Error::new(std::io::ErrorKind::AddrInUse, "address in use after retries")
+        std::io::Error::new(
+            std::io::ErrorKind::AddrInUse,
+            "address in use after retries",
+        )
     }))
 }
 
@@ -1137,7 +1140,15 @@ fn handle_readable(
     let entry = &mut conns[key];
     match entry.conn.state {
         ConnState::Handshaking => handle_handshake(
-            poll, entry, key, cfg, now_ns, dirty_tx, mailbox_waker, resolved_tx, next_gen,
+            poll,
+            entry,
+            key,
+            cfg,
+            now_ns,
+            dirty_tx,
+            mailbox_waker,
+            resolved_tx,
+            next_gen,
         ),
         ConnState::Open | ConnState::Closing => handle_frames(poll, entry, cfg, now_ns),
     }
@@ -1201,13 +1212,9 @@ fn handle_handshake(
                     }
                 };
                 let resolved = match env.apps.by_key_cached(&app_key) {
-                    Some(Ok(Some(app))) => finish_establish(
-                        env,
-                        app,
-                        codec,
-                        notify,
-                        cfg.mailbox_dropped_slot.clone(),
-                    ),
+                    Some(Ok(Some(app))) => {
+                        finish_establish(env, app, codec, notify, cfg.mailbox_dropped_slot.clone())
+                    }
                     Some(Ok(None)) => Err(Reject {
                         error: PusherError::app_not_found(),
                         codec: Some(codec),
@@ -1818,7 +1825,10 @@ fn drain_resolved(
                 Some(p) if p.gen == gen => {}
                 _ => continue,
             }
-            entry.pending_establish.take().expect("pending_establish present")
+            entry
+                .pending_establish
+                .take()
+                .expect("pending_establish present")
         };
 
         let outcome = match result {
@@ -1860,8 +1870,16 @@ fn drain_resolved(
                 wrote_any = true;
                 if action == Action::Close {
                     remove(
-                        poll, conns, token, local_subs, sid_to_token, wheel,
-                        inflight_bytes, conn_counts, app_registry, node_conns,
+                        poll,
+                        conns,
+                        token,
+                        local_subs,
+                        sid_to_token,
+                        wheel,
+                        inflight_bytes,
+                        conn_counts,
+                        app_registry,
+                        node_conns,
                     );
                 } else {
                     // Re-arm this resumed connection's idle deadline from NOW. The
@@ -1888,8 +1906,16 @@ fn drain_resolved(
                 fold_codel(conns, token, codel_total);
                 wrote_any = true;
                 remove(
-                    poll, conns, token, local_subs, sid_to_token, wheel,
-                    inflight_bytes, conn_counts, app_registry, node_conns,
+                    poll,
+                    conns,
+                    token,
+                    local_subs,
+                    sid_to_token,
+                    wheel,
+                    inflight_bytes,
+                    conn_counts,
+                    app_registry,
+                    node_conns,
                 );
             }
         }

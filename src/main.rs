@@ -5,9 +5,9 @@ use pylon::adapter::local::LocalAdapter;
 use pylon::adapter::Adapter;
 use pylon::app::static_file::StaticFileAppManager;
 use pylon::app::AppManager;
-use pylon::server::config::AppManagerKind;
 use pylon::channel::registry::Registry;
 use pylon::cluster::adapter::ClusterAdapter;
+use pylon::server::config::AppManagerKind;
 use pylon::server::config::ServerConfig;
 use pylon::server::router::{build_router, AppState};
 use pylon::server::shutdown::shutdown_signal;
@@ -74,33 +74,42 @@ async fn main() -> anyhow::Result<()> {
     let apps: Arc<dyn AppManager> = match config.app_manager {
         AppManagerKind::StaticFile => Arc::new(StaticFileAppManager::from_file(&config.apps_path)?),
         AppManagerKind::Sqlite | AppManagerKind::Mysql | AppManagerKind::Postgres => {
-            let dsn = config.app_dsn.clone()
-                .ok_or_else(|| anyhow::anyhow!("PYLON_APP_MANAGER=sqlite|mysql|postgres requires PYLON_APP_DSN"))?;
+            let dsn = config.app_dsn.clone().ok_or_else(|| {
+                anyhow::anyhow!("PYLON_APP_MANAGER=sqlite|mysql|postgres requires PYLON_APP_DSN")
+            })?;
             Arc::new(pylon::app::sql::SqlAppManager::connect(&dsn).await?)
         }
         AppManagerKind::Mongo => {
-            let dsn = config.app_dsn.clone()
-                .ok_or_else(|| anyhow::anyhow!("PYLON_APP_MANAGER=mongo requires PYLON_APP_DSN (mongodb://host/db)"))?;
+            let dsn = config.app_dsn.clone().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "PYLON_APP_MANAGER=mongo requires PYLON_APP_DSN (mongodb://host/db)"
+                )
+            })?;
             Arc::new(pylon::app::mongo::MongoAppManager::connect(&dsn).await?)
         }
     };
-    let (apps, caching_for_purge, uncached_driver) = if config.app_cache && config.app_manager != AppManagerKind::StaticFile {
-        use pylon::app::cache::{CacheConfig, CachingAppManager};
-        let l2 = match &config.app_cache_redis_url {
-            Some(url) => Some(Arc::new(pylon::app::l2::RedisAppCache::connect(url, 4, config.app_cache_ttl).await?)),
-            None => None,
+    let (apps, caching_for_purge, uncached_driver) =
+        if config.app_cache && config.app_manager != AppManagerKind::StaticFile {
+            use pylon::app::cache::{CacheConfig, CachingAppManager};
+            let l2 = match &config.app_cache_redis_url {
+                Some(url) => Some(Arc::new(
+                    pylon::app::l2::RedisAppCache::connect(url, 4, config.app_cache_ttl).await?,
+                )),
+                None => None,
+            };
+            let cfg = CacheConfig {
+                max_capacity: config.app_cache_max,
+                ttl_secs: config.app_cache_ttl,
+                neg_max: config.app_cache_neg_max,
+                neg_ttl_secs: config.app_cache_neg_ttl,
+            };
+            let uncached_driver: Arc<dyn AppManager> = apps.clone();
+            let caching = Arc::new(CachingAppManager::new(apps, cfg, l2));
+            let apps_erased: Arc<dyn AppManager> = caching.clone();
+            (apps_erased, Some(caching), Some(uncached_driver))
+        } else {
+            (apps, None, None)
         };
-        let cfg = CacheConfig {
-            max_capacity: config.app_cache_max, ttl_secs: config.app_cache_ttl,
-            neg_max: config.app_cache_neg_max, neg_ttl_secs: config.app_cache_neg_ttl,
-        };
-        let uncached_driver: Arc<dyn AppManager> = apps.clone();
-        let caching = Arc::new(CachingAppManager::new(apps, cfg, l2));
-        let apps_erased: Arc<dyn AppManager> = caching.clone();
-        (apps_erased, Some(caching), Some(uncached_driver))
-    } else {
-        (apps, None, None)
-    };
 
     // The redis adapter is the CLUSTERED production path: the node's single
     // `RedisAdapter` is owned by a `ClusterBridge` (on its own runtime), the percore workers
@@ -120,7 +129,10 @@ async fn main() -> anyhow::Result<()> {
 
     // The CONCRETE local adapter, so the percore transport can install its sharded
     // broadcast sink on it.
-    let local = Arc::new(LocalAdapter::new(Arc::new(Registry::new()), app_registry.clone()));
+    let local = Arc::new(LocalAdapter::new(
+        Arc::new(Registry::new()),
+        app_registry.clone(),
+    ));
     let adapter: Arc<dyn Adapter> = local.clone();
 
     // The single-node local path fires `channel_vacated` immediately (no grace
@@ -291,7 +303,10 @@ async fn run_redis_percore(
     // loop's `local.broadcast(Raw)` shards remote frames to this node's workers), the REST
     // plane reads the saturation flag off it, and the worker's ClusterAdapter + the sharded
     // sink install on it.
-    let local = Arc::new(LocalAdapter::new(Arc::new(Registry::new()), app_registry.clone()));
+    let local = Arc::new(LocalAdapter::new(
+        Arc::new(Registry::new()),
+        app_registry.clone(),
+    ));
 
     // Start the bridge: builds the node's single `RedisAdapter` (sharing `local`) on its own
     // runtime and returns once Redis is connected, or `Err` if the connect failed.

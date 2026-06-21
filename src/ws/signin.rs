@@ -125,7 +125,10 @@ mod tests {
     }
 
     fn ctx() -> (ConnectionContext, mpsc::Receiver<Box<ServerEvent>>) {
-        let adapter: Arc<dyn Adapter> = Arc::new(LocalAdapter::new(Arc::new(Registry::new()), Arc::new(crate::adapter::app_registry::AppRegistry::new())));
+        let adapter: Arc<dyn Adapter> = Arc::new(LocalAdapter::new(
+            Arc::new(Registry::new()),
+            Arc::new(crate::adapter::app_registry::AppRegistry::new()),
+        ));
         ctx_on(adapter, "123.456")
     }
 
@@ -208,7 +211,10 @@ mod tests {
 
     #[tokio::test]
     async fn watcher_is_notified_when_watched_user_signs_in() {
-        let adapter: Arc<dyn Adapter> = Arc::new(LocalAdapter::new(Arc::new(Registry::new()), Arc::new(crate::adapter::app_registry::AppRegistry::new())));
+        let adapter: Arc<dyn Adapter> = Arc::new(LocalAdapter::new(
+            Arc::new(Registry::new()),
+            Arc::new(crate::adapter::app_registry::AppRegistry::new()),
+        ));
         // watcher C signs in watching B (B offline -> no initial snapshot)
         let (mut c_watch, mut rx_watch) = ctx_on(adapter.clone(), "1.1");
         let sig_c = user_signature("app-secret", "1.1", r#"{"id":"C","watchlist":["B"]}"#);
@@ -243,7 +249,10 @@ mod tests {
 
     #[tokio::test]
     async fn watcher_is_notified_when_watched_user_disconnects() {
-        let adapter: Arc<dyn Adapter> = Arc::new(LocalAdapter::new(Arc::new(Registry::new()), Arc::new(crate::adapter::app_registry::AppRegistry::new())));
+        let adapter: Arc<dyn Adapter> = Arc::new(LocalAdapter::new(
+            Arc::new(Registry::new()),
+            Arc::new(crate::adapter::app_registry::AppRegistry::new()),
+        ));
         // B signs in (online).
         let (mut c_b, _rx_b) = ctx_on(adapter.clone(), "2.2");
         let sig_b = user_signature("app-secret", "2.2", r#"{"id":"B"}"#);
@@ -275,7 +284,10 @@ mod tests {
 
     #[tokio::test]
     async fn second_connection_does_not_reemit_online_to_watchers() {
-        let adapter: Arc<dyn Adapter> = Arc::new(LocalAdapter::new(Arc::new(Registry::new()), Arc::new(crate::adapter::app_registry::AppRegistry::new())));
+        let adapter: Arc<dyn Adapter> = Arc::new(LocalAdapter::new(
+            Arc::new(Registry::new()),
+            Arc::new(crate::adapter::app_registry::AppRegistry::new()),
+        ));
         // C watches B.
         let (mut c_watch, mut rx_watch) = ctx_on(adapter.clone(), "1.1");
         let sig_c = user_signature("app-secret", "1.1", r#"{"id":"C","watchlist":["B"]}"#);
@@ -319,7 +331,10 @@ mod tests {
 
     #[tokio::test]
     async fn non_last_connection_close_does_not_emit_offline_to_watchers() {
-        let adapter: Arc<dyn Adapter> = Arc::new(LocalAdapter::new(Arc::new(Registry::new()), Arc::new(crate::adapter::app_registry::AppRegistry::new())));
+        let adapter: Arc<dyn Adapter> = Arc::new(LocalAdapter::new(
+            Arc::new(Registry::new()),
+            Arc::new(crate::adapter::app_registry::AppRegistry::new()),
+        ));
         // B signs in on TWO connections.
         let (mut c_b1, _rx_b1) = ctx_on(adapter.clone(), "2.2");
         let sig_b1 = user_signature("app-secret", "2.2", r#"{"id":"B"}"#);

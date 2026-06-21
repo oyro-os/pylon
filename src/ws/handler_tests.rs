@@ -63,7 +63,10 @@ fn app_with_client_messages(enabled: bool) -> App {
 fn ctx(app: App) -> (ConnectionContext, mpsc::Receiver<Box<ServerEvent>>) {
     let (tx, rx) = mpsc::channel(1024);
     let registry = Arc::new(Registry::new());
-    let adapter: Arc<dyn Adapter> = Arc::new(LocalAdapter::new(registry, Arc::new(crate::adapter::app_registry::AppRegistry::new())));
+    let adapter: Arc<dyn Adapter> = Arc::new(LocalAdapter::new(
+        registry,
+        Arc::new(crate::adapter::app_registry::AppRegistry::new()),
+    ));
     let c = ConnectionContext {
         app: std::sync::Arc::new(app),
         socket_id: SocketId::generate(),
@@ -299,7 +302,10 @@ async fn presence_subscribe_with_bad_auth_errors() {
 async fn presence_unsubscribe_broadcasts_member_removed_to_others() {
     // Shared adapter so two contexts see the same channel.
     let registry = Arc::new(Registry::new());
-    let adapter: Arc<dyn Adapter> = Arc::new(LocalAdapter::new(registry, Arc::new(crate::adapter::app_registry::AppRegistry::new())));
+    let adapter: Arc<dyn Adapter> = Arc::new(LocalAdapter::new(
+        registry,
+        Arc::new(crate::adapter::app_registry::AppRegistry::new()),
+    ));
     let mk = |adapter: Arc<dyn Adapter>| {
         let (tx, rx) = mpsc::channel(1024);
         let c = ConnectionContext {
@@ -462,7 +468,10 @@ async fn duplicate_presence_subscribe_is_idempotent() {
 #[tokio::test]
 async fn client_event_on_encrypted_channel_is_dropped() {
     let registry = Arc::new(Registry::new());
-    let adapter: Arc<dyn Adapter> = Arc::new(LocalAdapter::new(registry, Arc::new(crate::adapter::app_registry::AppRegistry::new())));
+    let adapter: Arc<dyn Adapter> = Arc::new(LocalAdapter::new(
+        registry,
+        Arc::new(crate::adapter::app_registry::AppRegistry::new()),
+    ));
     let mk = |adapter: Arc<dyn Adapter>| {
         let (tx, rx) = mpsc::channel(1024);
         let c = ConnectionContext {
@@ -664,7 +673,10 @@ async fn encrypted_cache_subscribe_replays_after_auth() {
 #[tokio::test]
 async fn presence_over_member_cap_errors() {
     let registry = Arc::new(Registry::new());
-    let adapter: Arc<dyn Adapter> = Arc::new(LocalAdapter::new(registry, Arc::new(crate::adapter::app_registry::AppRegistry::new())));
+    let adapter: Arc<dyn Adapter> = Arc::new(LocalAdapter::new(
+        registry,
+        Arc::new(crate::adapter::app_registry::AppRegistry::new()),
+    ));
     let mk = || {
         let (tx, rx) = mpsc::channel(1024);
         let mut limits = crate::server::config::ServerConfig::default().limits();
@@ -1563,7 +1575,10 @@ async fn relayed_client_event_frame(
     channel_data: Option<&str>,
 ) -> serde_json::Value {
     let registry = Arc::new(Registry::new());
-    let adapter: Arc<dyn Adapter> = Arc::new(LocalAdapter::new(registry, Arc::new(crate::adapter::app_registry::AppRegistry::new())));
+    let adapter: Arc<dyn Adapter> = Arc::new(LocalAdapter::new(
+        registry,
+        Arc::new(crate::adapter::app_registry::AppRegistry::new()),
+    ));
     let mk = |adapter: Arc<dyn Adapter>| {
         let (tx, rx) = mpsc::channel(1024);
         let c = ConnectionContext {
@@ -1642,7 +1657,10 @@ async fn private_client_event_broadcast_omits_user_id() {
 async fn client_event_oversize_name_returns_4301_and_does_not_broadcast() {
     // Use a shared adapter so we can check the receiver gets nothing.
     let registry = Arc::new(Registry::new());
-    let adapter: Arc<dyn Adapter> = Arc::new(LocalAdapter::new(registry, Arc::new(crate::adapter::app_registry::AppRegistry::new())));
+    let adapter: Arc<dyn Adapter> = Arc::new(LocalAdapter::new(
+        registry,
+        Arc::new(crate::adapter::app_registry::AppRegistry::new()),
+    ));
     let mk = || {
         let (tx, rx) = mpsc::channel(1024);
         let c = ConnectionContext {
@@ -1724,7 +1742,10 @@ fn ctx_with_sub_cap(
 ) {
     let (tx, rx) = mpsc::channel(1024);
     let registry = Arc::new(Registry::new());
-    let adapter: Arc<dyn Adapter> = Arc::new(LocalAdapter::new(registry, Arc::new(crate::adapter::app_registry::AppRegistry::new())));
+    let adapter: Arc<dyn Adapter> = Arc::new(LocalAdapter::new(
+        registry,
+        Arc::new(crate::adapter::app_registry::AppRegistry::new()),
+    ));
     let mut limits = crate::server::config::ServerConfig::default().limits();
     limits.max_subscriptions_per_connection = cap;
     let c = ConnectionContext {
@@ -1870,7 +1891,10 @@ async fn subscription_cap_default_is_200() {
 #[tokio::test]
 async fn client_event_rate_limit_returns_4301_and_drops() {
     let registry = Arc::new(Registry::new());
-    let adapter: Arc<dyn Adapter> = Arc::new(LocalAdapter::new(registry, Arc::new(crate::adapter::app_registry::AppRegistry::new())));
+    let adapter: Arc<dyn Adapter> = Arc::new(LocalAdapter::new(
+        registry,
+        Arc::new(crate::adapter::app_registry::AppRegistry::new()),
+    ));
 
     // Build sender with a 3-event/second rate window.
     let (tx_sender, mut rx_sender) = mpsc::channel(1024);
@@ -1981,7 +2005,10 @@ fn ctx_saturated(
 ) {
     let (tx, rx) = mpsc::channel(1024);
     let registry = Arc::new(Registry::new());
-    let adapter: Arc<dyn Adapter> = Arc::new(LocalAdapter::new(registry, Arc::new(crate::adapter::app_registry::AppRegistry::new())));
+    let adapter: Arc<dyn Adapter> = Arc::new(LocalAdapter::new(
+        registry,
+        Arc::new(crate::adapter::app_registry::AppRegistry::new()),
+    ));
     let flag = Arc::new(std::sync::atomic::AtomicBool::new(true));
     let c = ConnectionContext {
         app: std::sync::Arc::new(app),

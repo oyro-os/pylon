@@ -1652,7 +1652,9 @@ async fn purge_app_closes_connections_and_removes_from_redis_apps_set() {
             socket_id: SocketId::generate(),
             mailbox: pylon::connection::handle::Mailbox::new(tx2, None, None),
         };
-        adapter.subscribe(TEST_APP, "public-room", sub_handle, None).await;
+        adapter
+            .subscribe(TEST_APP, "public-room", sub_handle, None)
+            .await;
 
         let clients = RedisClients::connect(&test_redis_url(), 1)
             .await
@@ -1670,13 +1672,20 @@ async fn purge_app_closes_connections_and_removes_from_redis_apps_set() {
 
         // CLOSE HALF: the registered connection is returned and force-closed 4009
         // (Error frame then Close frame), exactly like terminate_user.
-        assert_eq!(ids, vec![sock], "purge_app must return the app's registered connection");
+        assert_eq!(
+            ids,
+            vec![sock],
+            "purge_app must return the app's registered connection"
+        );
         assert!(
             matches!(rx.try_recv().map(|b| *b), Ok(ServerEvent::Error(e)) if e.code == 4009),
             "registered connection must receive Error(4009)"
         );
         assert!(
-            matches!(rx.try_recv().map(|b| *b), Ok(ServerEvent::Close { code: 4009, .. })),
+            matches!(
+                rx.try_recv().map(|b| *b),
+                Ok(ServerEvent::Close { code: 4009, .. })
+            ),
             "registered connection must then receive Close(4009)"
         );
         // The app's AppRegistry entry is fully drained.

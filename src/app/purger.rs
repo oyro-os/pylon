@@ -27,7 +27,11 @@ impl AppPurger {
         conn_counts: Arc<DashMap<String, Arc<AtomicUsize>>>,
         cache: Arc<CachingAppManager>,
     ) -> Self {
-        Self { adapter, conn_counts, cache }
+        Self {
+            adapter,
+            conn_counts,
+            cache,
+        }
     }
 
     /// Config/secret changed: evict the cache only (TTL backstop bounds staleness;
@@ -157,21 +161,38 @@ mod tests {
     #[tokio::test]
     async fn purge_closes_conns_reclaims_counter_and_evicts_cache() {
         let app_registry = Arc::new(AppRegistry::new());
-        let local = Arc::new(LocalAdapter::new(Arc::new(Registry::new()), app_registry.clone()));
+        let local = Arc::new(LocalAdapter::new(
+            Arc::new(Registry::new()),
+            app_registry.clone(),
+        ));
         let adapter: Arc<dyn Adapter> = local.clone();
 
         // A live connection of app "a".
         let (tx, mut rx) = mpsc::channel(1024);
         let sid = SocketId::generate();
-        app_registry.insert("a", ConnectionHandle { socket_id: sid, mailbox: Mailbox::new(tx, None, None) });
+        app_registry.insert(
+            "a",
+            ConnectionHandle {
+                socket_id: sid,
+                mailbox: Mailbox::new(tx, None, None),
+            },
+        );
 
         // A conn_counts entry for "a" (as establish would create).
         let conn_counts: Arc<DashMap<String, Arc<AtomicUsize>>> = Arc::new(DashMap::new());
         conn_counts.insert("a".to_string(), Arc::new(AtomicUsize::new(1)));
 
         let driver_calls = Arc::new(AtomicUsize::new(0));
-        let mock_driver = Arc::new(Mock { app: Some(app("a", "k")), calls: driver_calls.clone() });
-        let cfg = CacheConfig { max_capacity: 100, ttl_secs: 300, neg_max: 100, neg_ttl_secs: 300 };
+        let mock_driver = Arc::new(Mock {
+            app: Some(app("a", "k")),
+            calls: driver_calls.clone(),
+        });
+        let cfg = CacheConfig {
+            max_capacity: 100,
+            ttl_secs: 300,
+            neg_max: 100,
+            neg_ttl_secs: 300,
+        };
         let cache = Arc::new(CachingAppManager::new(mock_driver, cfg, None));
 
         // Warm the cache: driver must be hit exactly once.
@@ -181,16 +202,26 @@ mod tests {
 
         // Second lookup before purge must be an L1 cache hit (driver NOT called again).
         let _ = cache.by_id("a").await.unwrap();
-        assert_eq!(driver_calls.load(Ordering::SeqCst), 1, "pre-purge second lookup must be L1 hit");
+        assert_eq!(
+            driver_calls.load(Ordering::SeqCst),
+            1,
+            "pre-purge second lookup must be L1 hit"
+        );
 
         let purger = AppPurger::new(adapter, conn_counts.clone(), cache.clone());
         purger.purge("a", "k").await;
 
         // (1) Connection force-closed 4009.
         assert!(matches!(rx.try_recv().map(|b| *b), Ok(ServerEvent::Error(e)) if e.code == 4009));
-        assert!(matches!(rx.try_recv().map(|b| *b), Ok(ServerEvent::Close { code: 4009, .. })));
+        assert!(matches!(
+            rx.try_recv().map(|b| *b),
+            Ok(ServerEvent::Close { code: 4009, .. })
+        ));
         // (2) conn_counts entry reclaimed.
-        assert!(!conn_counts.contains_key("a"), "purge must remove the conn_counts entry");
+        assert!(
+            !conn_counts.contains_key("a"),
+            "purge must remove the conn_counts entry"
+        );
         // (3) AppRegistry entry drained.
         assert!(app_registry.connected_app_ids().is_empty());
         // (4) Cache was evicted: a lookup after purge must reach the driver again.
@@ -224,18 +255,41 @@ mod tests {
         }
     }
 
-    type SetupResult = (Arc<AppRegistry>, Arc<dyn AppManager>, Arc<CachingAppManager>, AppPurger, mpsc::Receiver<Box<ServerEvent>>);
+    type SetupResult = (
+        Arc<AppRegistry>,
+        Arc<dyn AppManager>,
+        Arc<CachingAppManager>,
+        AppPurger,
+        mpsc::Receiver<Box<ServerEvent>>,
+    );
 
     fn setup(outcome: Outcome) -> SetupResult {
         let app_registry = Arc::new(AppRegistry::new());
-        let local = Arc::new(LocalAdapter::new(Arc::new(Registry::new()), app_registry.clone()));
+        let local = Arc::new(LocalAdapter::new(
+            Arc::new(Registry::new()),
+            app_registry.clone(),
+        ));
         let adapter: Arc<dyn Adapter> = local.clone();
         let (tx, rx) = mpsc::channel(1024);
-        app_registry.insert("a", ConnectionHandle { socket_id: SocketId::generate(), mailbox: Mailbox::new(tx, None, None) });
+        app_registry.insert(
+            "a",
+            ConnectionHandle {
+                socket_id: SocketId::generate(),
+                mailbox: Mailbox::new(tx, None, None),
+            },
+        );
         let conn_counts: Arc<DashMap<String, Arc<AtomicUsize>>> = Arc::new(DashMap::new());
         conn_counts.insert("a".to_string(), Arc::new(AtomicUsize::new(1)));
-        let driver: Arc<dyn AppManager> = Arc::new(VarMock { app: app("a", "k"), outcome });
-        let cfg = CacheConfig { max_capacity: 100, ttl_secs: 300, neg_max: 100, neg_ttl_secs: 300 };
+        let driver: Arc<dyn AppManager> = Arc::new(VarMock {
+            app: app("a", "k"),
+            outcome,
+        });
+        let cfg = CacheConfig {
+            max_capacity: 100,
+            ttl_secs: 300,
+            neg_max: 100,
+            neg_ttl_secs: 300,
+        };
         let cache = Arc::new(CachingAppManager::new(driver.clone(), cfg, None));
         let purger = AppPurger::new(adapter, conn_counts, cache.clone());
         (app_registry, driver, cache, purger, rx)

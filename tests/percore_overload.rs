@@ -115,7 +115,10 @@ async fn spawn_with(config: ServerConfig) -> Harness {
     let port = config.port;
 
     let apps: Arc<dyn AppManager> = Arc::new(StaticFileAppManager::from_json(APPS).unwrap());
-    let local = Arc::new(LocalAdapter::new(Arc::new(Registry::new()), Arc::new(pylon::adapter::app_registry::AppRegistry::new())));
+    let local = Arc::new(LocalAdapter::new(
+        Arc::new(Registry::new()),
+        Arc::new(pylon::adapter::app_registry::AppRegistry::new()),
+    ));
     let adapter: Arc<dyn Adapter> = local.clone();
     let conn_counts = Arc::new(Default::default());
     let webhooks = pylon::webhook::WebhookHandle::null();

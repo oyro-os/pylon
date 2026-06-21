@@ -28,8 +28,10 @@ fn sort_keys(v: serde_json::Value) -> serde_json::Value {
     use serde_json::Value;
     match v {
         Value::Object(map) => {
-            let mut entries: Vec<(String, Value)> =
-                map.into_iter().map(|(k, val)| (k, sort_keys(val))).collect();
+            let mut entries: Vec<(String, Value)> = map
+                .into_iter()
+                .map(|(k, val)| (k, sort_keys(val)))
+                .collect();
             entries.sort_by(|a, b| a.0.cmp(&b.0));
             Value::Object(entries.into_iter().collect())
         }

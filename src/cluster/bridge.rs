@@ -745,7 +745,10 @@ async fn handle_cmd(
             let a = match apps.by_id(&app).await {
                 Ok(Some(a)) => a,
                 Ok(None) => return,
-                Err(e) => { tracing::warn!(error = %e, "cluster-edge app lookup failed; skipping"); return }
+                Err(e) => {
+                    tracing::warn!(error = %e, "cluster-edge app lookup failed; skipping");
+                    return;
+                }
             };
             // Clustered subscription_count: a single cluster-wide emit (local-via-sink +
             // cluster publish through the adapter's `broadcast`). Mirror the handler's
@@ -825,7 +828,10 @@ async fn handle_cmd(
             let a = match apps.by_id(&app).await {
                 Ok(Some(a)) => a,
                 Ok(None) => return,
-                Err(e) => { tracing::warn!(error = %e, "cluster-edge app lookup failed; skipping"); return }
+                Err(e) => {
+                    tracing::warn!(error = %e, "cluster-edge app lookup failed; skipping");
+                    return;
+                }
             };
             // Clustered subscription_count — same gating as Subscribe (enabled +
             // non-presence + `count > 0`).
@@ -943,7 +949,10 @@ async fn handle_cmd(
             let a = match apps.by_id(&app).await {
                 Ok(Some(a)) => a,
                 Ok(None) => return,
-                Err(e) => { tracing::warn!(error = %e, "cluster-edge app lookup failed; skipping"); return }
+                Err(e) => {
+                    tracing::warn!(error = %e, "cluster-edge app lookup failed; skipping");
+                    return;
+                }
             };
             // Single cluster-wide `member_added` on the cluster-wide first connection for
             // this user (local-via-sink + cluster publish through `broadcast`, excluding
@@ -1014,7 +1023,10 @@ async fn handle_cmd(
             let a = match apps.by_id(&app).await {
                 Ok(Some(a)) => a,
                 Ok(None) => return,
-                Err(e) => { tracing::warn!(error = %e, "cluster-edge app lookup failed; skipping"); return }
+                Err(e) => {
+                    tracing::warn!(error = %e, "cluster-edge app lookup failed; skipping");
+                    return;
+                }
             };
             // Single cluster-wide `member_removed` on the cluster-wide last connection for
             // this user, plus the `member_removed` webhook.

@@ -141,7 +141,10 @@ impl WebhookDispatcher {
                 let app = match self.apps.by_id(&app_id).await {
                     Ok(Some(a)) => a,
                     Ok(None) => continue, // app vanished (hot-reload race): drop
-                    Err(e) => { tracing::warn!(error = %e, "webhook app lookup failed; skipping cycle"); continue }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "webhook app lookup failed; skipping cycle");
+                        continue;
+                    }
                 };
                 if !app.webhooks.is_empty() {
                     Self::deliver_app_events(
@@ -189,7 +192,10 @@ impl WebhookDispatcher {
                         let resolved = match apps.by_id(&app).await {
                             Ok(Some(a)) => a,
                             Ok(None) => return, // app vanished: drop
-                            Err(e) => { tracing::warn!(error = %e, "webhook app lookup failed; skipping cycle"); return }
+                            Err(e) => {
+                                tracing::warn!(error = %e, "webhook app lookup failed; skipping cycle");
+                                return;
+                            }
                         };
                         if resolved.webhooks.is_empty() {
                             return;

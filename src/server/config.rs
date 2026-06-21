@@ -278,11 +278,29 @@ impl ServerConfig {
         }
         c.app_manager = parse_app_manager(std::env::var("PYLON_APP_MANAGER").ok().as_deref());
         c.app_dsn = std::env::var("PYLON_APP_DSN").ok();
-        if let Ok(v) = std::env::var("PYLON_APP_CACHE") { c.app_cache = v != "0" && v.to_lowercase() != "off" && v.to_lowercase() != "false"; }
-        if let Ok(v) = std::env::var("PYLON_APP_CACHE_MAX") { if let Ok(n) = v.parse() { c.app_cache_max = n; } }
-        if let Ok(v) = std::env::var("PYLON_APP_CACHE_TTL") { if let Ok(n) = v.parse() { c.app_cache_ttl = n; } }
-        if let Ok(v) = std::env::var("PYLON_APP_CACHE_NEG_MAX") { if let Ok(n) = v.parse() { c.app_cache_neg_max = n; } }
-        if let Ok(v) = std::env::var("PYLON_APP_CACHE_NEG_TTL") { if let Ok(n) = v.parse() { c.app_cache_neg_ttl = n; } }
+        if let Ok(v) = std::env::var("PYLON_APP_CACHE") {
+            c.app_cache = v != "0" && v.to_lowercase() != "off" && v.to_lowercase() != "false";
+        }
+        if let Ok(v) = std::env::var("PYLON_APP_CACHE_MAX") {
+            if let Ok(n) = v.parse() {
+                c.app_cache_max = n;
+            }
+        }
+        if let Ok(v) = std::env::var("PYLON_APP_CACHE_TTL") {
+            if let Ok(n) = v.parse() {
+                c.app_cache_ttl = n;
+            }
+        }
+        if let Ok(v) = std::env::var("PYLON_APP_CACHE_NEG_MAX") {
+            if let Ok(n) = v.parse() {
+                c.app_cache_neg_max = n;
+            }
+        }
+        if let Ok(v) = std::env::var("PYLON_APP_CACHE_NEG_TTL") {
+            if let Ok(n) = v.parse() {
+                c.app_cache_neg_ttl = n;
+            }
+        }
         c.app_cache_redis_url = std::env::var("PYLON_APP_CACHE_REDIS_URL").ok();
         c.app_admin_token = std::env::var("PYLON_ADMIN_TOKEN").ok();
         if let Ok(v) = std::env::var("PYLON_APP_SWEEP_INTERVAL") {
@@ -820,10 +838,16 @@ mod tests {
     #[test]
     fn parse_app_manager_maps_kinds() {
         assert_eq!(parse_app_manager(None), AppManagerKind::StaticFile);
-        assert_eq!(parse_app_manager(Some("static")), AppManagerKind::StaticFile);
+        assert_eq!(
+            parse_app_manager(Some("static")),
+            AppManagerKind::StaticFile
+        );
         assert_eq!(parse_app_manager(Some("sqlite")), AppManagerKind::Sqlite);
         assert_eq!(parse_app_manager(Some("mysql")), AppManagerKind::Mysql);
-        assert_eq!(parse_app_manager(Some("postgres")), AppManagerKind::Postgres);
+        assert_eq!(
+            parse_app_manager(Some("postgres")),
+            AppManagerKind::Postgres
+        );
         assert_eq!(parse_app_manager(Some("mongo")), AppManagerKind::Mongo);
         assert_eq!(parse_app_manager(Some("weird")), AppManagerKind::StaticFile);
     }
@@ -831,7 +855,7 @@ mod tests {
     #[test]
     fn cache_defaults_are_sane() {
         let c = ServerConfig::default();
-        assert!(c.app_cache);                 // on by default
+        assert!(c.app_cache); // on by default
         assert_eq!(c.app_cache_max, 100_000);
         assert_eq!(c.app_cache_ttl, 300);
         assert_eq!(c.app_cache_neg_ttl, 30);

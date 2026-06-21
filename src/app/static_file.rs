@@ -25,7 +25,11 @@ impl StaticFileAppManager {
 #[async_trait::async_trait]
 impl AppManager for StaticFileAppManager {
     async fn by_key(&self, key: &str) -> Result<Option<Arc<App>>, AppLookupError> {
-        Ok(self.apps.iter().find(|a| a.key == key && a.enabled).cloned())
+        Ok(self
+            .apps
+            .iter()
+            .find(|a| a.key == key && a.enabled)
+            .cloned())
     }
     async fn by_id(&self, id: &str) -> Result<Option<Arc<App>>, AppLookupError> {
         Ok(self.apps.iter().find(|a| a.id == id && a.enabled).cloned())
@@ -34,7 +38,11 @@ impl AppManager for StaticFileAppManager {
     fn by_key_cached(&self, key: &str) -> Option<Result<Option<Arc<App>>, AppLookupError>> {
         // The whole app set is in memory; resolving never does I/O, so the static
         // path always answers synchronously and never offloads.
-        Some(Ok(self.apps.iter().find(|a| a.key == key && a.enabled).cloned()))
+        Some(Ok(self
+            .apps
+            .iter()
+            .find(|a| a.key == key && a.enabled)
+            .cloned()))
     }
 }
 

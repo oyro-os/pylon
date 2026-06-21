@@ -107,7 +107,10 @@ mod tests {
         assert_eq!(r.connected_app_ids(), vec!["app".to_string()]);
         // Removing the last socket removes the whole app entry (remove_if-empty).
         r.remove("app", &s2);
-        assert!(r.connected_app_ids().is_empty(), "empty app entry must be removed");
+        assert!(
+            r.connected_app_ids().is_empty(),
+            "empty app entry must be removed"
+        );
     }
 
     #[test]

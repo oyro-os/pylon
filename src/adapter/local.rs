@@ -282,7 +282,10 @@ mod tests {
     #[tokio::test]
     async fn subscribe_then_broadcast_delegates_to_registry() {
         let reg = Arc::new(Registry::new());
-        let adapter = LocalAdapter::new(reg.clone(), Arc::new(crate::adapter::app_registry::AppRegistry::new()));
+        let adapter = LocalAdapter::new(
+            reg.clone(),
+            Arc::new(crate::adapter::app_registry::AppRegistry::new()),
+        );
         let (tx, mut rx) = mpsc::channel(1024);
         let out = adapter
             .subscribe(
@@ -310,7 +313,10 @@ mod tests {
     #[tokio::test]
     async fn presence_members_round_trip() {
         let reg = Arc::new(Registry::new());
-        let adapter = LocalAdapter::new(reg.clone(), Arc::new(crate::adapter::app_registry::AppRegistry::new()));
+        let adapter = LocalAdapter::new(
+            reg.clone(),
+            Arc::new(crate::adapter::app_registry::AppRegistry::new()),
+        );
         let (tx, _rx) = mpsc::channel(1024);
         adapter
             .subscribe(
@@ -337,7 +343,10 @@ mod tests {
 
     #[tokio::test]
     async fn cache_set_then_get_round_trips() {
-        let adapter = LocalAdapter::new(Arc::new(Registry::new()), Arc::new(crate::adapter::app_registry::AppRegistry::new()));
+        let adapter = LocalAdapter::new(
+            Arc::new(Registry::new()),
+            Arc::new(crate::adapter::app_registry::AppRegistry::new()),
+        );
         adapter
             .cache_set(
                 "app",
@@ -361,7 +370,10 @@ mod tests {
 
     #[tokio::test]
     async fn cache_set_overwrites_last_event() {
-        let adapter = LocalAdapter::new(Arc::new(Registry::new()), Arc::new(crate::adapter::app_registry::AppRegistry::new()));
+        let adapter = LocalAdapter::new(
+            Arc::new(Registry::new()),
+            Arc::new(crate::adapter::app_registry::AppRegistry::new()),
+        );
         for data in ["one", "two"] {
             adapter
                 .cache_set(
@@ -383,13 +395,19 @@ mod tests {
 
     #[tokio::test]
     async fn cache_get_is_none_when_absent() {
-        let adapter = LocalAdapter::new(Arc::new(Registry::new()), Arc::new(crate::adapter::app_registry::AppRegistry::new()));
+        let adapter = LocalAdapter::new(
+            Arc::new(Registry::new()),
+            Arc::new(crate::adapter::app_registry::AppRegistry::new()),
+        );
         assert_eq!(adapter.cache_get("app", "cache-missing").await, None);
     }
 
     #[tokio::test]
     async fn cache_entry_expires_after_ttl() {
-        let adapter = LocalAdapter::new(Arc::new(Registry::new()), Arc::new(crate::adapter::app_registry::AppRegistry::new()));
+        let adapter = LocalAdapter::new(
+            Arc::new(Registry::new()),
+            Arc::new(crate::adapter::app_registry::AppRegistry::new()),
+        );
         adapter
             .cache_set(
                 "app",
@@ -406,7 +424,10 @@ mod tests {
 
     #[tokio::test]
     async fn send_to_user_fans_out_to_all_connections() {
-        let adapter = LocalAdapter::new(Arc::new(Registry::new()), Arc::new(crate::adapter::app_registry::AppRegistry::new()));
+        let adapter = LocalAdapter::new(
+            Arc::new(Registry::new()),
+            Arc::new(crate::adapter::app_registry::AppRegistry::new()),
+        );
         let (tx1, mut rx1) = mpsc::channel(1024);
         let (tx2, mut rx2) = mpsc::channel(1024);
         let s1 = SocketId::generate();
@@ -438,7 +459,10 @@ mod tests {
 
     #[tokio::test]
     async fn terminate_user_pushes_error_then_close_and_returns_ids() {
-        let adapter = LocalAdapter::new(Arc::new(Registry::new()), Arc::new(crate::adapter::app_registry::AppRegistry::new()));
+        let adapter = LocalAdapter::new(
+            Arc::new(Registry::new()),
+            Arc::new(crate::adapter::app_registry::AppRegistry::new()),
+        );
         let (tx, mut rx) = mpsc::channel(1024);
         let s = SocketId::generate();
         adapter
@@ -491,11 +515,16 @@ mod tests {
         ids.sort();
         let mut want = vec![s_idle, s_sub];
         want.sort();
-        assert_eq!(ids, want, "purge must return BOTH the idle and subscribed socket ids");
+        assert_eq!(
+            ids, want,
+            "purge must return BOTH the idle and subscribed socket ids"
+        );
 
         // BOTH connections received Error(4009) then Close(4009).
         for rx in [&mut rx_idle, &mut rx_sub] {
-            assert!(matches!(rx.try_recv().map(|b| *b), Ok(ServerEvent::Error(e)) if e.code == 4009));
+            assert!(
+                matches!(rx.try_recv().map(|b| *b), Ok(ServerEvent::Error(e)) if e.code == 4009)
+            );
             assert!(matches!(
                 rx.try_recv().map(|b| *b),
                 Ok(ServerEvent::Close { code: 4009, .. })

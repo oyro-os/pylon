@@ -53,7 +53,9 @@ pub async fn post_invalidate(
         Some(inv) => {
             inv.publish(&app_id, &parsed.key, parsed.action)
                 .await
-                .map_err(|e| RestError::service_unavailable(format!("invalidate publish failed: {e}")))?;
+                .map_err(|e| {
+                    RestError::service_unavailable(format!("invalidate publish failed: {e}"))
+                })?;
             Ok(axum::http::StatusCode::ACCEPTED)
         }
         None => Err(RestError::service_unavailable(
@@ -112,7 +114,10 @@ mod tests {
     fn invalidate_body_defaults_action_to_refresh() {
         let b: InvalidateBody = serde_json::from_str(r#"{"key":"k"}"#).unwrap();
         assert_eq!(b.key, "k");
-        assert_eq!(b.action, crate::app::invalidation::InvalidateAction::Refresh);
+        assert_eq!(
+            b.action,
+            crate::app::invalidation::InvalidateAction::Refresh
+        );
     }
 
     #[test]
@@ -124,7 +129,10 @@ mod tests {
     #[test]
     fn invalidate_body_parses_refresh_action() {
         let b: InvalidateBody = serde_json::from_str(r#"{"key":"k","action":"refresh"}"#).unwrap();
-        assert_eq!(b.action, crate::app::invalidation::InvalidateAction::Refresh);
+        assert_eq!(
+            b.action,
+            crate::app::invalidation::InvalidateAction::Refresh
+        );
     }
 
     // ── Handler behavior: the full `post_invalidate` flow ────────────────────
@@ -261,7 +269,12 @@ mod tests {
             Arc::new(crate::app::static_file::StaticFileAppManager::from_json("[]").unwrap());
         let cache = Arc::new(CachingAppManager::new(
             apps,
-            CacheConfig { max_capacity: 16, ttl_secs: 60, neg_max: 16, neg_ttl_secs: 60 },
+            CacheConfig {
+                max_capacity: 16,
+                ttl_secs: 60,
+                neg_max: 16,
+                neg_ttl_secs: 60,
+            },
             None,
         ));
         let adapter: Arc<dyn crate::adapter::Adapter> =

@@ -44,8 +44,8 @@ impl RedisAppCache {
         match raw {
             None => Ok(None),
             Some(s) => {
-                let mut app: App = serde_json::from_str(&s)
-                    .map_err(|e| AppLookupError::Decode(e.to_string()))?;
+                let mut app: App =
+                    serde_json::from_str(&s).map_err(|e| AppLookupError::Decode(e.to_string()))?;
                 app.recompute_has_flags();
                 Ok(Some(Arc::new(app)))
             }
@@ -54,15 +54,17 @@ impl RedisAppCache {
 
     /// Delete both the id- and key-keyed entries for an app.
     pub async fn del(&self, id: &str, key: &str) -> Result<(), AppLookupError> {
-        let _: () = self.pool.del((Self::id_key(id), Self::key_key(key))).await
+        let _: () = self
+            .pool
+            .del((Self::id_key(id), Self::key_key(key)))
+            .await
             .map_err(|e| AppLookupError::Backend(e.to_string()))?;
         Ok(())
     }
 
     /// Store the app under both its id- and key-keyed entries with the configured TTL.
     pub async fn put(&self, app: &App) -> Result<(), AppLookupError> {
-        let s =
-            serde_json::to_string(app).map_err(|e| AppLookupError::Decode(e.to_string()))?;
+        let s = serde_json::to_string(app).map_err(|e| AppLookupError::Decode(e.to_string()))?;
         let exp = Some(Expiration::EX(self.ttl_secs));
         let _: () = self
             .pool

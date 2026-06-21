@@ -9,7 +9,9 @@
 //! Every socket-driving step is wrapped in a hard `tokio::time::timeout` wall so
 //! a hang fails fast instead of blocking the suite.
 
+use dashmap::DashMap;
 use futures_util::{SinkExt, StreamExt};
+use pylon::adapter::app_registry::AppRegistry;
 use pylon::adapter::local::LocalAdapter;
 use pylon::adapter::Adapter;
 use pylon::app::static_file::StaticFileAppManager;
@@ -17,8 +19,6 @@ use pylon::app::AppManager;
 use pylon::auth::signature::channel_signature;
 use pylon::channel::registry::Registry;
 use pylon::server::config::ServerConfig;
-use dashmap::DashMap;
-use pylon::adapter::app_registry::AppRegistry;
 use pylon::transport::worker::{run, DispatchEnv, Mode, WorkerConfig};
 use serde_json::{json, Value};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -490,7 +490,10 @@ async fn spawn_with_saturation_flag() -> (Harness, Arc<AtomicBool>) {
         Arc::new(StaticFileAppManager::from_json(APPS_UNLIMITED).unwrap());
     let registry = Arc::new(pylon::channel::registry::Registry::new());
     let app_registry = Arc::new(AppRegistry::new());
-    let adapter: Arc<dyn Adapter> = Arc::new(pylon::adapter::local::LocalAdapter::new(registry, app_registry.clone()));
+    let adapter: Arc<dyn Adapter> = Arc::new(pylon::adapter::local::LocalAdapter::new(
+        registry,
+        app_registry.clone(),
+    ));
     let sat_flag = Arc::new(AtomicBool::new(false));
     let conn_counts: Arc<DashMap<String, Arc<AtomicUsize>>> = Arc::new(Default::default());
     let env = Arc::new(DispatchEnv {
@@ -595,7 +598,10 @@ async fn conn_counts_and_registry_self_clean_on_last_disconnect() {
     let mut ws = try_connect(h.port).await;
     let _ = established_socket_id(&mut ws).await;
     // While connected: both shared maps carry an entry for "app".
-    assert!(h.conn_counts.contains_key("app"), "counter entry must exist while connected");
+    assert!(
+        h.conn_counts.contains_key("app"),
+        "counter entry must exist while connected"
+    );
     assert_eq!(h.app_registry.connected_app_ids(), vec!["app".to_string()]);
 
     drop(ws);

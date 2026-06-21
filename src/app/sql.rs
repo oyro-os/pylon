@@ -4,22 +4,36 @@ use sqlx::{AnyPool, Row};
 use std::sync::Arc;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
-enum Dialect { Sqlite, MySql, Postgres }
+enum Dialect {
+    Sqlite,
+    MySql,
+    Postgres,
+}
 
 impl Dialect {
     fn from_dsn(dsn: &str) -> Self {
         let scheme = dsn.split(':').next().unwrap_or("").to_ascii_lowercase();
-        if scheme.starts_with("mysql") || scheme.starts_with("mariadb") { Dialect::MySql }
-        else if scheme.starts_with("postgres") { Dialect::Postgres }
-        else { Dialect::Sqlite }
+        if scheme.starts_with("mysql") || scheme.starts_with("mariadb") {
+            Dialect::MySql
+        } else if scheme.starts_with("postgres") {
+            Dialect::Postgres
+        } else {
+            Dialect::Sqlite
+        }
     }
     /// `key` is reserved in MySQL (needs backticks); non-reserved in SQLite/Postgres.
     fn key_ident(&self) -> &'static str {
-        match self { Dialect::MySql => "`key`", _ => "key" }
+        match self {
+            Dialect::MySql => "`key`",
+            _ => "key",
+        }
     }
     /// Bind-parameter placeholder for the single lookup value. Postgres uses $N.
     fn placeholder(&self) -> &'static str {
-        match self { Dialect::Postgres => "$1", _ => "?" }
+        match self {
+            Dialect::Postgres => "$1",
+            _ => "?",
+        }
     }
 }
 
@@ -41,22 +55,41 @@ impl SqlAppManager {
     pub async fn connect(dsn: &str) -> anyhow::Result<Self> {
         sqlx::any::install_default_drivers();
         let dialect = Dialect::from_dsn(dsn);
-        let pool = AnyPoolOptions::new().max_connections(8).connect(dsn).await?;
+        let pool = AnyPoolOptions::new()
+            .max_connections(8)
+            .connect(dsn)
+            .await?;
         Ok(Self { pool, dialect })
     }
 
     fn select_sql(&self) -> String {
-        format!("SELECT id, {}, secret, name, capacity, client_messages_enabled, \
-                 subscription_count_enabled, enabled, webhooks FROM apps", self.dialect.key_ident())
+        format!(
+            "SELECT id, {}, secret, name, capacity, client_messages_enabled, \
+                 subscription_count_enabled, enabled, webhooks FROM apps",
+            self.dialect.key_ident()
+        )
     }
 
     async fn fetch(&self, col: LookupCol, val: &str) -> Result<Option<Arc<App>>, AppLookupError> {
-        let where_col = match col { LookupCol::Id => "id", LookupCol::Key => self.dialect.key_ident() };
-        let sql = format!("{} WHERE {} = {} AND enabled <> 0 LIMIT 1",
-                          self.select_sql(), where_col, self.dialect.placeholder());
-        let row = sqlx::query(&sql).bind(val).fetch_optional(&self.pool).await
+        let where_col = match col {
+            LookupCol::Id => "id",
+            LookupCol::Key => self.dialect.key_ident(),
+        };
+        let sql = format!(
+            "{} WHERE {} = {} AND enabled <> 0 LIMIT 1",
+            self.select_sql(),
+            where_col,
+            self.dialect.placeholder()
+        );
+        let row = sqlx::query(&sql)
+            .bind(val)
+            .fetch_optional(&self.pool)
+            .await
             .map_err(|e| AppLookupError::Backend(e.to_string()))?;
-        match row { None => Ok(None), Some(r) => Ok(Some(Arc::new(row_to_app(&r)?))) }
+        match row {
+            None => Ok(None),
+            Some(r) => Ok(Some(Arc::new(row_to_app(&r)?))),
+        }
     }
 }
 
@@ -72,10 +105,10 @@ fn get_text(r: &AnyRow, col: &str) -> Result<String, AppLookupError> {
     if let Ok(s) = r.try_get::<String, _>(col) {
         return Ok(s);
     }
-    let bytes: Vec<u8> = r.try_get(col)
+    let bytes: Vec<u8> = r
+        .try_get(col)
         .map_err(|e| AppLookupError::Decode(format!("{col} column: {e}")))?;
-    String::from_utf8(bytes)
-        .map_err(|e| AppLookupError::Decode(format!("{col} utf8: {e}")))
+    String::from_utf8(bytes).map_err(|e| AppLookupError::Decode(format!("{col} utf8: {e}")))
 }
 
 fn row_to_app(r: &AnyRow) -> Result<App, AppLookupError> {
@@ -126,14 +159,19 @@ mod tests {
         let dsn = format!("sqlite://{}?mode=rwc", tmp.path().join("apps.db").display());
         let m = SqlAppManager::connect(&dsn).await.unwrap();
         sqlx::query(include_str!("../../deploy/db/sqlite/001_apps.sql"))
-            .execute(&m.pool).await.unwrap();
+            .execute(&m.pool)
+            .await
+            .unwrap();
         sqlx::query(
             "INSERT INTO apps (id,key,secret,name,capacity,client_messages_enabled,\
              subscription_count_enabled,enabled,webhooks) VALUES \
              ('app-id','app-key','app-secret','Example',2,1,1,1,\
               '[{\"url\":\"https://e.test\",\"event_types\":[\"channel_occupied\"]}]'),\
-             ('off-id','off-key','s','Disabled',0,0,0,0,'[]')")
-            .execute(&m.pool).await.unwrap();
+             ('off-id','off-key','s','Disabled',0,0,0,0,'[]')",
+        )
+        .execute(&m.pool)
+        .await
+        .unwrap();
         (m, tmp)
     }
 
@@ -144,7 +182,7 @@ mod tests {
         assert_eq!(a.key, "app-key");
         assert_eq!(a.capacity, 2);
         assert!(a.client_messages_enabled);
-        assert!(a.has_channel_occupied_webhooks);       // recompute_has_flags ran
+        assert!(a.has_channel_occupied_webhooks); // recompute_has_flags ran
         let k = m.by_key("app-key").await.unwrap().expect("by_key");
         assert_eq!(k.id, "app-id");
     }
@@ -168,6 +206,9 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let dsn = format!("sqlite://{}?mode=rwc", tmp.path().join("apps.db").display());
         let m = SqlAppManager::connect(&dsn).await.unwrap(); // no table created
-        assert!(matches!(m.by_id("x").await, Err(AppLookupError::Backend(_))));
+        assert!(matches!(
+            m.by_id("x").await,
+            Err(AppLookupError::Backend(_))
+        ));
     }
 }

@@ -12,14 +12,22 @@ pub struct MongoAppManager {
 impl MongoAppManager {
     pub async fn connect(uri: &str) -> anyhow::Result<Self> {
         let client = Client::with_uri_str(uri).await?;
-        let db = client.default_database()
-            .ok_or_else(|| anyhow::anyhow!("mongo URI must include a database name (mongodb://host/dbname)"))?;
-        Ok(Self { apps: db.collection::<App>("apps") })
+        let db = client.default_database().ok_or_else(|| {
+            anyhow::anyhow!("mongo URI must include a database name (mongodb://host/dbname)")
+        })?;
+        Ok(Self {
+            apps: db.collection::<App>("apps"),
+        })
     }
 
     async fn find(&self, field: &str, val: &str) -> Result<Option<Arc<App>>, AppLookupError> {
         let filter = doc! { field: val, "enabled": true };
-        match self.apps.find_one(filter).await.map_err(|e| AppLookupError::Backend(e.to_string()))? {
+        match self
+            .apps
+            .find_one(filter)
+            .await
+            .map_err(|e| AppLookupError::Backend(e.to_string()))?
+        {
             None => Ok(None),
             Some(mut app) => {
                 app.recompute_has_flags();
