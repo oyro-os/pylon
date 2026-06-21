@@ -17,6 +17,7 @@ use pylon::connection::handle::ConnectionHandle;
 use pylon::protocol::event::ServerEvent;
 use pylon::protocol::socket_id::SocketId;
 use pylon::server::config::ServerConfig;
+use std::sync::Arc;
 use std::time::Duration;
 use uuid::Uuid;
 
@@ -1616,20 +1617,43 @@ async fn cluster_publish_broadcast_fans_out_only_remote() {
 async fn purge_app_closes_connections_and_removes_from_redis_apps_set() {
     tokio::time::timeout(Duration::from_secs(10), async {
         let prefix = random_prefix();
-        let adapter = connect_adapter_with_prefix(&prefix).await;
+        let cfg = redis_test_config(&prefix);
         let keys = Keys::new(&prefix);
 
-        // Register the app in the `apps` set by subscribing a connection (same as
-        // `cluster_subscribe` does) so the pre-condition matches production.
-        let (tx, _rx) = tokio::sync::mpsc::channel::<Box<ServerEvent>>(64);
-        let sock = SocketId::generate();
-        let handle = ConnectionHandle {
-            socket_id: sock,
-            mailbox: pylon::connection::handle::Mailbox::new(tx, None, None),
-        };
-        adapter.subscribe(TEST_APP, "public-room", handle, None).await;
+        // Build the RedisAdapter over a LocalAdapter whose AppRegistry we control, so
+        // we can register a live connection (as the percore worker does at establish)
+        // and prove purge_app force-closes it with 4009 — the close half — in addition
+        // to the Redis SREM half.
+        let app_registry = Arc::new(pylon::adapter::app_registry::AppRegistry::new());
+        let local = Arc::new(pylon::adapter::local::LocalAdapter::new(
+            Arc::new(pylon::channel::registry::Registry::new()),
+            app_registry.clone(),
+        ));
+        let adapter = RedisAdapter::with_local(&cfg, local, None)
+            .await
+            .expect("with_local must connect to the test Redis");
 
-        // Confirm the app is indexed in the Redis `apps` set.
+        // (1) A live connection registered in the app's AppRegistry (mirrors the
+        //     worker's establish-time insert) — purge_app must force-close THIS.
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Box<ServerEvent>>(64);
+        let sock = SocketId::generate();
+        app_registry.insert(
+            TEST_APP,
+            ConnectionHandle {
+                socket_id: sock,
+                mailbox: pylon::connection::handle::Mailbox::new(tx, None, None),
+            },
+        );
+
+        // (2) Index the app in the Redis `apps` set the way `cluster_subscribe` does
+        //     (a separate handle), so the SREM half has something to remove.
+        let (tx2, _rx2) = tokio::sync::mpsc::channel::<Box<ServerEvent>>(64);
+        let sub_handle = ConnectionHandle {
+            socket_id: SocketId::generate(),
+            mailbox: pylon::connection::handle::Mailbox::new(tx2, None, None),
+        };
+        adapter.subscribe(TEST_APP, "public-room", sub_handle, None).await;
+
         let clients = RedisClients::connect(&test_redis_url(), 1)
             .await
             .expect("test clients must connect");
@@ -1641,18 +1665,24 @@ async fn purge_app_closes_connections_and_removes_from_redis_apps_set() {
             .expect("SISMEMBER apps must succeed");
         assert!(is_member, "app must be in the `apps` set after subscribe");
 
-        // Now purge the app — all local connections closed, Redis `apps` SREM'd.
+        // Purge: close every local connection (4009) AND SREM the app index.
         let ids = adapter.purge_app(TEST_APP).await;
-        // The RedisAdapter's internal LocalAdapter has its own private AppRegistry
-        // with no worker-registered connections — `subscribe` goes to the channel
-        // registry only, not app_registry — so drain_app always returns empty here.
-        // The real point of this test is the SREM assertion below.
-        assert!(
-            ids.is_empty(),
-            "RedisAdapter's private app_registry has no worker-registered conns; ids must be empty"
-        );
 
-        // The app must have been removed from the Redis `apps` set.
+        // CLOSE HALF: the registered connection is returned and force-closed 4009
+        // (Error frame then Close frame), exactly like terminate_user.
+        assert_eq!(ids, vec![sock], "purge_app must return the app's registered connection");
+        assert!(
+            matches!(rx.try_recv().map(|b| *b), Ok(ServerEvent::Error(e)) if e.code == 4009),
+            "registered connection must receive Error(4009)"
+        );
+        assert!(
+            matches!(rx.try_recv().map(|b| *b), Ok(ServerEvent::Close { code: 4009, .. })),
+            "registered connection must then receive Close(4009)"
+        );
+        // The app's AppRegistry entry is fully drained.
+        assert!(app_registry.connected_app_ids().is_empty());
+
+        // SREM HALF: the app is removed from the Redis `apps` set.
         let still_member: bool = clients
             .pool
             .next()

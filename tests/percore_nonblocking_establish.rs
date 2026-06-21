@@ -105,6 +105,7 @@ async fn spawn_slow(delay: Duration) -> Harness {
         pong_timeout: config.pong_timeout,
         strict_protocol: config.strict_protocol,
         conn_counts: conn_counts.clone(),
+        node_conns: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         webhooks: pylon::webhook::WebhookHandle::null(),
         saturated: None,
         clustered: false,
@@ -283,35 +284,45 @@ async fn slow_connection_eventually_establishes() {
 async fn parked_disconnect_leaks_no_counter_and_discards_late_resolution() {
     let h = spawn_slow(Duration::from_millis(150)).await;
 
-    // Open A and drop it almost immediately — while its lookup is still sleeping.
+    // Open A (parks on its 150ms lookup) and drop it ~20ms later — WHILE its lookup
+    // is still in flight — so A never establishes and its slab token is freed.
     {
         let _a = connect(h.port).await;
         tokio::time::sleep(Duration::from_millis(20)).await;
         // `_a` drops here → client closes the socket while A is parked.
     }
 
-    // Wait past the lookup's completion so the late ResolvedApp is drained.
-    tokio::time::sleep(Duration::from_millis(300)).await;
-
-    // The parked-then-dropped connection took no counter and the late resolution
-    // was discarded: either the entry is absent, or it reads 0.
-    match h.conn_counts.get("app") {
-        None => {}
-        Some(c) => assert_eq!(
-            c.load(Ordering::SeqCst),
-            0,
-            "a parked-then-dropped connection must leak no per-app counter"
-        ),
-    }
-
-    // The worker is still healthy: a new connection establishes and is counted once.
+    // Let the worker process A's close (free its slab slot), then open B BEFORE A's
+    // lookup resolves (150ms). B reuses A's just-freed slab token and parks with a
+    // FRESH generation, so when A's stale `ResolvedApp` lands (~150ms) it finds B's
+    // pending with a mismatched gen and is DISCARDED — the slab-token-recycling guard.
+    // B must be entirely unaffected (it resumes from its OWN lookup at ~170ms).
+    tokio::time::sleep(Duration::from_millis(20)).await;
     let mut b = connect(h.port).await;
-    let fb = next_json(&mut b).await;
-    assert_eq!(fb["event"], "pusher:connection_established");
-    let counter = h.conn_counts.get("app").expect("app counter exists after B");
+    let fb = next_json(&mut b).await; // generous 5s timeout inside next_json
+    assert_eq!(
+        fb["event"], "pusher:connection_established",
+        "B (on the recycled slab token) must establish; A's stale resolution must be \
+         discarded by the gen guard, never applied to B"
+    );
+
+    // Counters: A (parked then dropped) took no counter; exactly B is counted.
+    let counter = h
+        .conn_counts
+        .get("app")
+        .expect("app counter exists after B establishes");
     assert_eq!(
         counter.load(Ordering::SeqCst),
         1,
-        "exactly one live connection after the parked drop"
+        "exactly one live connection (B); the parked-then-dropped A leaked no counter"
     );
+
+    // Both A's and B's lookups actually offloaded — A's ran and its result was
+    // discarded; B's ran and resumed it.
+    assert!(
+        h.calls.load(Ordering::SeqCst) >= 2,
+        "both A's and B's lookups must have offloaded"
+    );
+
+    drop(b);
 }

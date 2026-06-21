@@ -80,6 +80,7 @@ async fn spawn(config: ServerConfig) -> Harness {
         pong_timeout: config.pong_timeout,
         strict_protocol: config.strict_protocol,
         conn_counts: conn_counts.clone(),
+        node_conns: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         webhooks: pylon::webhook::WebhookHandle::null(),
         saturated: None,
         clustered: false,
@@ -297,6 +298,7 @@ async fn spawn_with_node_ceiling(max_connections: usize) -> Harness {
         pong_timeout: 30,
         strict_protocol: false,
         conn_counts: conn_counts.clone(),
+        node_conns: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         webhooks: pylon::webhook::WebhookHandle::null(),
         saturated: None,
         clustered: false,
@@ -499,6 +501,7 @@ async fn spawn_with_saturation_flag() -> (Harness, Arc<AtomicBool>) {
         pong_timeout: 30,
         strict_protocol: false,
         conn_counts: conn_counts.clone(),
+        node_conns: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         webhooks: pylon::webhook::WebhookHandle::null(),
         saturated: Some(sat_flag.clone()),
         clustered: false,
@@ -552,7 +555,7 @@ async fn spawn_with_saturation_flag() -> (Harness, Arc<AtomicBool>) {
 
 /// With the saturation flag forced `true`, a new connection attempt is rejected
 /// with close code 4100. With the flag cleared, a subsequent connection succeeds.
-/// This verifies both that (a) the accept gate fires and (b) the NODE_CONNS
+/// This verifies both that (a) the accept gate fires and (b) the node-connection
 /// counter is correctly decremented on the reject path (no counter leak).
 #[tokio::test]
 async fn saturated_accept_gate_rejects_4100_and_releases_counter() {
@@ -570,8 +573,8 @@ async fn saturated_accept_gate_rejects_4100_and_releases_counter() {
 
     // ── Not saturated: clear the flag — a new connection must succeed. ──────
     sat_flag.store(false, Ordering::SeqCst);
-    // Give the worker a moment to process the previous close so NODE_CONNS is
-    // back to 0 before the next connect (the reject path should have already
+    // Give the worker a moment to process the previous close so the node counter
+    // is back to 0 before the next connect (the reject path should have already
     // decremented it, but a small sleep confirms).
     tokio::time::sleep(Duration::from_millis(100)).await;
 
