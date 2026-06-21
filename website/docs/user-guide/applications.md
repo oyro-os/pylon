@@ -15,11 +15,10 @@ default `apps.json` (configurable via [`PYLON_APPS_PATH`](configuration.md)).
     "id": "<your-app-id>",
     "key": "<your-app-key>",
     "secret": "<your-app-secret>",
-    "host": "",
-    "path": "",
+    "enabled": true,
     "client_messages_enabled": true,
+    "subscription_count_enabled": false,
     "capacity": 10000,
-    "statistics_enabled": false,
     "webhooks": [
       {
         "url": "https://example.test/pusher/webhooks",
@@ -46,12 +45,111 @@ default `apps.json` (configurable via [`PYLON_APPS_PATH`](configuration.md)).
 | `id` | string | Unique app identifier. Included in REST API paths (`/apps/{id}/...`). |
 | `key` | string | Public app key. Clients use this to identify the app when connecting. |
 | `secret` | string | Shared secret for HMAC signing. Never sent to clients. |
-| `host` | string | Optional hostname restriction. Empty string means unrestricted. |
-| `path` | string | Optional path prefix for the WebSocket endpoint. Empty string means unrestricted. |
-| `client_messages_enabled` | boolean | When `true`, clients may publish events to channels via `client_event`. Defaults to `true`. |
-| `capacity` | integer | Maximum concurrent WebSocket connections for this app. Connections beyond this limit are refused with WebSocket close code **4004**. |
-| `statistics_enabled` | boolean | Reserved for future metrics collection. Has no effect in the current release. |
+| `enabled` | boolean | When `false`, the app is treated as if it did not exist: new connections are rejected and (with a DB-backed store) existing connections are force-closed. Defaults to `true`. |
+| `client_messages_enabled` | boolean | When `true`, clients may publish events to channels via `client_event`. Defaults to `false`. |
+| `subscription_count_enabled` | boolean | When `true`, the server emits `pusher_internal:subscription_count` events as a channel's subscriber count changes. Defaults to `false`. |
+| `capacity` | integer | Maximum concurrent WebSocket connections for this app (`0` = unlimited). Connections beyond this limit are refused with WebSocket close code **4004**. |
 | `webhooks` | array | Zero or more webhook targets. Each entry has a `url`, an `event_types` list, and an optional `headers` map. See the [Webhooks](webhooks.md) page for the full event-type reference. |
+
+!!! note
+    Unknown fields in `apps.json` are ignored. Earlier examples included `host`, `path`, and
+    `statistics_enabled` — these are **not** read by Pylon and have no effect; they are safe to
+    leave in an existing file but are no longer documented.
+
+---
+
+## Database-backed app stores
+
+`apps.json` is ideal for a fixed set of applications. For a **SaaS-scale** deployment — apps
+provisioned by a control plane, or more apps than fit comfortably in a file — Pylon can read
+applications from a **database** instead. Set `PYLON_APP_MANAGER` and `PYLON_APP_DSN`:
+
+| `PYLON_APP_MANAGER` | Example `PYLON_APP_DSN` |
+|---|---|
+| `sqlite` | `sqlite:///var/lib/pylon/apps.db` (single-node / edge / dev) |
+| `mysql` | `mysql://user:pass@db-host:3306/pylon` |
+| `postgres` | `postgres://user:pass@db-host:5432/pylon` |
+| `mongo` | `mongodb://db-host:27017/pylon` |
+
+Pylon only **reads** the application store — provisioning (creating, updating, deleting apps) is
+your control plane's job. The lookup path is the same as for `apps.json`: an app's record is
+resolved once at connection establish and once per REST publish, never per message.
+
+### Schema
+
+The relational drivers expect an `apps` table; the columns mirror the
+[field reference](#field-reference) above. Ready-to-run DDL ships in the repository under
+[`deploy/db/`](https://github.com/i-rocky/pylon/tree/master/deploy/db) — one file per engine:
+
+```sql
+-- deploy/db/postgres/001_apps.sql (MySQL/SQLite equivalents alongside)
+CREATE TABLE IF NOT EXISTS apps (
+    id          VARCHAR(255) NOT NULL PRIMARY KEY,
+    key         VARCHAR(255) NOT NULL UNIQUE,
+    secret      VARCHAR(255) NOT NULL,
+    name        VARCHAR(255) NOT NULL DEFAULT '',
+    capacity    BIGINT NOT NULL DEFAULT 0,
+    client_messages_enabled     BIGINT NOT NULL DEFAULT 0,   -- 0/1
+    subscription_count_enabled  BIGINT NOT NULL DEFAULT 0,   -- 0/1
+    enabled     BIGINT NOT NULL DEFAULT 1,                   -- 0/1
+    webhooks    TEXT NOT NULL DEFAULT '[]',                  -- JSON array
+    updated_at  TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+```
+
+The unique index on `key` and the primary key on `id` make both lookups index hits. Boolean
+columns are stored as `0`/`1` integers and `webhooks` as a JSON array string (the same shape as
+the `apps.json` `webhooks` field). MongoDB uses an `apps` collection with the same fields and
+unique indexes on `id` and `key` (see `deploy/db/mongo/001_indexes.js`).
+
+### Caching
+
+A DB-backed store is fronted by a two-tier cache so per-connection lookups stay fast even with an
+unbounded app catalogue:
+
+- **L1 (in-process):** a bounded cache (TinyLFU, per-entry TTL, single-flight) — a warm hit is
+  ~hundreds of nanoseconds, faster than scanning a large file. Concurrent misses for the same app
+  collapse into one database query, so a connection storm to a cold app does not stampede the DB.
+- **L2 (Redis, optional):** set `PYLON_APP_CACHE_REDIS_URL` to share warm apps across nodes and
+  survive restarts — a cold node reads from Redis instead of the database.
+- **Negative cache:** a separate, smaller, short-TTL cache holds "no such app" so a flood of bad
+  keys can never evict real apps and never reaches the database.
+
+A backend outage is distinguished from a genuinely-missing app: a missing/disabled app is
+rejected fatally (WS `4001`), while a transient DB/Redis error is rejected *retryably* (WS
+`4103`) and never negatively cached, so clients reconnect and succeed when the backend recovers.
+See [Configuration → Application store](configuration.md#application-store) for the cache tuning
+variables.
+
+### Keeping the cache correct
+
+Every cache entry has a TTL, so the worst-case staleness is bounded even if no signal ever
+arrives. To apply a change immediately (a rotated secret, a disabled or deleted app), tell Pylon
+to invalidate its cache. With `PYLON_APP_CACHE_REDIS_URL` set, an authenticated admin call
+publishes the invalidation to every node:
+
+```bash
+# Refresh: re-fetch this app on the next lookup (e.g. after a config/secret change).
+curl -X POST "http://pylon:7000/admin/apps/<app-id>/invalidate" \
+  -H "Authorization: Bearer $PYLON_ADMIN_TOKEN" \
+  -d '{"key":"<app-key>","action":"refresh"}'
+
+# Remove: the app is gone — every node evicts it AND force-closes all of its live
+# connections with WebSocket close code 4009.
+curl -X POST "http://pylon:7000/admin/apps/<app-id>/invalidate" \
+  -H "Authorization: Bearer $PYLON_ADMIN_TOKEN" \
+  -d '{"key":"<app-key>","action":"remove"}'
+```
+
+`action` defaults to `refresh` if omitted. The admin API is **disabled (404)** unless
+`PYLON_ADMIN_TOKEN` is set, requires the bearer token (constant-time compared), and requires
+`PYLON_APP_CACHE_REDIS_URL` for cross-node delivery (otherwise it returns 503). Your control
+plane can call this endpoint on any app write, or publish to the `pylon:app:invalidate` Redis
+channel directly.
+
+As a backstop, set `PYLON_APP_SWEEP_INTERVAL` to a number of seconds: Pylon then periodically
+re-checks the currently-connected apps against the database and force-closes any that have been
+disabled or deleted, even if an invalidation signal was missed.
 
 ---
 
