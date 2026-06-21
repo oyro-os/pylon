@@ -1,6 +1,6 @@
 //! HMAC-SHA256 / MD5 primitives and constant-time comparison for Pusher auth.
 //! Known-answer tests below are computed directly from the documented signing
-//! strings, e.g. a private-channel token signs "<socket_id>:<channel>".
+//! strings, e.g. a private-channel token signs `"<socket_id>:<channel>"`.
 
 use hmac::{Hmac, Mac};
 use md5::{Digest, Md5};
@@ -40,7 +40,7 @@ pub fn user_signature(secret: &str, socket_id: &str, user_data: &str) -> String 
     hmac_sha256_hex(secret, &format!("{socket_id}::user::{user_data}"))
 }
 
-/// Channel auth signature. Private channels sign "<socket_id>:<channel>";
+/// Channel auth signature. Private channels sign `"<socket_id>:<channel>"`;
 /// presence channels append ":<channel_data>" (the exact JSON string the client sent).
 /// An empty `channel_data` (`Some("")`) is treated as no channel data — it signs
 /// the private-channel string `"<socket_id>:<channel>"`.

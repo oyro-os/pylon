@@ -12,15 +12,15 @@
 //!   the accepted fd, moved out of mio) plus the `prefix` bytes already consumed
 //!   from the socket during head detection (these MUST be replayed before any
 //!   further reads, or the HTTP parser sees a truncated request). For TLS
-//!   connections, the live rustls [`ServerConnection`] is also carried so the
+//!   connections, the live rustls `ServerConnection` is also carried so the
 //!   async REST plane can continue driving the encrypted session.
 //! * [`mio_to_std`] — the single audited `unsafe` site: transfer fd ownership
 //!   from a `mio::net::TcpStream` to a `std::net::TcpStream` with no
 //!   double-close. The crate root is `#![deny(unsafe_code)]`; this function
 //!   opts in locally.
-//! * [`Rewind`] — an `AsyncRead`/`AsyncWrite` adapter that yields `prefix`
+//! * `Rewind` — an `AsyncRead`/`AsyncWrite` adapter that yields `prefix`
 //!   first, then delegates to the live tokio stream (plain path).
-//! * [`TlsRestStream`] — an `AsyncRead`/`AsyncWrite` adapter that drives the
+//! * `TlsRestStream` — an `AsyncRead`/`AsyncWrite` adapter that drives the
 //!   synchronous rustls `ServerConnection` over a tokio `TcpStream`. It replays
 //!   `prefix` (the already-decrypted HTTP head bytes) first, then pulls further
 //!   plaintext from the TLS session. Waker-driven: uses

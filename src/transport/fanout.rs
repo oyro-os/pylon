@@ -71,7 +71,7 @@ pub struct WorkerSlot {
 pub struct BroadcastSink {
     pub workers: Arc<Vec<Arc<WorkerSlot>>>,
     /// Set whenever any worker's bounded hand-off channel is `Full` (a broadcast
-    /// was dropped). The publish-admission path reads this via [`is_saturated`]
+    /// was dropped). The publish-admission path reads this via [`BroadcastSink::is_saturated`]
     /// to fail fast (503) under sustained overload; a worker clears it after
     /// fully draining its broadcast inbox to empty. Shared (`Arc`) so the cheap
     /// `Clone` of the sink onto the adapter keeps pointing at the same flag.

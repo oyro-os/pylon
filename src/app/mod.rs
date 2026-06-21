@@ -137,7 +137,7 @@ pub trait AppManager: Send + Sync {
     /// Returns `Some(result)` ONLY when the answer is known without performing any
     /// I/O (a static-file scan, or an in-memory L1 cache hit). Returns `None` when
     /// resolving would require a DB/Redis round-trip — the caller then offloads the
-    /// async [`by_key`] to a tokio task and parks the connection rather than
+    /// async [`Self::by_key`] to a tokio task and parks the connection rather than
     /// blocking the worker. The default is `None`: a raw `SqlAppManager` /
     /// `MongoAppManager` has no in-memory tier, so it always offloads.
     fn by_key_cached(&self, _key: &str) -> Option<Result<Option<Arc<App>>, AppLookupError>> {

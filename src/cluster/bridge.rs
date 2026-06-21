@@ -1135,7 +1135,7 @@ async fn notify_local_watchers(local: &LocalAdapter, app: &str, user_id: &str, n
     }
 }
 
-/// Build a [`PresencePayload`] from a list of cluster presence members, mirroring the
+/// Build a [`crate::protocol::event::PresencePayload`] from a list of cluster presence members, mirroring the
 /// roster shape `cluster_presence_join` produces: ids SORTED, the hash keyed by `user_id`
 /// → `user_info`, and the distinct-user `count`. Used only on the best-effort error path
 /// of [`ClusterCmd::PresenceSubscribe`], where the authoritative roster read failed.
