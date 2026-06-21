@@ -21,9 +21,9 @@
 //!   * then connects a FRESH probe subscriber and publishes one more frame,
 //!     asserting it arrives within 2 s (the server is alive, not wedged).
 //!
-//! The budget-bound assertion (total inflight ≤ budget) needs the per-worker
-//! byte-budget accounting + the `percore_total_inflight_bytes()` debug hook that
-//! Phase 2 wires, so it is `#[ignore]`d here.
+//! The budget-bound assertion (total inflight ≤ budget) uses the per-worker
+//! byte-budget accounting + the `percore_total_inflight_bytes()` debug hook
+//! (wired in SP10 Phase 2); see `overload_total_inflight_stays_within_budget`.
 
 use futures_util::{SinkExt, StreamExt};
 use pylon::adapter::local::LocalAdapter;
